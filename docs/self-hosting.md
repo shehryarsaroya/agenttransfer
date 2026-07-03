@@ -117,7 +117,7 @@ curl -X POST https://agents.example.com/v1/agents \
   -d '{"name":"openclaw-dev","owner_email":"you@example.com"}'
 ```
 
-Hand the returned `api_key` to your agent (MCP or REST — see the [README](../README.md)). For a public instance, set `OPEN_SIGNUP=true`: signups get per-IP rate limits, at most `MAX_AGENTS_PER_OWNER` agents per owner email, a reduced storage quota (`STORAGE_QUOTA_UNVERIFIED`, 200MB) whose files expire within `UNVERIFIED_FILE_TTL` (24h), and must confirm their owner email (an emailed link → a Confirm button; the link itself is side-effect-free so mail scanners can't approve it). Verification unlocks outbound email, the full quota, and persistent files. Even then, each agent can only email a small circle of unique outside recipients (`HUMAN_RECIPIENTS_MAX`, default 3; the owner is exempt) — widen it per agent with `POST /v1/agents/{id}/limits`, or raise the instance default.
+Hand the returned `api_key` to your agent (MCP or REST — see the [README](../README.md)). For a public instance, set `OPEN_SIGNUP=true`: signups get per-IP rate limits, at most `MAX_AGENTS_PER_OWNER` agents per owner email, a reduced storage quota (`STORAGE_QUOTA_UNVERIFIED`, 400MB) whose files expire within `UNVERIFIED_FILE_TTL` (24h), and must confirm their owner email (an emailed link → a Confirm button; the link itself is side-effect-free so mail scanners can't approve it). Verification unlocks outbound email, the full quota, and persistent files. Even then, each agent can only email a small circle of unique outside recipients (`HUMAN_RECIPIENTS_MAX`, default 3; the owner is exempt) — widen it per agent with `POST /v1/agents/{id}/limits`, or raise the instance default.
 
 ## Optional: also be a connect host
 
@@ -154,6 +154,6 @@ Replace the binary, restart. The schema migrates on boot (`CREATE TABLE IF NOT E
 
 - CPU: negligible (hashing dominates; ~1 GB/s/core).
 - RAM: <100 MB steady; uploads/downloads stream with constant memory.
-- Disk: folders are quota-bound per agent (`STORAGE_QUOTA`, default 20 GB — or `STORAGE_QUOTA_UNVERIFIED`, 200 MB, until the owner verifies); unverified agents' files also expire within `UNVERIFIED_FILE_TTL` (24h); links add no bytes (same blob); unclaimed arrivals expire.
+- Disk: folders are quota-bound per agent (`STORAGE_QUOTA`, default 20 GB — or `STORAGE_QUOTA_UNVERIFIED`, 400 MB, until the owner verifies); unverified agents' files also expire within `UNVERIFIED_FILE_TTL` (24h); links add no bytes (same blob); unclaimed arrivals expire.
 - **The volume can't fill**: the disk guard (`DISK_RESERVE`, default 10% of the volume) refuses uploads with 507 before free space runs out. `agenttransfer doctor` shows the guard's state; `GET /v1/admin/storage` (admin token) shows the top consumers when you need to find and delete an abuser.
 - Bandwidth is the real cost driver — every share-link download is your egress. The public pages are per-IP rate-limited (`IP_RATE`), which catches lazy single-source hammering; for real floods add kernel-level limits (nftables/ufw) or an edge, which are deployment choices, not app config.

@@ -20,10 +20,10 @@
 <body>
 <div class="card">
   <h1>📤 AgentTransfer</h1>
-  <p class="tag">Every AI agent gets an email address — this instance is <strong>{{.Instance}}</strong>.</p>
-  <p>An agent here uploads a file, gets a content-addressed link that expires within 24
-     hours, and sends it to any agent or human as ordinary email. Folders persist; links
-     don't. Every action leaves a signed receipt.</p>
+  <p class="tag">The open-source Dropbox for AI agents — this instance is <strong>{{.Instance}}</strong>.</p>
+  <p>An agent signs itself up, gets a folder and an email address, and moves files up to
+     5 GB over links that expire within 24 hours. Folders persist; links don't. Every
+     action leaves a signed receipt.</p>
   <pre>{{if .OpenSignup}}curl -X POST {{.Base}}/v1/agents \
   -d '{"name":"my-agent","owner_email":"you@example.com"}'{{else}}# signup on this instance is operator-gated{{end}}
 # connect any MCP-capable agent (Streamable HTTP):

@@ -128,7 +128,7 @@ func FromEnv() (Config, error) {
 	if c.StorageQuota, err = parseSizeEnv("STORAGE_QUOTA", "20GB"); err != nil {
 		return c, err
 	}
-	if c.StorageQuotaUnverified, err = parseSizeEnv("STORAGE_QUOTA_UNVERIFIED", "200MB"); err != nil {
+	if c.StorageQuotaUnverified, err = parseSizeEnv("STORAGE_QUOTA_UNVERIFIED", "400MB"); err != nil {
 		return c, err
 	}
 	if c.HumanRecipientsMax, err = parseIntEnv("HUMAN_RECIPIENTS_MAX", 3); err != nil {
@@ -185,7 +185,7 @@ func (c *Config) ApplyDefaults() {
 		c.StorageQuota = 20 << 30
 	}
 	if c.StorageQuotaUnverified == 0 {
-		c.StorageQuotaUnverified = 200 << 20
+		c.StorageQuotaUnverified = 400 << 20
 	}
 	if c.HumanRecipientsMax == 0 {
 		c.HumanRecipientsMax = 3

@@ -3,9 +3,9 @@
 [![CI](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml/badge.svg)](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Every AI agent gets an email address.** Upload a file, get a link, send it to any agent or any human. Open source, self-hostable.
+**The open-source Dropbox for AI agents.** Your agent signs itself up with one API call, gets a folder and an email address, and moves files up to **5 GB each** — to any agent, or any human, anywhere.
 
-The address comes with an **API key** and a folder. Files live in persistent, quota-bound folders; transfers happen over **content-addressed links that expire within 24 hours**; the handoff travels as **ordinary email**, so anything with an inbox can receive it. Every action leaves an **ed25519-signed, hash-chained receipt**.
+No approval step, no credit card, no SDK. Signup is instant and comes with **400 MB of storage**; one click from a human owner unlocks 20 GB and makes the folder permanent. Files stream in content-addressed and deduplicated; transfers happen over **links that expire within 24 hours**; the handoff travels as **ordinary email**, so anything with an inbox can receive it. Every action leaves an **ed25519-signed, hash-chained receipt**.
 
 One static Go binary. One data folder. Goes live from any machine with one command — or self-host everything on a $5 VPS with three DNS records.
 
@@ -22,7 +22,7 @@ One static Go binary. One data folder. Goes live from any machine with one comma
 
 ## Why
 
-Agents increasingly need to hand artifacts to each other: model weights, datasets, build outputs, screen recordings. Across runtimes (OpenClaw ↔ Codex ↔ Cursor), across machines, across organizations. Today that means pasting bytes through context windows, sharing cloud-drive credentials, or standing up S3 + presigned URLs + a notification channel.
+Agents increasingly need to hand artifacts to each other: model weights, datasets, build outputs, screen recordings. Across runtimes (OpenClaw ↔ Codex ↔ Cursor), across machines, across organizations. A 2 GB dataset does not fit through a context window, and the usual workarounds mean sharing cloud-drive credentials or standing up S3 + presigned URLs + a notification channel — with a human in the loop for every account.
 
 AgentTransfer's bet: **email is the control plane, HTTPS is the data plane.**
 
@@ -78,16 +78,16 @@ Or run a purely local instance (dev mode — what the demo and tests use):
 ## The core loop
 
 ```sh
-# 1. Create two agents (admin token from first boot)
+# 1. The agent signs ITSELF up — no human in the loop
+#    (on OPEN_SIGNUP instances; admin-gated instances use the admin token)
 curl -X POST http://localhost:8080/v1/agents \
-  -H "Authorization: Bearer at_admin_..." \
-  -d '{"name":"openclaw-dev"}'
+  -d '{"name":"openclaw-dev","owner_email":"you@example.com"}'
 # → { "email": "openclaw-dev@local", "api_key": "at_live_...", ... }
+#   400 MB of storage, working immediately
 curl -X POST http://localhost:8080/v1/agents \
-  -H "Authorization: Bearer at_admin_..." \
-  -d '{"name":"codex-bot"}'
+  -d '{"name":"codex-bot","owner_email":"you@example.com"}'
 
-# 2. Upload into its folder (persistent, quota-bound)
+# 2. Upload into its folder — streamed, any size up to 5 GB
 curl -T ./weights.tar.gz "http://localhost:8080/v1/files/weights.tar.gz" \
   -H "Authorization: Bearer at_live_..."
 # → { "sha256": "8f2a41...", "size": 209715200, ... }
@@ -104,12 +104,11 @@ curl "http://localhost:8080/v1/inbox/wait?timeout=60" -H "Authorization: Bearer 
 curl -L "<offer url>?dl=1" -o weights.tar.gz && shasum -a 256 weights.tar.gz
 ```
 
-Or skip curl entirely — the same binary is the client:
+Or skip curl entirely — the same binary is the client, and onboarding is one line:
 
 ```sh
-agenttransfer login http://localhost:8080 --key at_live_...
-# (on an OPEN_SIGNUP instance, agents onboard themselves in one line instead:)
-#   agenttransfer signup https://<instance> --name my-agent --owner you@example.com
+agenttransfer signup https://<instance> --name my-agent --owner you@example.com
+# (or log in with an existing key: agenttransfer login <url> --key at_live_...)
 agenttransfer put weights.tar.gz --share --ttl 3h    # upload (+ optional link)
 agenttransfer send weights.tar.gz --to codex-bot@local --note "training set v3"
 agenttransfer inbox --wait 60
@@ -226,7 +225,7 @@ Full guide (systemd, Docker, backups, provider notes): **[docs/self-hosting.md](
 | `OPEN_SIGNUP` | `false` | public signup (per-IP rate-limited; taken names get a random suffix; reserved names blocked) |
 | `MAX_FILE_SIZE` | `5GB` | per-file cap |
 | `STORAGE_QUOTA` | `20GB` | per-agent folder cap (verified owners) |
-| `STORAGE_QUOTA_UNVERIFIED` | `200MB` | folder cap until the owner verifies |
+| `STORAGE_QUOTA_UNVERIFIED` | `400MB` | folder cap until the owner verifies |
 | `UNVERIFIED_FILE_TTL` | `24h` | files of unverified-owner agents expire; verifying makes the folder persistent (`off` disables) |
 | `DISK_RESERVE` | `10%` | global backstop: uploads are refused (507) while the data volume has less than this free — the disk can never fill (`50GB` absolute also accepted; `off` disables) |
 | `DEFAULT_TTL` / `MAX_TTL` | `3h` / `24h` | share-link (and unclaimed-file) lifetimes |

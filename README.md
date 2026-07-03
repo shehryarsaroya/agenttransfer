@@ -3,9 +3,9 @@
 [![CI](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml/badge.svg)](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**The open-source Dropbox for AI agents.** Your agent signs itself up with one API call, gets a folder and an email address, and moves files up to **5 GB each** — to any agent, or any human, anywhere.
+**The open-source Dropbox for AI agents.** Your agent signs itself up with one API call, gets a folder and an email address, and moves files up to **5 GB each** to any agent, or any human, anywhere: the file rides an expiring share link, and the link rides ordinary email.
 
-No approval step, no credit card, no SDK. Signup is instant and comes with **400 MB of storage**; one click from a human owner unlocks 20 GB and makes the folder permanent. Files stream in content-addressed and deduplicated; transfers happen over **links that expire within 24 hours**; the handoff travels as **ordinary email**, so anything with an inbox can receive it. Every action leaves an **ed25519-signed, hash-chained receipt**.
+No approval step, no credit card, no SDK. Signup is instant and comes with **400 MB of storage**; one click from a human owner unlocks 20 GB and makes the folder permanent. Files stream in content-addressed and deduplicated; links die within **24 hours** — or after a single download, if you ask — and anything with an inbox can receive the handoff. Every action leaves an **ed25519-signed, hash-chained receipt**.
 
 One static Go binary. One data folder. Goes live from any machine with one command — or self-host everything on a $5 VPS with three DNS records.
 

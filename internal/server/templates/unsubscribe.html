@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Unsubscribe — AgentTransfer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:34rem;width:100%;padding:2rem}
+  h1{font-size:1.1rem;margin:0 0 .5rem}
+  p{color:#555;font-size:.92rem;line-height:1.5}
+  code{background:#f2f3f5;border-radius:4px;padding:.1rem .3rem}
+  button{background:#111;color:#fff;border:0;border-radius:8px;padding:.6rem 1.1rem;font-size:.95rem;cursor:pointer}
+  .foot{color:#888;font-size:.78rem;margin-top:1.5rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Stop receiving agent mail?</h1>
+  <p><code>{{.Addr}}</code> will no longer receive email from any agent on this instance.</p>
+  <form method="post" action="{{.Action}}">
+    <button type="submit">Unsubscribe</button>
+  </form>
+  <p class="foot">Changed your mind? Just close this page.</p>
+</div>
+</body>
+</html>

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.Name}} — AgentTransfer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:34rem;width:100%;padding:2rem}
+  h1{font-size:1.1rem;margin:0 0 .25rem;word-break:break-all}
+  .meta{color:#555;font-size:.9rem;margin:0 0 1.25rem}
+  .hash{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:#666;word-break:break-all;
+        background:#f2f3f5;border-radius:6px;padding:.5rem .6rem;margin:0 0 1.25rem}
+  a.btn{display:inline-block;background:#111;color:#fff;text-decoration:none;border-radius:8px;
+        padding:.6rem 1.1rem;font-size:.95rem}
+  .warn{color:#8a5a00;background:#fff6e5;border:1px solid #f2dfb3;border-radius:8px;
+        padding:.5rem .75rem;font-size:.85rem;margin:0 0 1.25rem}
+  .foot{color:#888;font-size:.78rem;margin-top:1.5rem}
+  .exp{color:#555;font-size:.85rem;margin-top:.75rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>{{.Name}}</h1>
+  <p class="meta">{{.Size}} · expires {{.ExpiresAt}}</p>
+  {{if .Once}}<p class="warn">Single-download link: it burns after the first complete download. Clicking the button consumes it.</p>{{end}}
+  <p class="hash">sha256:{{.SHA256}}</p>
+  <a class="btn" href="{{.URL}}" rel="nofollow">Download</a>
+  <p class="exp">Link expires in about {{.ExpiresIn}}. Verify the file after download:<br>
+  <code>shasum -a 256 &lt;file&gt;</code> should print the hash above.</p>
+  <p class="foot">Shared via AgentTransfer — ephemeral, content-addressed links for AI agents.</p>
+</div>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# binary
+/agenttransfer
+/agenttransfer.exe
+/dist/
+/tmp/
+
+# launch planning (local only)
+/marketing/
+/scratchpad/
+
+# runtime state
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/

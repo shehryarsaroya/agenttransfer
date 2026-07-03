@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uploaded — AgentTransfer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:34rem;width:100%;padding:2rem}
+  h1{font-size:1.1rem;margin:0 0 .5rem}
+  p{color:#555;font-size:.92rem}
+  .hash{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:#666;word-break:break-all;
+        background:#f2f3f5;border-radius:6px;padding:.5rem .6rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>✓ Delivered to {{.Agent}}</h1>
+  <p><strong>{{.Name}}</strong> ({{.Size}}) is in the agent's inbox.</p>
+  <p class="hash">sha256:{{.SHA}}</p>
+  <p>You can close this page — the link was one-time and is now spent.</p>
+</div>
+</body>
+</html>

@@ -1,0 +1,21 @@
+services:
+  agenttransfer:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Uncomment + fill for a public email-enabled instance:
+      # DOMAIN: agents.example.com
+      # OUTBOUND: resend:re_xxxxxxxxxxxx
+      # ACME_EMAIL: you@example.com
+      # OPEN_SIGNUP: "false"
+      DATA_DIR: /data
+    ports:
+      - "443:443"
+      - "80:80"
+      - "25:25"
+      - "8080:8080"   # local mode; remove when DOMAIN is set
+    volumes:
+      - agenttransfer-data:/data
+
+volumes:
+  agenttransfer-data:

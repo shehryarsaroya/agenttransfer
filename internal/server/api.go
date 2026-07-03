@@ -1,0 +1,1518 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/mail"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	afmail "github.com/shehryarsaroya/agenttransfer/internal/mail"
+	"github.com/shehryarsaroya/agenttransfer/internal/proto"
+	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/store"
+)
+
+// ---- plumbing ----
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+func errJSON(w http.ResponseWriter, status int, format string, args ...any) {
+	writeJSON(w, status, map[string]string{"error": fmt.Sprintf(format, args...)})
+}
+
+func bearer(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if tok, ok := strings.CutPrefix(h, "Bearer "); ok {
+		return strings.TrimSpace(tok)
+	}
+	return ""
+}
+
+type authedHandler func(w http.ResponseWriter, r *http.Request, agent store.Agent)
+
+func (s *Server) auth(next authedHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok := bearer(r)
+		if tok == "" {
+			errJSON(w, http.StatusUnauthorized, "missing Authorization: Bearer <api_key>")
+			return
+		}
+		agent, err := s.st.AgentByKey(tok)
+		if err != nil {
+			errJSON(w, http.StatusUnauthorized, "invalid API key")
+			return
+		}
+		next(w, r, agent)
+	}
+}
+
+func decodeBody(r *http.Request, v any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("bad JSON body: %w", err)
+	}
+	return nil
+}
+
+// checkRate charges one unit against a daily counter, failing past max.
+func (s *Server) checkRate(agentID, kind string, max int64) error {
+	return s.checkRateN(agentID, kind, 1, max)
+}
+
+// checkRateN charges n units at once, refunding the whole charge when it
+// would cross max — a rejected call must not eat the rest of the day's
+// budget (a 10-recipient send bouncing off the cap would otherwise brick
+// smaller sends for the rest of the day).
+func (s *Server) checkRateN(agentID, kind string, n, max int64) error {
+	if n == 0 {
+		return nil
+	}
+	total, err := s.st.IncrCounterN(agentID, kind, n)
+	if err != nil {
+		return err
+	}
+	if total > max {
+		_, _ = s.st.IncrCounterN(agentID, kind, -n)
+		return fmt.Errorf("daily %s limit reached (%d/day)", kind, max)
+	}
+	return nil
+}
+
+func (s *Server) linkURL(token string) string { return s.BaseURL() + "/f/" + token }
+
+// emailCapable reports whether this instance can send real email — either
+// through its own relay (Domain + OUTBOUND) or through its connect host.
+func (s *Server) emailCapable() bool {
+	if s.cfg.EmailEnabled() && s.outbound != nil {
+		return true
+	}
+	c := s.client
+	return c != nil && c.connected()
+}
+
+// sendRaw submits one outbound email via whichever path this instance has:
+// its own relay, or the connect host's.
+func (s *Server) sendRaw(from string, rcpts []string, raw []byte) error {
+	if s.cfg.EmailEnabled() && s.outbound != nil {
+		return afmail.Send(s.outbound, from, rcpts, raw)
+	}
+	if c := s.client; c != nil {
+		return c.relay(from, rcpts, raw)
+	}
+	return errors.New("no outbound email path configured")
+}
+
+func (s *Server) ttlFrom(q string, def time.Duration) (time.Duration, error) {
+	if q == "" {
+		if def <= 0 {
+			def = time.Hour // guard against a misconfigured default
+		}
+		return def, nil
+	}
+	d, err := ParseTTL(q)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, errors.New("ttl must be positive")
+	}
+	if d > s.cfg.MaxTTL {
+		d = s.cfg.MaxTTL
+	}
+	return d, nil
+}
+
+type linkJSON struct {
+	Token     string `json:"token"`
+	URL       string `json:"url"`
+	SHA256    string `json:"sha256"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	Once      bool   `json:"once"`
+	Status    string `json:"status"`
+	Downloads int64  `json:"downloads"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func (s *Server) linkJSON(l store.Link) linkJSON {
+	return linkJSON{
+		Token: l.Token, URL: s.linkURL(l.Token), SHA256: l.SHA256, Name: l.Name,
+		Size: l.Size, Once: l.Once, Status: l.Status, Downloads: l.Downloads,
+		ExpiresAt: time.Unix(l.ExpiresAt, 0).UTC().Format(time.RFC3339),
+	}
+}
+
+// ---- agents ----
+
+// reservedNames are localparts open signup may not claim: they are RFC-special
+// (postmaster), used by the instance itself as a From address (no-reply,
+// upload-request), routing-special (self — DELETE /v1/agents/self), or too
+// easy to abuse for impersonation on a shared domain.
+var reservedNames = map[string]bool{
+	"abuse": true, "admin": true, "administrator": true, "agenttransfer": true,
+	"help": true, "hostmaster": true, "info": true, "mail": true,
+	"mailer-daemon": true, "no-reply": true, "noreply": true, "postmaster": true,
+	"root": true, "security": true, "self": true, "support": true,
+	"system": true, "upload-request": true, "webmaster": true, "www": true,
+}
+
+// suffixedName appends a short random tag so open signups never fail on a
+// taken name — on a shared public instance every nice name goes fast.
+func suffixedName(base string) string {
+	const alphabet = "abcdefghjkmnpqrstvwxyz23456789"
+	tag := make([]byte, 4)
+	for i := range tag {
+		tag[i] = alphabet[randInt(len(alphabet))]
+	}
+	if len(base) > 59 { // keep the result within the 64-char name limit
+		base = base[:59]
+	}
+	return base + "-" + string(tag)
+}
+
+func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name       string `json:"name"`
+		OwnerEmail string `json:"owner_email"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+
+	isAdmin := s.st.IsAdmin(bearer(r))
+	if !isAdmin && !s.cfg.OpenSignup {
+		errJSON(w, http.StatusForbidden, "signup is admin-gated on this instance (set OPEN_SIGNUP=true for public signup)")
+		return
+	}
+	requested := strings.ToLower(strings.TrimSpace(req.Name))
+	if !isAdmin {
+		if !s.signupLimiter.allow(s.clientIP(r)) {
+			errJSON(w, http.StatusTooManyRequests, "signup rate limit: try again later")
+			return
+		}
+		if _, err := mail.ParseAddress(req.OwnerEmail); err != nil {
+			errJSON(w, http.StatusBadRequest, "owner_email (a valid address) is required for open signup")
+			return
+		}
+		if reservedNames[requested] {
+			errJSON(w, http.StatusBadRequest, "the name %q is reserved on this instance", requested)
+			return
+		}
+		// Identities must not be free in bulk: one owner address can register
+		// only so many agents (each with its own quota) via open signup.
+		if max := s.cfg.MaxAgentsPerOwner; max > 0 {
+			if n, err := s.st.CountAgentsByOwner(req.OwnerEmail); err == nil && n >= max {
+				errJSON(w, http.StatusForbidden,
+					"this owner email already has %d agents (max %d) — delete one (DELETE /v1/agents/self) or ask the operator", n, max)
+				return
+			}
+		}
+	}
+
+	agent, key, err := s.st.CreateAgent(req.Name, req.OwnerEmail, isAdmin)
+	// Open signup never fails on a name collision: retry with a random suffix
+	// (admins get the error — they asked for that exact name).
+	if err != nil && !isAdmin && errors.Is(err, store.ErrNameTaken) {
+		for i := 0; i < 4 && err != nil; i++ {
+			agent, key, err = s.st.CreateAgent(suffixedName(requested), req.OwnerEmail, isAdmin)
+		}
+	}
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+
+	verification := "not_required"
+	if !agent.OwnerVerified {
+		verification = "pending"
+		if s.emailCapable() {
+			if err := s.sendVerificationEmail(agent); err == nil {
+				verification = "sent"
+			}
+		}
+	}
+
+	out := map[string]any{
+		"agent_id":       agent.ID,
+		"name":           agent.Name,
+		"email":          agent.Email,
+		"api_key":        key,
+		"owner_email":    agent.OwnerEmail,
+		"owner_verified": agent.OwnerVerified,
+		"verification":   verification,
+		"endpoints": map[string]string{
+			"api": s.BaseURL() + "/v1",
+			"mcp": s.BaseURL() + "/mcp",
+		},
+	}
+	if requested != "" && agent.Name != requested {
+		out["note"] = fmt.Sprintf("the name %q was taken; you are %q", requested, agent.Name)
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) sendVerificationEmail(agent store.Agent) error {
+	tok, err := s.st.CreateVerifyToken(agent.ID)
+	if err != nil {
+		return err
+	}
+	link := s.BaseURL() + "/verify?t=" + tok
+	instance := s.st.Instance()
+	m := &afmail.Message{
+		FromName: "AgentTransfer",
+		From:     "no-reply@" + instance,
+		To:       []string{agent.OwnerEmail},
+		Subject:  "Verify your agent " + agent.Email,
+		Text: fmt.Sprintf("An agent named %q was created with you as its owner.\n\n"+
+			"Verify to enable outbound email for it:\n\n  %s\n\n"+
+			"If this wasn't you, ignore this message.\n", agent.Name, link),
+		MessageID: afmail.FormatRFCMessageID(store.NewID("msg"), instance),
+	}
+	raw, err := m.Build()
+	if err != nil {
+		return err
+	}
+	return s.sendRaw(m.From, []string{agent.OwnerEmail}, raw)
+}
+
+// handleVerifyOwner (GET) shows the confirm page. It deliberately consumes
+// NOTHING: corporate mail scanners prefetch every link in every email, and a
+// GET that verified would let an attacker sign up with a victim's address and
+// have the victim's own security tooling click the approval for them.
+func (s *Server) handleVerifyOwner(w http.ResponseWriter, r *http.Request) {
+	tok := r.URL.Query().Get("t")
+	agentID, err := s.st.PeekVerifyToken(tok)
+	if err != nil || strings.HasPrefix(agentID, "connect:") {
+		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
+		return
+	}
+	agent, err := s.st.AgentByID(agentID)
+	if err != nil {
+		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.tmpl.ExecuteTemplate(w, "verify.html", map[string]any{
+		"What":   "agent " + agent.Email,
+		"Action": "/verify?t=" + url.QueryEscape(tok),
+		"Sends":  s.cfg.SendRate,
+		"Circle": s.humanCircleMax(agent),
+	})
+}
+
+// handleVerifyOwnerConfirm (POST) is the explicit human click that consumes
+// the token and unlocks outbound email.
+func (s *Server) handleVerifyOwnerConfirm(w http.ResponseWriter, r *http.Request) {
+	tok := r.URL.Query().Get("t")
+	if tok == "" {
+		tok = r.FormValue("t")
+	}
+	// Reject the wrong token type BEFORE consuming, so a connect token
+	// mis-POSTed here isn't silently burned.
+	if slot, err := s.st.PeekVerifyToken(tok); err != nil || strings.HasPrefix(slot, "connect:") {
+		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
+		return
+	}
+	agentID, err := s.st.ConsumeVerifyToken(tok)
+	if err != nil || strings.HasPrefix(agentID, "connect:") {
+		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
+		return
+	}
+	if err := s.st.MarkOwnerVerified(agentID); err != nil {
+		http.Error(w, "verification failed", http.StatusInternalServerError)
+		return
+	}
+	agent, _ := s.st.AgentByID(agentID)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.tmpl.ExecuteTemplate(w, "verified.html", map[string]any{"Agent": agent.Email})
+}
+
+func (s *Server) handleAdminVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.st.IsAdmin(bearer(r)) {
+		errJSON(w, http.StatusForbidden, "admin token required")
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.st.MarkOwnerVerified(id); err != nil {
+		errJSON(w, http.StatusNotFound, "no such agent")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "owner_verified": true})
+}
+
+// handleAdminLimits lets the operator widen (or shrink) one agent's
+// recipient circle: 0 resets to the instance default, <0 removes the cap.
+func (s *Server) handleAdminLimits(w http.ResponseWriter, r *http.Request) {
+	if !s.st.IsAdmin(bearer(r)) {
+		errJSON(w, http.StatusForbidden, "admin token required")
+		return
+	}
+	var req struct {
+		HumanRecipientsMax *int64 `json:"human_recipients_max"`
+	}
+	if err := decodeBody(r, &req); err != nil || req.HumanRecipientsMax == nil {
+		errJSON(w, http.StatusBadRequest, "provide {\"human_recipients_max\": N} (0 = instance default, -1 = unlimited)")
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.st.SetHumanRecipientsMax(id, *req.HumanRecipientsMax); err != nil {
+		errJSON(w, http.StatusNotFound, "no such agent")
+		return
+	}
+	agent, err := s.st.AgentByID(id)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "no such agent")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agent_id":             id,
+		"human_recipients_max": *req.HumanRecipientsMax,
+		"effective_max":        s.humanCircleMax(agent),
+	})
+}
+
+// handleDeleteAgent (admin) removes any agent by id.
+func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.st.IsAdmin(bearer(r)) {
+		errJSON(w, http.StatusForbidden, "admin token required")
+		return
+	}
+	s.deleteAgent(w, r.PathValue("id"))
+}
+
+// handleDeleteSelf lets an agent delete itself with its own key — the mirror
+// of self-signup.
+func (s *Server) handleDeleteSelf(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	s.deleteAgent(w, agent.ID)
+}
+
+func (s *Server) deleteAgent(w http.ResponseWriter, id string) {
+	a, severed, err := s.st.DeleteAgent(id)
+	if errors.Is(err, store.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "no such agent")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	// Cut any in-flight downloads on the agent's now-deleted links, and record
+	// the account removal in the chain (actor outlives the row on purpose).
+	for _, tok := range severed {
+		s.sever(tok)
+	}
+	_, _ = s.st.AppendReceipt(a.Email, receipt.ActionDeleted, "", 0, "agent:"+a.Name, "")
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": a.Email, "links_severed": len(severed)})
+}
+
+// humanCircleMax resolves the agent's effective recipient-circle cap.
+func (s *Server) humanCircleMax(a store.Agent) int64 {
+	if a.HumanRecipientsMax != 0 {
+		return a.HumanRecipientsMax
+	}
+	return s.cfg.HumanRecipientsMax
+}
+
+// quotaFor returns the storage quota tier for an agent: verified owners get
+// the full drive, anonymous signups a small one until a human vouches.
+func (s *Server) quotaFor(a store.Agent) int64 {
+	if a.OwnerVerified {
+		return s.cfg.StorageQuota
+	}
+	return s.cfg.StorageQuotaUnverified
+}
+
+// fileExpiry returns the expiry for a file entering this agent's folder —
+// the storage mirror of the quota tier: 0 (persistent) once the owner is
+// verified, now+UNVERIFIED_FILE_TTL before that. Verification lifts the
+// expiry on files already in the folder (see store.MarkOwnerVerified).
+func (s *Server) fileExpiry(a store.Agent) int64 {
+	if a.OwnerVerified || s.cfg.UnverifiedFileTTL <= 0 {
+		return 0
+	}
+	return time.Now().Add(s.cfg.UnverifiedFileTTL).Unix()
+}
+
+func (s *Server) handleRotateKey(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	key, err := s.st.RotateKey(agent.ID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "rotate failed: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent_id": agent.ID, "api_key": key})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	var req struct {
+		AlwaysCCOwner *bool `json:"always_cc_owner"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	if req.AlwaysCCOwner != nil {
+		if err := s.st.SetAlwaysCC(agent.ID, *req.AlwaysCCOwner); err != nil {
+			errJSON(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		agent.AlwaysCCOwner = *req.AlwaysCCOwner
+	}
+	writeJSON(w, http.StatusOK, agent)
+}
+
+func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	used, _ := s.st.StorageUsed(agent.ID)
+	circleUsed, _ := s.st.CountHumanRecipients(agent.ID)
+	storage := map[string]any{
+		"used":  used,
+		"quota": s.quotaFor(agent),
+	}
+	if exp := s.fileExpiry(agent); exp > 0 {
+		// The unverified tier: files are mortal until the owner verifies.
+		storage["files_expire_after"] = s.cfg.UnverifiedFileTTL.String()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agent_id":       agent.ID,
+		"name":           agent.Name,
+		"email":          agent.Email,
+		"owner_email":    agent.OwnerEmail,
+		"owner_verified": agent.OwnerVerified,
+		"instance":       s.st.Instance(),
+		"storage":        storage,
+		"limits": map[string]any{
+			"max_file_size": s.cfg.MaxFileSize,
+			"default_ttl":   s.cfg.DefaultTTL.String(),
+			"max_ttl":       s.cfg.MaxTTL.String(),
+			"send_per_day":  s.cfg.SendRate,
+		},
+		// The circle: unique remote recipients this agent has ever emailed
+		// (same-instance agents and the owner are exempt and uncounted).
+		"remote_recipients": map[string]any{
+			"used": circleUsed,
+			"max":  s.humanCircleMax(agent),
+		},
+		"email_enabled": s.emailCapable(),
+	})
+}
+
+// ---- folder ----
+
+type uploadResult struct {
+	SHA256 string `json:"sha256"`
+	Name   string `json:"name"`
+	MIME   string `json:"mime"`
+	Size   int64  `json:"size"`
+	// ExpiresAt is set when the file is mortal — the unverified-owner tier;
+	// verify the owner to make the folder persistent.
+	ExpiresAt string    `json:"expires_at,omitempty"`
+	Link      *linkJSON `json:"link,omitempty"`
+}
+
+// diskFull reports (and counts) a global disk-guard trip. The log line is
+// throttled to one per minute — a hammered instance must not flood its own
+// journal.
+func (s *Server) diskFull() bool {
+	if !s.st.DiskFull() {
+		return false
+	}
+	s.metrics.diskFullRejects.Add(1)
+	now := time.Now().Unix()
+	if last := s.lastDiskLog.Load(); now-last >= 60 && s.lastDiskLog.CompareAndSwap(last, now) {
+		free, _, reserve := s.st.DiskStats()
+		log.Printf("disk guard: refusing uploads — %d bytes free < %d reserve (free space or raise DISK_RESERVE)", free, reserve)
+	}
+	return true
+}
+
+// performUpload streams body into the blob store and the agent's folder,
+// optionally minting a share link. Shared by REST, MCP, and upload pages.
+func (s *Server) performUpload(agent store.Agent, name, contentType string, body io.Reader, share bool, ttl time.Duration, once bool) (*uploadResult, int, error) {
+	// Global backstop before anything else: a full volume refuses work
+	// without consuming the agent's upload-rate budget.
+	if s.diskFull() {
+		return nil, http.StatusInsufficientStorage, errors.New("instance storage is full — try again later")
+	}
+	if err := s.checkRate(agent.ID, "uploads", s.cfg.UploadRate); err != nil {
+		return nil, http.StatusTooManyRequests, err
+	}
+	sha, size, err := s.st.PutBlob(body, s.cfg.MaxFileSize)
+	if err != nil {
+		if errors.Is(err, store.ErrQuota) {
+			return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("upload exceeds MAX_FILE_SIZE (%d bytes)", s.cfg.MaxFileSize)
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil, http.StatusRequestTimeout, errors.New("upload body arrived too slowly and hit UPLOAD_BODY_TIMEOUT — retry on a faster connection")
+		}
+		return nil, http.StatusInternalServerError, err
+	}
+
+	mimeType := contentType
+	if mimeType == "" || strings.HasPrefix(mimeType, "multipart/") || mimeType == "application/octet-stream" || mimeType == "application/x-www-form-urlencoded" {
+		mimeType = mime.TypeByExtension(filepath.Ext(name))
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+	}
+
+	// Quota check + insert are serialized per agent so concurrent uploads
+	// can't all pass the same headroom reading. An idempotent re-upload of an
+	// entry the agent already has is free (dedup); anything that adds a
+	// folder row is charged.
+	lock := s.uploadLock(agent.ID)
+	lock.Lock()
+	used, err := s.st.StorageUsed(agent.ID)
+	if err != nil {
+		lock.Unlock()
+		return nil, http.StatusInternalServerError, err
+	}
+	if quota := s.quotaFor(agent); !s.st.AgentHasFile(agent.ID, sha, name) && used+size > quota {
+		lock.Unlock()
+		hint := "delete files or raise STORAGE_QUOTA"
+		if !agent.OwnerVerified {
+			hint = "unverified agents get a reduced quota — verify your owner email to unlock the full one"
+		}
+		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("storage quota exceeded: %d used + %d new > %d (%s)", used, size, quota, hint)
+	}
+	f, err := s.st.AddFile(agent.ID, sha, name, mimeType, size, "upload", true, s.fileExpiry(agent))
+	lock.Unlock()
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	s.metrics.uploads.Add(1)
+	_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionUploaded, sha, size, "file:"+f.Name, "")
+
+	res := &uploadResult{SHA256: sha, Name: f.Name, MIME: f.MIME, Size: size}
+	if f.ExpiresAt > 0 {
+		res.ExpiresAt = time.Unix(f.ExpiresAt, 0).UTC().Format(time.RFC3339)
+	}
+	if share {
+		l, err := s.st.CreateLink(agent.ID, sha, f.Name, f.MIME, size, once, ttl)
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		lj := s.linkJSON(l)
+		res.Link = &lj
+	}
+	return res, http.StatusCreated, nil
+}
+
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	// Slow-body defense: bound how long this request may spend sending its
+	// body. A READ deadline only — downloads deliberately stream untimed.
+	if d := s.cfg.UploadBodyTimeout; d > 0 {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(d))
+	}
+	q := r.URL.Query()
+	name := r.PathValue("name")
+	if name == "" {
+		name = q.Get("name")
+	}
+	if name == "" {
+		name = strings.TrimSpace(r.Header.Get("X-Name"))
+	}
+	if name == "" {
+		name = "upload.bin"
+	}
+
+	once := q.Get("once") == "1" || q.Get("once") == "true"
+	share := q.Get("share") == "1" || q.Get("share") == "true" || q.Has("ttl") || once
+	ttl, err := s.ttlFrom(q.Get("ttl"), s.cfg.DefaultTTL)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+
+	res, status, err := s.performUpload(agent, name, r.Header.Get("Content-Type"), r.Body, share, ttl, once)
+	if err != nil {
+		errJSON(w, status, "%v", err)
+		return
+	}
+	writeJSON(w, status, res)
+}
+
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	files, err := s.st.ListFiles(agent.ID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	used, _ := s.st.StorageUsed(agent.ID)
+	out := make([]map[string]any, 0, len(files))
+	for _, f := range files {
+		e := map[string]any{
+			"sha256": f.SHA256, "name": f.Name, "mime": f.MIME, "size": f.Size,
+			"source": f.Source, "claimed": f.Claimed,
+			"created_at": time.Unix(f.CreatedAt, 0).UTC().Format(time.RFC3339),
+		}
+		if f.ExpiresAt > 0 {
+			e["expires_at"] = time.Unix(f.ExpiresAt, 0).UTC().Format(time.RFC3339)
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"files": out, "storage_used": used, "storage_quota": s.quotaFor(agent)})
+}
+
+func shaParam(r *http.Request) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(r.PathValue("sha"))), "sha256:")
+}
+
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	sha := shaParam(r)
+	files, err := s.st.DeleteFile(agent.ID, sha)
+	if errors.Is(err, store.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "no such file in your folder")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	// Deleting a file kills its live links too — "remove" means now.
+	revoked, _ := s.st.RevokeLinksForSHA(agent.ID, sha)
+	for _, l := range revoked {
+		s.sever(l.Token)
+		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionRevoked, l.SHA256, l.Size, "link:"+l.Token, "")
+	}
+	for _, f := range files {
+		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionDeleted, f.SHA256, f.Size, "file:"+f.Name, "")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(files), "links_revoked": len(revoked)})
+}
+
+func (s *Server) handleKeepFile(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	// Keep claims the file at the agent's tier: persistent for verified
+	// owners, extended to the unverified ceiling otherwise.
+	f, err := s.st.KeepFile(agent.ID, shaParam(r), s.fileExpiry(agent))
+	if errors.Is(err, store.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "no such file in your folder")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	out := map[string]any{"sha256": f.SHA256, "name": f.Name, "claimed": true}
+	if f.ExpiresAt > 0 {
+		out["expires_at"] = time.Unix(f.ExpiresAt, 0).UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleFileContent streams a folder file back to its owner (auth'd; not a
+// share link).
+func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	sha := shaParam(r)
+	f, err := s.st.FileBySHA(agent.ID, sha)
+	if errors.Is(err, store.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "no such file in your folder")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	blob, err := s.st.OpenBlob(f.SHA256)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "blob missing")
+		return
+	}
+	defer blob.Close()
+	w.Header().Set("Content-Type", f.MIME)
+	w.Header().Set("X-Sha256", f.SHA256)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", f.Name))
+	http.ServeContent(w, r, f.Name, time.Unix(f.CreatedAt, 0), blob)
+}
+
+// ---- links ----
+
+func (s *Server) handleCreateLink(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	var req struct {
+		File string `json:"file"` // "sha256:..." or folder filename
+		TTL  string `json:"ttl"`
+		Once bool   `json:"once"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	f, err := s.resolveFile(agent, req.File)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "%v", err)
+		return
+	}
+	ttl, err := s.ttlFrom(req.TTL, s.cfg.DefaultTTL)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	l, err := s.st.CreateLink(agent.ID, f.SHA256, f.Name, f.MIME, f.Size, req.Once, ttl)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.linkJSON(l))
+}
+
+func (s *Server) resolveFile(agent store.Agent, ref string) (store.File, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return store.File{}, errors.New("file reference required (\"sha256:...\" or a folder filename)")
+	}
+	if sha, ok := strings.CutPrefix(ref, "sha256:"); ok {
+		f, err := s.st.FileBySHA(agent.ID, strings.ToLower(sha))
+		if err != nil {
+			return f, fmt.Errorf("no file with hash %s in your folder", sha)
+		}
+		return f, nil
+	}
+	f, err := s.st.FileByName(agent.ID, ref)
+	if err != nil {
+		return f, fmt.Errorf("no file named %q in your folder", ref)
+	}
+	return f, nil
+}
+
+func (s *Server) handleListLinks(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	links, err := s.st.ListLinks(agent.ID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	out := make([]linkJSON, 0, len(links))
+	for _, l := range links {
+		out = append(out, s.linkJSON(l))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"links": out})
+}
+
+func (s *Server) handleRevokeLink(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	token := r.PathValue("token")
+	l, err := s.st.GetLink(token)
+	if err != nil || l.AgentID != agent.ID {
+		errJSON(w, http.StatusNotFound, "no such link")
+		return
+	}
+	if l.Status != "active" {
+		errJSON(w, http.StatusConflict, "link is already %s", l.Status)
+		return
+	}
+	if _, err := s.st.RevokeLink(token); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Lost a race with burn/expiry — it's closed either way.
+			errJSON(w, http.StatusConflict, "link was already closed")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	s.sever(token) // cut any in-flight download now
+	_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionRevoked, l.SHA256, l.Size, "link:"+token, "")
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "status": "revoked"})
+}
+
+// ---- send ----
+
+type sendRequest struct {
+	To      []string `json:"to"`
+	File    string   `json:"file,omitempty"`
+	Note    string   `json:"note,omitempty"`
+	Subject string   `json:"subject,omitempty"`
+	TTL     string   `json:"ttl,omitempty"`
+	Once    bool     `json:"once,omitempty"`
+	ReplyTo string   `json:"reply_to,omitempty"`
+	CCOwner bool     `json:"cc_owner,omitempty"`
+}
+
+type sendResult struct {
+	MessageID string           `json:"message_id"`
+	Subject   string           `json:"subject"`
+	Delivered []map[string]any `json:"delivered"`
+	Link      *linkJSON        `json:"link,omitempty"`
+	CCOwner   string           `json:"cc_owner,omitempty"`
+}
+
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idemKey != "" {
+		// Collapse concurrent duplicates: only one request per (agent, key)
+		// executes; the rest wait and replay its stored response.
+		flightKey := agent.ID + "\x00" + idemKey
+		for {
+			if prev, err := s.st.GetIdempotent(agent.ID, idemKey); err == nil && prev != "" {
+				w.Header().Set("Idempotent-Replay", "true")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(prev))
+				return
+			}
+			s.idemMu.Lock()
+			ch, busy := s.idemFlight[flightKey]
+			if !busy {
+				ch = make(chan struct{})
+				s.idemFlight[flightKey] = ch
+				s.idemMu.Unlock()
+				defer func() {
+					s.idemMu.Lock()
+					delete(s.idemFlight, flightKey)
+					s.idemMu.Unlock()
+					close(ch)
+				}()
+				break
+			}
+			s.idemMu.Unlock()
+			select {
+			case <-ch: // the in-flight twin finished; re-check the store
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
+
+	var req sendRequest
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	res, status, err := s.performSend(agent, req)
+	if err != nil {
+		errJSON(w, status, "%v", err)
+		return
+	}
+	if idemKey != "" {
+		if buf, err := json.Marshal(res); err == nil {
+			_ = s.st.PutIdempotent(agent.ID, idemKey, string(buf))
+		}
+	}
+	writeJSON(w, status, res)
+}
+
+// performSend implements one send: resolve the file, mint a fresh link,
+// deliver same-instance recipients straight to their inbox, relay the rest
+// as real email. Shared by REST and MCP.
+func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, int, error) {
+	if len(req.To) == 0 {
+		return nil, http.StatusBadRequest, errors.New("\"to\" requires at least one recipient")
+	}
+	if len(req.To) > 20 {
+		return nil, http.StatusBadRequest, errors.New("at most 20 recipients per send")
+	}
+	if req.File == "" && strings.TrimSpace(req.Note) == "" {
+		return nil, http.StatusBadRequest, errors.New("nothing to send: provide \"file\", \"note\", or both")
+	}
+
+	// Threading.
+	var inReplyTo, references, replySubject string
+	if req.ReplyTo != "" {
+		orig, err := s.st.GetMessage(agent.ID, req.ReplyTo)
+		if err != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("reply_to: no message %q in your inbox", req.ReplyTo)
+		}
+		inReplyTo = orig.MessageID
+		references = strings.TrimSpace(orig.References + " " + orig.MessageID)
+		replySubject = orig.Subject
+		if replySubject != "" && !strings.HasPrefix(strings.ToLower(replySubject), "re:") {
+			replySubject = "Re: " + replySubject
+		}
+	}
+
+	// Classify recipients (deduplicated — one delivery and one rate unit per
+	// unique address).
+	instance := s.st.Instance()
+	var localAgents []store.Agent
+	var remote []string
+	seen := map[string]bool{}
+	for _, to := range req.To {
+		addr := strings.ToLower(strings.TrimSpace(to))
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		localpart, domain, ok := strings.Cut(addr, "@")
+		if ok && domain == instance {
+			la, err := s.st.AgentByName(localpart)
+			if err != nil {
+				return nil, http.StatusBadRequest, fmt.Errorf("no agent %q on this instance", addr)
+			}
+			localAgents = append(localAgents, la)
+			continue
+		}
+		remote = append(remote, addr)
+	}
+	if len(localAgents)+len(remote) == 0 {
+		return nil, http.StatusBadRequest, errors.New("\"to\" requires at least one recipient")
+	}
+
+	if len(remote) > 0 {
+		if !s.emailCapable() {
+			return nil, http.StatusBadRequest, fmt.Errorf("this instance cannot send email (it can only deliver to local agents …@%s) — configure DOMAIN + OUTBOUND, or CONNECT to a host", instance)
+		}
+		if !agent.OwnerVerified {
+			return nil, http.StatusForbidden, errors.New("outbound email requires a verified owner; open the verification link sent to your owner_email (or ask the operator)")
+		}
+	}
+
+	// Recipients who unsubscribed are skipped (and reported); they consume
+	// neither send rate nor a circle slot.
+	var sendable, unsubscribed []string
+	for _, addr := range remote {
+		if s.st.IsSuppressed(addr) {
+			unsubscribed = append(unsubscribed, addr)
+		} else {
+			sendable = append(sendable, addr)
+		}
+	}
+
+	// Resolve the file reference and TTL before consuming quota — lookups
+	// have no side effects, so a bad reference costs nothing.
+	var sendFile *store.File
+	var linkTTL time.Duration
+	if req.File != "" {
+		f, err := s.resolveFile(agent, req.File)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		sendFile = &f
+		linkTTL, err = s.ttlFrom(req.TTL, s.cfg.DefaultTTL)
+		if err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+	}
+
+	// The recipient circle: every unique remote address the agent ever emails
+	// counts against a small lifetime cap (the verified owner is exempt), so a
+	// compromised or prompt-injected agent can reach at most a handful of
+	// strangers. Claimed first among the spends because it is the only
+	// releasable one — slots for sends that fail below are refunded.
+	var newCircle []string
+	if len(sendable) > 0 {
+		circleAddrs := make([]string, 0, len(sendable))
+		for _, a := range sendable {
+			if agent.OwnerEmail == "" || !strings.EqualFold(a, agent.OwnerEmail) {
+				circleAddrs = append(circleAddrs, a)
+			}
+		}
+		var err error
+		newCircle, err = s.st.ClaimHumanRecipients(agent.ID, circleAddrs, s.humanCircleMax(agent))
+		if err != nil {
+			if errors.Is(err, store.ErrCircleFull) {
+				return nil, http.StatusForbidden, fmt.Errorf("%v — the operator can widen it: POST /v1/agents/%s/limits", err, agent.ID)
+			}
+			return nil, http.StatusInternalServerError, err
+		}
+	}
+
+	// Rate limit one unit per unique recipient — after validation and before
+	// the link is minted, so a rejected send leaves nothing behind (its rate
+	// charge is refunded and its circle slots released).
+	if err := s.checkRateN(agent.ID, "sends", int64(len(localAgents)+len(sendable)), s.cfg.SendRate); err != nil {
+		_ = s.st.ReleaseHumanRecipients(agent.ID, newCircle)
+		return nil, http.StatusTooManyRequests, err
+	}
+
+	// File → fresh ephemeral link.
+	var link *store.Link
+	var filePart *proto.Part
+	if sendFile != nil {
+		l, err := s.st.CreateLink(agent.ID, sendFile.SHA256, sendFile.Name, sendFile.MIME, sendFile.Size, req.Once, linkTTL)
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		link = &l
+		p := proto.FilePart(l.Name, l.MIME, s.linkURL(l.Token), l.SHA256, l.Size,
+			time.Unix(l.ExpiresAt, 0).UTC().Format(time.RFC3339), l.Once)
+		filePart = &p
+	}
+
+	subject := strings.TrimSpace(req.Subject)
+	if subject == "" {
+		switch {
+		case replySubject != "":
+			subject = replySubject
+		case link != nil:
+			subject = fmt.Sprintf("[AgentTransfer] %s (%s)", link.Name, humanSize(link.Size))
+		default:
+			subject = "[AgentTransfer] message from " + agent.Name
+		}
+	}
+
+	msgID := store.NewID("msg")
+	rfcMsgID := afmail.FormatRFCMessageID(msgID, s.st.Instance())
+
+	manifest := proto.Manifest{V: proto.Version, From: agent.Email, MessageID: msgID}
+	if req.ReplyTo != "" {
+		manifest.InReplyTo = req.ReplyTo
+	}
+	if strings.TrimSpace(req.Note) != "" {
+		manifest.Parts = append(manifest.Parts, proto.TextPart(req.Note))
+	}
+	if filePart != nil {
+		manifest.Parts = append(manifest.Parts, *filePart)
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	res := &sendResult{MessageID: msgID, Subject: subject, Delivered: []map[string]any{}}
+	if link != nil {
+		lj := s.linkJSON(*link)
+		res.Link = &lj
+	}
+
+	// Local fast path: same-instance recipients skip SMTP entirely.
+	for _, la := range localAgents {
+		_, err := s.st.AddMessage(store.Message{
+			AgentID: la.ID, From: agent.Email, To: req.To, Subject: subject,
+			Text: strings.TrimSpace(req.Note), MessageID: rfcMsgID,
+			InReplyTo: inReplyTo, References: references,
+			Manifest: string(manifestJSON), DKIM: "local", SPF: "local",
+		})
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		s.hub.notify(la.ID)
+		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionSent, shaOf(link), sizeOf(link), la.Email, msgID)
+		_, _ = s.st.AppendReceipt(la.Email, receipt.ActionReceived, shaOf(link), sizeOf(link), agent.Email, msgID)
+		res.Delivered = append(res.Delivered, map[string]any{"to": la.Email, "via": "inbox"})
+	}
+
+	// Remote: one real email PER recipient through the relay, each carrying
+	// its own unsubscribe link (a shared body can't personalize suppression).
+	ccOwner := req.CCOwner || agent.AlwaysCCOwner
+	var cc []string
+	if ccOwner {
+		switch {
+		case agent.OwnerEmail == "":
+			res.CCOwner = "skipped (agent has no owner_email)"
+		case !agent.OwnerVerified:
+			// The CC rides the relay like any outbound email, so it needs the
+			// same verified owner — otherwise an unverified signup could relay
+			// mail to an arbitrary owner_email via local-only sends.
+			res.CCOwner = "skipped (owner not verified)"
+		default:
+			cc = append(cc, agent.OwnerEmail)
+		}
+	}
+	if len(sendable) > 0 || len(cc) > 0 {
+		if !s.emailCapable() {
+			if ccOwner && res.CCOwner == "" {
+				res.CCOwner = "skipped (no outbound email path configured)"
+			}
+		} else {
+			sendOne := func(to []string, unsubURL string) error {
+				m := &afmail.Message{
+					FromName: agent.Name, From: agent.Email,
+					To: to, Subject: subject,
+					Text:      s.renderBody(agent, req.Note, link, unsubURL),
+					MessageID: rfcMsgID, InReplyTo: inReplyTo, References: references,
+					Manifest: manifestJSON, ManifestName: proto.Filename,
+				}
+				raw, err := m.Build()
+				if err != nil {
+					return err
+				}
+				return s.sendRaw(agent.Email, to, raw)
+			}
+			var failedCircle []string
+			var lastErr error
+			delivered := 0
+			for _, to := range sendable {
+				if err := sendOne([]string{to}, s.unsubscribeURL(to)); err != nil {
+					lastErr = err
+					log.Printf("send: relay to %s (from %s) failed: %v", to, agent.Email, err)
+					res.Delivered = append(res.Delivered, map[string]any{"to": to, "via": "error", "error": err.Error()})
+					for _, n := range newCircle {
+						if n == to {
+							failedCircle = append(failedCircle, to)
+						}
+					}
+					continue
+				}
+				delivered++
+				_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionSent, shaOf(link), sizeOf(link), to, msgID)
+				res.Delivered = append(res.Delivered, map[string]any{"to": to, "via": "email"})
+			}
+			// The owner's copy carries no unsubscribe link — the owner's lever
+			// is verification/limits, not suppression.
+			if len(cc) > 0 {
+				if err := sendOne(cc, ""); err != nil {
+					res.CCOwner = "failed: " + err.Error()
+				} else {
+					res.CCOwner = "sent to " + agent.OwnerEmail
+				}
+			}
+			// A recipient whose send failed must not consume a circle slot
+			// forever (typo'd addresses would burn the cap).
+			if len(failedCircle) > 0 {
+				_ = s.st.ReleaseHumanRecipients(agent.ID, failedCircle)
+			}
+			if len(sendable) > 0 && delivered == 0 && len(localAgents) == 0 {
+				return nil, http.StatusBadGateway, fmt.Errorf("email send failed: %w", lastErr)
+			}
+		}
+	}
+	for _, addr := range unsubscribed {
+		res.Delivered = append(res.Delivered, map[string]any{"to": addr, "via": "suppressed"})
+	}
+
+	s.metrics.sends.Add(1)
+	return res, http.StatusCreated, nil
+}
+
+func shaOf(l *store.Link) string {
+	if l == nil {
+		return ""
+	}
+	return l.SHA256
+}
+
+func sizeOf(l *store.Link) int64 {
+	if l == nil {
+		return 0
+	}
+	return l.Size
+}
+
+func (s *Server) renderBody(agent store.Agent, note string, link *store.Link, unsubURL string) string {
+	var b strings.Builder
+	if strings.TrimSpace(note) != "" {
+		b.WriteString(strings.TrimSpace(note))
+		b.WriteString("\n\n")
+	}
+	if link != nil {
+		fmt.Fprintf(&b, "File: %s (%s)\nDownload: %s\nExpires: %s\nsha256: %s\n",
+			link.Name, humanSize(link.Size), s.linkURL(link.Token),
+			time.Unix(link.ExpiresAt, 0).UTC().Format(time.RFC3339), link.SHA256)
+		if link.Once {
+			b.WriteString("This link is single-download: it burns after the first complete fetch.\n")
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "--\nSent by agent %s via AgentTransfer (verify integrity with the sha256 above)\n", agent.Email)
+	if unsubURL != "" {
+		fmt.Fprintf(&b, "Stop receiving mail from agents on this instance: %s\n", unsubURL)
+	}
+	return b.String()
+}
+
+// unsubscribeURL builds the per-recipient suppression link that rides in
+// every human-bound email footer.
+func (s *Server) unsubscribeURL(addr string) string {
+	return s.BaseURL() + "/unsubscribe?e=" + url.QueryEscape(addr) + "&t=" + s.st.UnsubscribeToken(addr)
+}
+
+// handleUnsubscribe (GET) shows a confirm page — like verification, the GET
+// consumes nothing so link prefetchers can't unsubscribe (or DoS-suppress) an
+// address; only the explicit POST does.
+func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	addr := strings.TrimSpace(r.URL.Query().Get("e"))
+	tok := strings.TrimSpace(r.URL.Query().Get("t"))
+	if addr == "" || !s.st.CheckUnsubscribeToken(addr, tok) {
+		http.Error(w, "invalid unsubscribe link", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if s.st.IsSuppressed(addr) {
+		_ = s.tmpl.ExecuteTemplate(w, "unsubscribed.html", map[string]any{"Addr": addr})
+		return
+	}
+	_ = s.tmpl.ExecuteTemplate(w, "unsubscribe.html", map[string]any{
+		"Addr":   addr,
+		"Action": "/unsubscribe?e=" + url.QueryEscape(addr) + "&t=" + url.QueryEscape(tok),
+	})
+}
+
+// handleUnsubscribeConfirm (POST) suppresses the address for good.
+func (s *Server) handleUnsubscribeConfirm(w http.ResponseWriter, r *http.Request) {
+	addr := strings.TrimSpace(r.URL.Query().Get("e"))
+	tok := strings.TrimSpace(r.URL.Query().Get("t"))
+	if addr == "" || !s.st.CheckUnsubscribeToken(addr, tok) {
+		http.Error(w, "invalid unsubscribe link", http.StatusNotFound)
+		return
+	}
+	if err := s.st.Suppress(addr); err != nil {
+		http.Error(w, "unsubscribe failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.tmpl.ExecuteTemplate(w, "unsubscribed.html", map[string]any{"Addr": addr})
+}
+
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// ---- inbox ----
+
+func (s *Server) messageJSON(m store.Message) map[string]any {
+	out := map[string]any{
+		"id": m.ID, "from": m.From, "to": m.To, "subject": m.Subject, "text": m.Text,
+		"message_id": m.MessageID, "read": m.Read,
+		"dkim": m.DKIM, "spf": m.SPF,
+		"attachments": m.Attachments,
+		"received_at": time.Unix(m.ReceivedAt, 0).UTC().Format(time.RFC3339),
+	}
+	if m.InReplyTo != "" {
+		out["in_reply_to"] = m.InReplyTo
+	}
+	if m.References != "" {
+		out["references"] = m.References
+	}
+	if m.Manifest != "" {
+		var man proto.Manifest
+		if err := json.Unmarshal([]byte(m.Manifest), &man); err == nil {
+			out["manifest"] = man
+			if fp := man.FirstFile(); fp != nil {
+				offer := map[string]any{
+					"name":       fp.File.Name,
+					"mime":       fp.File.MIMEType,
+					"url":        fp.File.URI,
+					"sha256":     fp.MetaString(proto.MetaSHA256),
+					"size":       fp.MetaInt64(proto.MetaSize),
+					"expires_at": fp.MetaString(proto.MetaExpiresAt),
+					// Burn-after-read links must be fetched knowingly — the
+					// download consumes them.
+					"once": fp.MetaBool(proto.MetaOnce),
+				}
+				// Only auto-trust offers with authenticated provenance.
+				offer["trusted"] = m.DKIM == "pass" || m.DKIM == "local"
+				out["offer"] = offer
+			}
+		}
+	}
+	return out
+}
+
+func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	q := r.URL.Query()
+	unread := q.Get("unread") == "1" || q.Get("unread") == "true"
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	msgs, err := s.st.ListInbox(agent.ID, unread, q.Get("thread"), limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	out := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, s.messageJSON(m))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"messages": out})
+}
+
+func (s *Server) handleInboxWait(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	timeout := 30 * time.Second
+	if t := r.URL.Query().Get("timeout"); t != "" {
+		if secs, err := strconv.Atoi(t); err == nil && secs > 0 {
+			timeout = time.Duration(secs) * time.Second
+		}
+	}
+	if timeout > 120*time.Second {
+		timeout = 120 * time.Second
+	}
+
+	ch, cancel := s.hub.subscribe(agent.ID)
+	defer cancel()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for {
+		msgs, err := s.st.ListInbox(agent.ID, true, "", 0)
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		if len(msgs) > 0 {
+			out := make([]map[string]any, 0, len(msgs))
+			for _, m := range msgs {
+				out = append(out, s.messageJSON(m))
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"messages": out})
+			return
+		}
+		select {
+		case <-ch:
+			// New mail signal: loop and fetch.
+		case <-deadline.C:
+			writeJSON(w, http.StatusOK, map[string]any{"messages": []any{}})
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	m, err := s.st.GetMessage(agent.ID, r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		errJSON(w, http.StatusNotFound, "no such message")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.messageJSON(m))
+}
+
+func (s *Server) handleMarkRead(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	if err := s.st.MarkRead(agent.ID, r.PathValue("id")); err != nil {
+		errJSON(w, http.StatusNotFound, "no such message")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"read": true})
+}
+
+// ---- upload requests ----
+
+func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	var req struct {
+		Note string `json:"note"`
+		TTL  string `json:"ttl"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	ttl, err := s.ttlFrom(req.TTL, s.cfg.MaxTTL)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	u, err := s.st.CreateUploadRequest(agent.ID, req.Note, ttl)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"upload_url": s.BaseURL() + "/u/" + u.Token,
+		"token":      u.Token,
+		"expires_at": time.Unix(u.ExpiresAt, 0).UTC().Format(time.RFC3339),
+	})
+}
+
+// ---- receipts ----
+
+func (s *Server) handleReceipts(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	rs, err := s.st.ListReceipts(agent.Email, limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance":       s.st.Instance(),
+		"receipt_pubkey": receipt.FormatPublicKey(s.st.PublicKey()),
+		"receipts":       rs,
+	})
+}
+
+// handleReceiptsExport streams the full instance chain as JSONL (admin only) —
+// the verifiable, portable evidence log.
+func (s *Server) handleReceiptsExport(w http.ResponseWriter, r *http.Request) {
+	if !s.st.IsAdmin(bearer(r)) {
+		errJSON(w, http.StatusForbidden, "admin token required")
+		return
+	}
+	rs, err := s.st.ListReceipts("", 0)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("X-Receipt-Pubkey", receipt.FormatPublicKey(s.st.PublicKey()))
+	enc := json.NewEncoder(w)
+	for _, rec := range rs {
+		_ = enc.Encode(rec)
+	}
+}
+
+// handleAdminStorage (admin) is the operator's storage dashboard: volume and
+// disk-guard state plus the top consumers by folder bytes — abuse cleanup
+// starts with being able to SEE who holds the disk.
+func (s *Server) handleAdminStorage(w http.ResponseWriter, r *http.Request) {
+	if !s.st.IsAdmin(bearer(r)) {
+		errJSON(w, http.StatusForbidden, "admin token required")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	agents, err := s.st.TopStorageConsumers(limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	stored, _ := s.st.StoredBytes()
+	free, total, reserve := s.st.DiskStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"volume": map[string]any{
+			"total":           total,
+			"free":            free,
+			"reserve":         reserve,
+			"guard_active":    reserve > 0,
+			"uploads_refused": s.st.DiskFull(),
+		},
+		"stored_bytes": stored, // physical (deduplicated) blob bytes
+		"agents":       agents, // folder bytes per agent, biggest first
+	})
+}
+
+// ---- meta ----
+
+func (s *Server) handleWellKnown(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{
+		"name":           "agenttransfer",
+		"version":        Version,
+		"instance":       s.st.Instance(),
+		"receipt_pubkey": receipt.FormatPublicKey(s.st.PublicKey()),
+		"max_file_size":  s.cfg.MaxFileSize,
+		"default_ttl":    s.cfg.DefaultTTL.String(),
+		"max_ttl":        s.cfg.MaxTTL.String(),
+		"open_signup":    s.cfg.OpenSignup,
+		"email_enabled":  s.emailCapable(),
+		"protocols":      map[string]any{"manifest": proto.Version, "a2a_parts": true},
+		"endpoints":      map[string]string{"api": s.BaseURL() + "/v1", "mcp": s.BaseURL() + "/mcp"},
+	}
+	// Advertise the abuse contact when the operator has stood one up (an
+	// agent named "abuse" — the name is reserved from open signup).
+	if s.cfg.EmailEnabled() {
+		if a, err := s.st.AgentByName("abuse"); err == nil {
+			out["abuse"] = a.Email
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.tmpl.ExecuteTemplate(w, "index.html", map[string]any{
+		"Instance":   s.st.Instance(),
+		"OpenSignup": s.cfg.OpenSignup,
+		"Base":       s.BaseURL(),
+	})
+}
+
+// Version is stamped at build time via -ldflags; keep a sane default.
+var Version = "0.1.0-dev"

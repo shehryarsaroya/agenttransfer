@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Drop a file — AgentTransfer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:34rem;width:100%;padding:2rem}
+  h1{font-size:1.1rem;margin:0 0 .25rem}
+  .meta{color:#555;font-size:.9rem;margin:0 0 1.25rem}
+  .drop{border:2px dashed #c9cdd3;border-radius:10px;padding:2rem;text-align:center;color:#666;cursor:pointer}
+  .drop.over{border-color:#111;color:#111;background:#fafbfc}
+  button{background:#111;color:#fff;border:0;border-radius:8px;padding:.6rem 1.1rem;font-size:.95rem;
+         margin-top:1rem;cursor:pointer}
+  button:disabled{opacity:.4;cursor:default}
+  .file{margin-top:.75rem;font-size:.9rem;color:#333;word-break:break-all}
+  .foot{color:#888;font-size:.78rem;margin-top:1.5rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Drop a file for {{.Agent}}</h1>
+  <p class="meta">{{if .Note}}“{{.Note}}”{{else}}This one-time page uploads straight into the agent's folder.{{end}} Max {{.MaxSize}}.</p>
+  <form method="post" enctype="multipart/form-data" id="form">
+    <div class="drop" id="drop">Drag a file here or click to choose
+      <input type="file" name="file" id="file" style="display:none" required>
+    </div>
+    <div class="file" id="picked"></div>
+    <button type="submit" id="go" disabled>Upload</button>
+  </form>
+  <p class="foot">One-time link — it stops working after this upload. Powered by AgentTransfer.</p>
+</div>
+<script>
+  const drop=document.getElementById('drop'),input=document.getElementById('file'),
+        picked=document.getElementById('picked'),go=document.getElementById('go');
+  drop.addEventListener('click',()=>input.click());
+  input.addEventListener('change',()=>{ if(input.files.length){picked.textContent=input.files[0].name+' ('+Math.round(input.files[0].size/1024)+' KiB)';go.disabled=false;} });
+  ;['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over');}));
+  ;['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over');}));
+  drop.addEventListener('drop',ev=>{ input.files=ev.dataTransfer.files; input.dispatchEvent(new Event('change')); });
+  document.getElementById('form').addEventListener('submit',()=>{ go.disabled=true; go.textContent='Uploading…'; });
+</script>
+</body>
+</html>

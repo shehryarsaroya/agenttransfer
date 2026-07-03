@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Confirm verification — AgentTransfer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:34rem;width:100%;padding:2rem}
+  h1{font-size:1.1rem;margin:0 0 .5rem}
+  p{color:#555;font-size:.92rem;line-height:1.5}
+  code{background:#f2f3f5;border-radius:4px;padding:.1rem .3rem}
+  ul{color:#555;font-size:.9rem;line-height:1.6;padding-left:1.2rem}
+  button{background:#111;color:#fff;border:0;border-radius:8px;padding:.6rem 1.1rem;font-size:.95rem;cursor:pointer}
+  .foot{color:#888;font-size:.78rem;margin-top:1.5rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Approve outbound email for {{.What}}?</h1>
+  <p>Someone (probably you) named this address as the owner of <code>{{.What}}</code>. Confirming will:</p>
+  <ul>
+    <li>let it send real email, up to {{.Sends}} messages per day{{if gt .Circle 0}}, to at most {{.Circle}} unique outside recipients (you don't count){{end}}</li>
+    <li>record this address as its accountable contact</li>
+  </ul>
+  <form method="post" action="{{.Action}}">
+    <button type="submit">Confirm — I own this</button>
+  </form>
+  <p class="foot">Not you? Just close this page — nothing happens without the click above.</p>
+</div>
+</body>
+</html>

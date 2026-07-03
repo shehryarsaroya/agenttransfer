@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentTransfer nightly backup snapshot
+# Snapshots DATA_DIR into /var/backups/agenttransfer/<date>.tar.gz and keeps
+# the last 7. Uses sqlite3's .backup for a consistent DB copy while the server
+# runs (WAL-safe) — `apt install sqlite3`. Pull the snapshots OFF the box too:
+# a backup that dies with the disk isn't one (see docs/self-hosting.md).
+
+[Service]
+Type=oneshot
+Environment=DATA_DIR=/var/lib/agenttransfer
+Environment=BACKUP_DIR=/var/backups/agenttransfer
+ExecStart=/bin/bash -c '\
+  set -euo pipefail; \
+  mkdir -p "$BACKUP_DIR"; \
+  work=$(mktemp -d); trap "rm -rf $work" EXIT; \
+  sqlite3 "$DATA_DIR/agenttransfer.db" ".backup $work/agenttransfer.db"; \
+  tar -C "$DATA_DIR" -czf "$BACKUP_DIR/agenttransfer-$(date +%%F).tar.gz" \
+      -C "$work" agenttransfer.db -C "$DATA_DIR" blobs certmagic 2>/dev/null || \
+  tar -czf "$BACKUP_DIR/agenttransfer-$(date +%%F).tar.gz" -C "$work" agenttransfer.db -C "$DATA_DIR" blobs; \
+  ls -1t "$BACKUP_DIR"/agenttransfer-*.tar.gz | tail -n +8 | xargs -r rm -f; \
+  ls -lh "$BACKUP_DIR" | tail -3'

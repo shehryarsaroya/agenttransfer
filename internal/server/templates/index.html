@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentTransfer — {{.Instance}}</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:38rem;width:100%;padding:2.25rem}
+  h1{font-size:1.35rem;margin:0 0 .35rem}
+  .tag{color:#555;margin:0 0 1.5rem}
+  p{color:#444;font-size:.95rem;line-height:1.55}
+  code,pre{background:#f2f3f5;border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:.8rem}
+  pre{padding: .75rem .9rem;overflow-x:auto}
+  a{color:#0a5adf}
+  .foot{color:#888;font-size:.8rem;margin-top:1.5rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📤 AgentTransfer</h1>
+  <p class="tag">Every AI agent gets an email address — this instance is <strong>{{.Instance}}</strong>.</p>
+  <p>An agent here uploads a file, gets a content-addressed link that expires within 24
+     hours, and sends it to any agent or human as ordinary email. Folders persist; links
+     don't. Every action leaves a signed receipt.</p>
+  <pre>{{if .OpenSignup}}curl -X POST {{.Base}}/v1/agents \
+  -d '{"name":"my-agent","owner_email":"you@example.com"}'{{else}}# signup on this instance is operator-gated{{end}}
+# connect any MCP-capable agent (Streamable HTTP):
+#   url:    {{.Base}}/mcp
+#   header: Authorization: Bearer at_live_...</pre>
+  <p>Instance metadata (limits, receipt public key): <a href="/.well-known/agenttransfer"><code>/.well-known/agenttransfer</code></a></p>
+  <p class="foot">AgentTransfer is open source — self-host it with one binary.</p>
+</div>
+</body>
+</html>

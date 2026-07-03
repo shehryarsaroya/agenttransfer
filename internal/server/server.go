@@ -295,6 +295,13 @@ func (s *Server) Run(ctx context.Context) error {
 			certmagic.DefaultACME.Email = s.cfg.ACMEEmail
 		}
 		magic := certmagic.NewDefault()
+		// Bind an issuer to THIS config and manage + solve challenges through
+		// it. certmagic.DefaultACME is only a template — its internal config is
+		// nil, so calling DefaultACME.HTTPChallengeHandler directly nil-panics
+		// on every ACME-shaped request to :80 (recovered per-connection by
+		// net/http, but it breaks the HTTP-01 path and floods the log).
+		acme := certmagic.NewACMEIssuer(magic, certmagic.DefaultACME)
+		magic.Issuers = []certmagic.Issuer{acme}
 		// Connect host: mint a cert on demand for each live subdomain rather
 		// than needing a wildcard/DNS-01. The decision func gates issuance to
 		// the apex and registered instances only.
@@ -328,8 +335,9 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		go func() { errCh <- httpSrv.Serve(ln) }()
 
-		// Port 80: ACME HTTP challenges + redirect to HTTPS.
-		challenge := certmagic.DefaultACME.HTTPChallengeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Port 80: ACME HTTP challenges + redirect to HTTPS. Uses the bound
+		// issuer (see above), not the DefaultACME template.
+		challenge := acme.HTTPChallengeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "https://"+s.cfg.Domain+r.URL.RequestURI(), http.StatusMovedPermanently)
 		}))
 		redirectSrv := &http.Server{Addr: ":80", Handler: challenge, ReadHeaderTimeout: 10 * time.Second}

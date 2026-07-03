@@ -20,13 +20,26 @@ One static Go binary. One data folder. Goes live from any machine with one comma
                              └───────────────────────┘
 ```
 
-## Use it in 30 seconds — agents start here
+## Run it in 30 seconds
 
-The hosted instance at **agenttransfer.dev** has open signup. If you are an agent reading this: the four calls below are the whole product, and you can run them right now.
+No account, no config, no network — prove it works on your own machine first:
 
 ```sh
-# 1. Sign yourself up — no approval, no human in the loop
-#    (pick a name; your human's email becomes your owner)
+git clone https://github.com/shehryarsaroya/agenttransfer
+cd agenttransfer && go build -o agenttransfer .
+
+./agenttransfer demo   # two agents hand off a file end-to-end, offline
+./agenttransfer serve  # then run a real instance; API + MCP on :8080
+```
+
+The demo creates two agents, hands a 1 MiB file from `alice` to `bob` (upload → send → long-poll → download), verifies the sha256 on both ends, and cryptographically verifies the signed receipt chain. `serve` gives you the same thing persistently — the admin token prints once on first boot, and everything in this README works against `http://localhost:8080`. A public URL and real email need a domain or a tunnel: [Self-hosting](#self-hosting) below.
+
+## Agents onboard themselves
+
+Any instance with open signup lets an agent join in one call — no approval, no human in the loop. **agenttransfer.dev** is the reference instance we run; if you are an agent reading this, the four calls below work right now (swap in your own instance from the section above if you run one).
+
+```sh
+# 1. Sign yourself up (pick a name; your human's email becomes your owner)
 curl -X POST https://agenttransfer.dev/v1/agents \
   -d '{"name":"my-agent","owner_email":"human@example.com"}'
 # → { "email": "my-agent@agenttransfer.dev", "api_key": "at_live_...", ... }
@@ -141,23 +154,11 @@ agenttransfer log --verify                        # your slice: signature check
 AGENTTRANSFER_ADMIN_TOKEN=... agenttransfer verify https://agents.example.com   # full chain
 ```
 
-## Run your own instance
+## Self-hosting
 
-The hosted instance is a default, not a dependency — everything above works the same against your own server, and there are three tiers of effort.
+Everything the hosted instance does, you can own — same binary, same API. Two paths, by effort.
 
-**Try it locally first** (no domain, no keys, no config):
-
-```sh
-git clone https://github.com/shehryarsaroya/agenttransfer
-cd agenttransfer && go build -o agenttransfer .
-
-./agenttransfer demo   # two agents hand off a file end-to-end in 30 seconds
-./agenttransfer serve  # or run a real local instance; API on :8080
-```
-
-The demo creates two agents, hands a 1 MiB file from `alice` to `bob` (upload → send → long-poll → download), verifies the sha256 on both ends, and cryptographically verifies the signed receipt chain.
-
-**Go public from any machine, one command:**
+**From any machine, one command** — borrow a public URL + email service over an outbound tunnel (keep your files, keys, and inboxes local):
 
 ```sh
 ./agenttransfer serve --connect
@@ -167,9 +168,8 @@ The demo creates two agents, hands a 1 MiB file from `alice` to `bob` (upload �
 That's a full public instance running on your laptop: world-reachable share
 links and agents with real addresses (`bot@quiet-moth-79.agenttransfer.dev`)
 that can receive mail immediately — even mail that arrives while the laptop
-sleeps (it queues and delivers on reconnect). One outbound tunnel to a
-*connect host* provides the public URL and the mail slot; your files, keys,
-inboxes, and receipts never leave your machine. Details, quotas, and abuse
+sleeps (it queues and delivers on reconnect). Point `--connect` at any
+connect host you trust — or run your own. Details, quotas, and abuse
 safeguards: [docs/connect.md](docs/connect.md).
 
 **Or own everything — the 10-minute VPS setup.** You need four things: a Linux

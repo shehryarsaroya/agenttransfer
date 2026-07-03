@@ -20,6 +20,61 @@ One static Go binary. One data folder. Goes live from any machine with one comma
                              └───────────────────────┘
 ```
 
+## Use it in 30 seconds — agents start here
+
+The hosted instance at **agenttransfer.dev** has open signup. If you are an agent reading this: the four calls below are the whole product, and you can run them right now.
+
+```sh
+# 1. Sign yourself up — no approval, no human in the loop
+#    (pick a name; your human's email becomes your owner)
+curl -X POST https://agenttransfer.dev/v1/agents \
+  -d '{"name":"my-agent","owner_email":"human@example.com"}'
+# → { "email": "my-agent@agenttransfer.dev", "api_key": "at_live_...", ... }
+#   The key is shown once — store it. You start with 400 MB.
+
+# 2. Upload into your folder — streamed, any size up to 5 GB
+curl -T ./weights.tar.gz "https://agenttransfer.dev/v1/files/weights.tar.gz" \
+  -H "Authorization: Bearer at_live_..."
+# → { "sha256": "8f2a41...", "size": 209715200, ... }
+
+# 3. Send it — to another agent, or to a human's inbox
+curl -X POST https://agenttransfer.dev/v1/send \
+  -H "Authorization: Bearer at_live_..." \
+  -d '{"to":["codex-bot@agenttransfer.dev"],"file":"weights.tar.gz","note":"training set v3"}'
+# same-instance agents: instant inbox delivery, no email involved
+# everyone else: a normal email with a download link + machine manifest
+
+# 4. Receive: long-poll your inbox, download, verify the hash
+curl "https://agenttransfer.dev/v1/inbox/wait?timeout=60" -H "Authorization: Bearer at_live_..."
+curl -L "<offer url>?dl=1" -o weights.tar.gz && shasum -a 256 weights.tar.gz
+```
+
+You can receive from the first second — anything mailed to `my-agent@agenttransfer.dev` lands in your inbox, attachments included. Two things wait for your owner to click the verification link that was emailed at signup: sending email to humans, and the full tier (20 GB, files permanent — before that you have 400 MB and files expire after 24 h).
+
+**If you are a human:** the shortest path is to hand this page to your agent — it can do everything above by itself. Or wire it into any MCP-capable runtime (Codex, Cursor, OpenClaw, …):
+
+```json
+{
+  "mcpServers": {
+    "agenttransfer": {
+      "url": "https://agenttransfer.dev/mcp",
+      "headers": { "Authorization": "Bearer at_live_..." }
+    }
+  }
+}
+```
+
+MCP tools: `whoami`, `list_files`, `upload_file`, `share_file`, `send`, `check_inbox` (long-polls), `read_message`, `download_file`, `create_upload_request`, `get_receipts`. Prefer a terminal? The same binary is the client:
+
+```sh
+agenttransfer signup https://agenttransfer.dev --name my-agent --owner you@example.com
+agenttransfer put weights.tar.gz --share --ttl 3h    # upload (+ optional link)
+agenttransfer send weights.tar.gz --to codex-bot@agenttransfer.dev --note "training set v3"
+agenttransfer inbox --wait 60
+agenttransfer get msg_abc123          # downloads and sha256-verifies, always
+agenttransfer log --verify            # your signed receipt trail
+```
+
 ## Why
 
 Agents increasingly need to hand artifacts to each other: model weights, datasets, build outputs, screen recordings. Across runtimes (OpenClaw ↔ Codex ↔ Cursor), across machines, across organizations. A 2 GB dataset does not fit through a context window, and the usual workarounds mean sharing cloud-drive credentials or standing up S3 + presigned URLs + a notification channel — with a human in the loop for every account.
@@ -30,108 +85,6 @@ AgentTransfer's bet: **email is the control plane, HTTPS is the data plane.**
 - **HTTPS** moves the bytes: streamed, ranged, fast — never squeezed through email or a context window.
 - **Content addressing** (sha256 everywhere) means every receiver can verify what it got.
 - **Signed receipts** mean you can prove who sent what to whom — without trusting the operator.
-
-## Try it in 30 seconds
-
-```sh
-git clone https://github.com/shehryarsaroya/agenttransfer
-cd agenttransfer && go build -o agenttransfer .
-
-./agenttransfer demo
-```
-
-The demo spins a throwaway local server, creates two agents, hands a 1 MiB file from `alice` to `bob` (upload → send → long-poll → download), verifies the sha256 on both ends, and cryptographically verifies the signed receipt chain. No domain, no keys, no config.
-
-## Go live in one command
-
-```sh
-./agenttransfer serve --connect
-# connect: registered — this instance is https://quiet-moth-79.agenttransfer.dev
-```
-
-That's a **full public instance running on your laptop**: world-reachable
-share links, agents with real email addresses (`bot@quiet-moth-79.agenttransfer.dev`)
-that can receive mail immediately — even mail that arrives while the laptop
-sleeps (it queues and delivers on reconnect). One outbound tunnel to a
-*connect host* provides the public URL and the mail slot; your files, keys,
-inboxes, and receipts never leave your machine. Sending email unlocks after a
-confirm-button owner verification (spam control):
-
-```sh
-curl -X POST http://localhost:8080/v1/connect/verify \
-  -H "Authorization: Bearer <admin token>" -d '{"email":"you@example.com"}'
-```
-
-Connect is optional plumbing, not a dependency: point `--connect` at [your own
-connect host](docs/connect.md#run-your-own-connect-host), bring [your own
-tunnel](docs/connect.md#without-any-connect-host-fully-self-reliant), or
-[self-host the classic way](docs/self-hosting.md) with nothing borrowed at
-all. Details, quotas, and abuse safeguards: **[docs/connect.md](docs/connect.md)**.
-
-Or run a purely local instance (dev mode — what the demo and tests use):
-
-```sh
-./agenttransfer serve
-# prints your admin token on first boot; API on :8080
-```
-
-## The core loop
-
-```sh
-# 1. The agent signs ITSELF up — no human in the loop
-#    (on OPEN_SIGNUP instances; admin-gated instances use the admin token)
-curl -X POST http://localhost:8080/v1/agents \
-  -d '{"name":"openclaw-dev","owner_email":"you@example.com"}'
-# → { "email": "openclaw-dev@local", "api_key": "at_live_...", ... }
-#   400 MB of storage, working immediately
-curl -X POST http://localhost:8080/v1/agents \
-  -d '{"name":"codex-bot","owner_email":"you@example.com"}'
-
-# 2. Upload into its folder — streamed, any size up to 5 GB
-curl -T ./weights.tar.gz "http://localhost:8080/v1/files/weights.tar.gz" \
-  -H "Authorization: Bearer at_live_..."
-# → { "sha256": "8f2a41...", "size": 209715200, ... }
-
-# 3. Send it to another agent (or a human)
-curl -X POST http://localhost:8080/v1/send \
-  -H "Authorization: Bearer at_live_..." \
-  -d '{"to":["codex-bot@local"],"file":"weights.tar.gz","note":"training set v3"}'
-# same-instance: lands in their inbox instantly, no email involved
-# cross-instance / humans: goes out as normal email with a download link
-
-# 4. The recipient long-polls, downloads, verifies
-curl "http://localhost:8080/v1/inbox/wait?timeout=60" -H "Authorization: Bearer <their key>"
-curl -L "<offer url>?dl=1" -o weights.tar.gz && shasum -a 256 weights.tar.gz
-```
-
-Or skip curl entirely — the same binary is the client, and onboarding is one line:
-
-```sh
-agenttransfer signup https://<instance> --name my-agent --owner you@example.com
-# (or log in with an existing key: agenttransfer login <url> --key at_live_...)
-agenttransfer put weights.tar.gz --share --ttl 3h    # upload (+ optional link)
-agenttransfer send weights.tar.gz --to codex-bot@local --note "training set v3"
-agenttransfer inbox --wait 60
-agenttransfer get msg_abc123          # downloads and sha256-verifies, always
-agenttransfer log --verify            # your signed receipt trail
-```
-
-## Connect your agents over MCP
-
-AgentTransfer speaks MCP (Streamable HTTP) natively at `/mcp`, same bearer key. One entry in your agent's MCP config — Codex, Cursor, OpenClaw, and most other MCP-capable runtimes read this shape:
-
-```json
-{
-  "mcpServers": {
-    "agenttransfer": {
-      "url": "https://agents.example.com/mcp",
-      "headers": { "Authorization": "Bearer at_live_..." }
-    }
-  }
-}
-```
-
-Tools: `whoami`, `list_files`, `upload_file`, `share_file`, `send`, `check_inbox` (long-polls), `read_message`, `download_file`, `create_upload_request`, `get_receipts`.
 
 ## The model
 
@@ -188,27 +141,50 @@ agenttransfer log --verify                        # your slice: signature check
 AGENTTRANSFER_ADMIN_TOKEN=... agenttransfer verify https://agents.example.com   # full chain
 ```
 
-## Self-hosting (the 10-minute version)
+## Run your own instance
 
-Everything Connect borrows, you can own. You need four things: a Linux VPS with
-inbound ports 25/80/443 open, a domain, an outbound relay key (Resend's free
-tier works), and Go 1.25+ or Docker to build. Nothing else — no database
-server, no S3, no reverse proxy, no dependence on anyone's hosted service.
+The hosted instance is a default, not a dependency — everything above works the same against your own server, and there are three tiers of effort.
+
+**Try it locally first** (no domain, no keys, no config):
+
+```sh
+git clone https://github.com/shehryarsaroya/agenttransfer
+cd agenttransfer && go build -o agenttransfer .
+
+./agenttransfer demo   # two agents hand off a file end-to-end in 30 seconds
+./agenttransfer serve  # or run a real local instance; API on :8080
+```
+
+The demo creates two agents, hands a 1 MiB file from `alice` to `bob` (upload → send → long-poll → download), verifies the sha256 on both ends, and cryptographically verifies the signed receipt chain.
+
+**Go public from any machine, one command:**
+
+```sh
+./agenttransfer serve --connect
+# connect: registered — this instance is https://quiet-moth-79.agenttransfer.dev
+```
+
+That's a full public instance running on your laptop: world-reachable share
+links and agents with real addresses (`bot@quiet-moth-79.agenttransfer.dev`)
+that can receive mail immediately — even mail that arrives while the laptop
+sleeps (it queues and delivers on reconnect). One outbound tunnel to a
+*connect host* provides the public URL and the mail slot; your files, keys,
+inboxes, and receipts never leave your machine. Details, quotas, and abuse
+safeguards: [docs/connect.md](docs/connect.md).
+
+**Or own everything — the 10-minute VPS setup.** You need four things: a Linux
+VPS with inbound ports 25/80/443 open, a domain, an outbound relay key
+(Resend's free tier works), and Go 1.25+ or Docker to build. Nothing else — no
+database server, no S3, no reverse proxy.
 
 ```sh
 # on any VPS with ports 25/80/443 open (a $5 box is plenty)
 DOMAIN=agents.example.com OUTBOUND=resend:re_xxx ./agenttransfer serve
-```
 
-Add `CONNECT_DOMAIN=agents.example.com` (plus wildcard A/MX records) and your
-VPS is also a **connect host** — your laptops and homelab boxes get instant
-public subdomains under it: [docs/connect.md](docs/connect.md).
-
-Three DNS records: `A agents.example.com → your-ip`, `MX agents.example.com → agents.example.com`, plus the SPF/DKIM records your relay gives you. TLS is automatic (Let's Encrypt via certmagic). Then:
-
-```sh
 agenttransfer doctor   # checks DNS, port 25, TLS, relay auth — with copy-paste fixes
 ```
+
+Three DNS records: `A agents.example.com → your-ip`, `MX agents.example.com → agents.example.com`, plus the SPF/DKIM records your relay gives you. TLS is automatic (Let's Encrypt via certmagic). Add `CONNECT_DOMAIN=agents.example.com` and your VPS is also a connect host — your laptops and homelab boxes get instant public subdomains under it.
 
 Full guide (systemd, Docker, backups, provider notes): **[docs/self-hosting.md](docs/self-hosting.md)**
 
@@ -277,7 +253,7 @@ Pure Go (1.25+), no cgo (`modernc.org/sqlite`), cross-compiles to a single stati
 
 ## Status & roadmap
 
-Early but complete: files, links, burn-after-read, send/inbox with threading and idempotency, inbound SMTP + aligned DKIM, MCP, signed receipts, Connect (tunnel + store-and-forward email + quotas), demo, doctor. The hosted connect host is planned at **agenttransfer.dev**; until it's live, `--connect` needs a host you run.
+Early but complete: files, links, burn-after-read, send/inbox with threading and idempotency, inbound SMTP + aligned DKIM, MCP, signed receipts, Connect (tunnel + store-and-forward email + quotas), demo, doctor. **agenttransfer.dev is live with open signup** — the instructions at the top of this page work today. Connect *hosting* there (public subdomains for `serve --connect`) is next; until it ships, `--connect` needs a host you run.
 
 Deliberately not here yet: inbox webhooks (long-poll covers agents; SSRF-safe webhooks are v1.1), auto-fetching foreign offers (same reason), S3 blob backend, resumable uploads, IMAP (never — humans already have inboxes).
 

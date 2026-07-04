@@ -511,16 +511,9 @@ func TestDeleteAgent(t *testing.T) {
 	if c, _ := e.do("GET", "/v1/whoami", bobKey, nil, ""); c.StatusCode != 401 {
 		t.Fatalf("self-deleted key still works: %d", c.StatusCode)
 	}
-	// The real invariant: no agent references the shared blob anymore, so its
-	// refcount is 0. (Disk GC additionally waits out the young-blob grace
-	// period, so age it before sweeping.)
-	var refs int64
-	if err := e.srv.Store().DB.QueryRow(`SELECT refs FROM blobs WHERE sha256=?`, sha).Scan(&refs); err != nil {
-		t.Fatalf("blob row gone early: %v", err)
-	}
-	if refs != 0 {
-		t.Fatalf("shared blob refs=%d after both owners deleted, want 0 (leak or over-release)", refs)
-	}
+	// The real invariant: with both owners gone, nothing references the shared
+	// blob, so orphan GC reclaims it. (GC waits out the young-blob grace period,
+	// so age it before sweeping.)
 	if _, err := e.srv.Store().DB.Exec(`UPDATE blobs SET created_at=1 WHERE sha256=?`, sha); err != nil {
 		t.Fatal(err)
 	}

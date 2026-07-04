@@ -16,15 +16,6 @@ func newStore(t *testing.T) *Store {
 	return s
 }
 
-func blobRefs(t *testing.T, s *Store, sha string) int64 {
-	t.Helper()
-	var n int64
-	if err := s.DB.QueryRow(`SELECT refs FROM blobs WHERE sha256=?`, sha).Scan(&n); err != nil {
-		t.Fatalf("refs(%s): %v", sha, err)
-	}
-	return n
-}
-
 func put(t *testing.T, s *Store, content string) (sha string, size int64) {
 	t.Helper()
 	sha, size, err := s.PutBlob(strings.NewReader(content), 1<<20)
@@ -34,10 +25,26 @@ func put(t *testing.T, s *Store, content string) (sha string, size int64) {
 	return sha, size
 }
 
-// A link may be closed exactly once — a second close (burn racing revoke,
-// janitor racing either) must not decrement the blob ref again. Regression
-// test for the double-decrement data-loss bug.
-func TestCloseLinkDecrementsOnce(t *testing.T) {
+// survivesGC ages every blob past the grace window, runs orphan GC, and reports
+// whether sha's bytes remain — i.e. whether some file or active link still
+// references it. The whole reference model is computed on demand, so this is the
+// only observable that matters (there is no refcount to inspect).
+func survivesGC(t *testing.T, s *Store, sha string) bool {
+	t.Helper()
+	if _, err := s.DB.Exec(`UPDATE blobs SET created_at=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteOrphanBlobs(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.OpenBlob(sha)
+	return err == nil
+}
+
+// A link may be closed exactly once; further closes (burn racing revoke, the
+// janitor racing either) lose the race and are no-ops. And a blob a file still
+// references must never be reclaimed when a separate link over it closes.
+func TestCloseLinkKeepsReferencedBlob(t *testing.T) {
 	s := newStore(t)
 	a, _, err := s.CreateAgent("alice", "", true)
 	if err != nil {
@@ -51,10 +58,6 @@ func TestCloseLinkDecrementsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := blobRefs(t, s, sha); got != 2 { // file row + link
-		t.Fatalf("refs = %d, want 2", got)
-	}
-
 	if _, err := s.RevokeLink(l.Token); err != nil {
 		t.Fatalf("first close: %v", err)
 	}
@@ -64,13 +67,38 @@ func TestCloseLinkDecrementsOnce(t *testing.T) {
 	if _, err := s.RevokeLink(l.Token); err != ErrNotFound {
 		t.Fatalf("third close should lose: got %v", err)
 	}
-	if got := blobRefs(t, s, sha); got != 1 { // the file row's ref survives
-		t.Fatalf("refs after double close = %d, want 1 — the file's bytes would have been GC'd", got)
+	if !survivesGC(t, s, sha) {
+		t.Fatal("blob GC'd while a file still references it")
 	}
 }
 
-// Duplicate DeleteFile calls decrement by what each call actually deleted.
-func TestDeleteFileDecrementsByRowsDeleted(t *testing.T) {
+// A blob reachable only through a link is kept alive while the link is active
+// and reclaimed once it closes.
+func TestLinkOnlyBlobReclaimedAfterClose(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("alice", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, size := put(t, s, "link only")
+	l, err := s.CreateLink(a.ID, sha, "f.txt", "text/plain", size, false, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !survivesGC(t, s, sha) {
+		t.Fatal("an active link must keep its blob alive")
+	}
+	if _, err := s.RevokeLink(l.Token); err != nil {
+		t.Fatal(err)
+	}
+	if survivesGC(t, s, sha) {
+		t.Fatal("blob survived after its only link closed")
+	}
+}
+
+// A blob shared by two agents must survive one agent deleting (and double-
+// deleting) its copy, and be reclaimed only once no agent references it.
+func TestSharedBlobSurvivesOneAgentDelete(t *testing.T) {
 	s := newStore(t)
 	a, _, err := s.CreateAgent("alice", "", true)
 	if err != nil {
@@ -87,17 +115,44 @@ func TestDeleteFileDecrementsByRowsDeleted(t *testing.T) {
 	if _, err := s.AddFile(b.ID, sha, "f.txt", "text/plain", size, "upload", true, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := blobRefs(t, s, sha); got != 2 {
-		t.Fatalf("refs = %d, want 2", got)
-	}
 	if _, err := s.DeleteFile(a.ID, sha); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DeleteFile(a.ID, sha); err != ErrNotFound {
 		t.Fatalf("second delete should be NotFound, got %v", err)
 	}
-	if got := blobRefs(t, s, sha); got != 1 {
-		t.Fatalf("refs = %d, want 1 — bob's copy must survive alice's double delete", got)
+	if !survivesGC(t, s, sha) {
+		t.Fatal("bob's copy must survive alice's delete")
+	}
+	if _, err := s.DeleteFile(b.ID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if survivesGC(t, s, sha) {
+		t.Fatal("blob should be reclaimed once no agent references it")
+	}
+}
+
+// DeleteAgent must succeed even when the agent has registered a webhook: the
+// webhooks.agent_id FK is ON DELETE CASCADE. Regression test for the delete
+// path throwing a FK violation (and rolling back) on any agent with a webhook.
+func TestDeleteAgentCascadesWebhooks(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("alice", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateWebhook(a.ID, "https://example.test/hook", "whsec_x", "*"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.DeleteAgent(a.ID); err != nil {
+		t.Fatalf("DeleteAgent with a webhook failed (FK cascade regression): %v", err)
+	}
+	whs, err := s.ListWebhooks(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(whs) != 0 {
+		t.Fatalf("webhooks survived agent deletion: %d", len(whs))
 	}
 }
 

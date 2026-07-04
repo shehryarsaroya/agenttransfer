@@ -42,6 +42,21 @@ func randInt(n int) int {
 	return int(v.Int64())
 }
 
+// randInt64 returns a crypto-random value in [0, n). Used for backoff jitter,
+// where n is an int64 nanosecond duration that must not be narrowed to int
+// (32-bit truncation could go negative and panic rand.Int). Returns 0 for
+// n <= 0 rather than panicking.
+func randInt64(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	v, err := rand.Int(rand.Reader, big.NewInt(n))
+	if err != nil {
+		panic(err)
+	}
+	return v.Int64()
+}
+
 // randomInstanceName returns a name like "crimson-fox-42".
 func randomInstanceName() string {
 	return fmt.Sprintf("%s-%s-%d",

@@ -313,7 +313,7 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 	if u.Note != "" {
 		subject = u.Note
 	}
-	_, _ = s.st.AddMessage(store.Message{
+	dropMsg, _ := s.st.AddMessage(store.Message{
 		AgentID: agent.ID,
 		From:    "upload-request@" + s.st.Instance(),
 		To:      []string{agent.Email},
@@ -325,6 +325,7 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 		DKIM:        "local", SPF: "local",
 	})
 	s.hub.notify(agent.ID)
+	s.enqueueWebhooks(agent.ID, "message.received", dropMsg.ID, "upload-request@"+s.st.Instance())
 	s.metrics.uploads.Add(1)
 	_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionReceived, sha, size, "upload-request:"+token, "")
 

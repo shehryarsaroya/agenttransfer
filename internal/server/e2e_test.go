@@ -15,7 +15,19 @@ import (
 	"time"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/seal"
+	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
+
+// testRecipient mints a valid age recipient ("age1...") for pubkey tests.
+func testRecipient(t *testing.T) string {
+	t.Helper()
+	id, err := seal.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id.Recipient()
+}
 
 type env struct {
 	t      *testing.T
@@ -479,30 +491,175 @@ func TestOpenSignupRequiresVerification(t *testing.T) {
 	srv.SetBaseURL(ts.URL)
 	e := &env{t: t, ts: ts, srv: srv, admin: admin, client: ts.Client()}
 
-	// Open signup needs owner_email.
-	code := e.doJSON("POST", "/v1/agents", "", map[string]string{"name": "wanderer"}, nil)
-	if code != 400 {
-		t.Fatalf("signup without owner_email: %d", code)
+	// Keyed signup: no owner_email needed — a keyed agent is first-class and
+	// ready to work with no human in the loop.
+	var keyed struct {
+		APIKey       string `json:"api_key"`
+		Pubkey       string `json:"pubkey"`
+		OwnerEmail   string `json:"owner_email"`
+		Verification string `json:"verification"`
 	}
-	var out struct {
+	code := e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "wanderer", "pubkey": testRecipient(t)}, &keyed)
+	if code != 201 {
+		t.Fatalf("keyed signup (no owner_email): %d", code)
+	}
+	if keyed.Verification != "not_required" || keyed.OwnerEmail != "" || keyed.Pubkey == "" {
+		t.Fatalf("keyed agent: verification=%q owner=%q pubkey=%q", keyed.Verification, keyed.OwnerEmail, keyed.Pubkey)
+	}
+	// It works same-instance immediately.
+	e.createAgent("bob")
+	if code := e.doJSON("POST", "/v1/send", keyed.APIKey, map[string]any{"to": []string{"bob@local"}, "note": "hi"}, nil); code != 201 {
+		t.Fatalf("keyed agent local send should work: %d", code)
+	}
+
+	// Owned signup: owner_email given → unverified until confirmed; the admin
+	// verify endpoint flips the flag (unlocking the outbound email projection).
+	var owned struct {
 		AgentID       string `json:"agent_id"`
-		APIKey        string `json:"api_key"`
 		OwnerVerified bool   `json:"owner_verified"`
 	}
-	code = e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "wanderer", "owner_email": "human@example.com"}, &out)
-	if code != 201 || out.OwnerVerified {
-		t.Fatalf("open signup: %d verified=%v", code, out.OwnerVerified)
+	code = e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "settler", "owner_email": "human@example.com"}, &owned)
+	if code != 201 || owned.OwnerVerified {
+		t.Fatalf("owned signup: %d verified=%v", code, owned.OwnerVerified)
 	}
-	// Local sends work unverified…
-	e.createAgent("bob")
-	code = e.doJSON("POST", "/v1/send", out.APIKey, map[string]any{"to": []string{"bob@local"}, "note": "hi"}, nil)
-	if code != 201 {
-		t.Fatalf("local send should work unverified: %d", code)
-	}
-	// …but admin verify endpoint flips the flag.
-	code = e.doJSON("POST", "/v1/agents/"+out.AgentID+"/verify", e.admin, map[string]any{}, nil)
-	if code != 200 {
+	if code := e.doJSON("POST", "/v1/agents/"+owned.AgentID+"/verify", e.admin, map[string]any{}, nil); code != 200 {
 		t.Fatalf("admin verify: %d", code)
+	}
+}
+
+// Discovery: an agent publishes an opt-in card and another finds it by
+// capability. Unlisted agents stay invisible (anti-enumeration preserved).
+func TestDiscovery(t *testing.T) {
+	e := newEnv(t)
+	_, aliceKey := e.createAgent("alice")
+	_, bobKey := e.createAgent("bob")
+
+	var card store.Card
+	code := e.doJSON("PUT", "/v1/agents/self/card", aliceKey, map[string]any{
+		"description":  "transcodes audio",
+		"capabilities": []string{"Transcode", "audio", "transcode"}, // dupe + case
+		"listed":       true,
+	}, &card)
+	if code != 200 {
+		t.Fatalf("set card: %d", code)
+	}
+	if !card.Listed || len(card.Capabilities) != 2 { // normalized + deduped
+		t.Fatalf("card not normalized: %+v", card)
+	}
+
+	var dir struct {
+		Agents []store.Card `json:"agents"`
+		Count  int          `json:"count"`
+	}
+	code = e.doJSON("GET", "/v1/directory?capability=transcode", bobKey, nil, &dir)
+	if code != 200 || dir.Count != 1 || dir.Agents[0].Name != "alice" {
+		t.Fatalf("directory by capability: %d %+v", code, dir)
+	}
+	if code = e.doJSON("GET", "/v1/directory?capability=nope", bobKey, nil, &dir); code != 200 || dir.Count != 0 {
+		t.Fatalf("empty capability filter: %d count=%d", code, dir.Count)
+	}
+
+	// Bob published nothing → his card 404s and he's absent from the directory.
+	if c, _ := e.do("GET", "/v1/agents/bob/card", aliceKey, nil, ""); c.StatusCode != 404 {
+		t.Fatalf("bob has no card: want 404 got %d", c.StatusCode)
+	}
+	// Alice is fetchable by name while listed.
+	if code = e.doJSON("GET", "/v1/agents/alice/card", bobKey, nil, &card); code != 200 || card.Description != "transcodes audio" {
+		t.Fatalf("get alice card: %d %+v", code, card)
+	}
+	// Unlisting hides her again.
+	e.doJSON("PUT", "/v1/agents/self/card", aliceKey, map[string]any{"description": "x", "listed": false}, nil)
+	if c, _ := e.do("GET", "/v1/agents/alice/card", bobKey, nil, ""); c.StatusCode != 404 {
+		t.Fatalf("unlisted alice: want 404 got %d", c.StatusCode)
+	}
+	if code = e.doJSON("GET", "/v1/directory", bobKey, nil, &dir); code != 200 || dir.Count != 0 {
+		t.Fatalf("directory after unlist: count=%d", dir.Count)
+	}
+}
+
+// Recipient accept policy: an agent controls who reaches its main inbox.
+// "known" quarantines strangers (allowlisted or space co-members pass);
+// "closed" refuses strangers outright; "open" (default) lets everyone through.
+func TestAcceptPolicyQuarantine(t *testing.T) {
+	e := newEnv(t)
+	_, aliceKey := e.createAgent("alice")
+	_, bobKey := e.createAgent("bob")
+
+	type delivery struct {
+		Delivered []map[string]any `json:"delivered"`
+	}
+	type inbox struct {
+		Messages []map[string]any `json:"messages"`
+	}
+
+	// Alice → "known": an unknown sender is quarantined, not dropped, not shown.
+	if code := e.doJSON("PUT", "/v1/agents/self/policy", aliceKey, map[string]any{"accept": "known"}, nil); code != 200 {
+		t.Fatalf("set policy: %d", code)
+	}
+	var sent delivery
+	e.doJSON("POST", "/v1/send", bobKey, map[string]any{"to": []string{"alice@local"}, "note": "hi"}, &sent)
+	if len(sent.Delivered) != 1 || sent.Delivered[0]["via"] != "quarantined" {
+		t.Fatalf("unknown bob→alice via = %+v, want quarantined", sent.Delivered)
+	}
+	var main, quar inbox
+	e.doJSON("GET", "/v1/inbox", aliceKey, nil, &main)
+	e.doJSON("GET", "/v1/inbox?quarantined=1", aliceKey, nil, &quar)
+	if len(main.Messages) != 0 || len(quar.Messages) != 1 || quar.Messages[0]["quarantined"] != true {
+		t.Fatalf("main=%d quar=%d (want 0/1)", len(main.Messages), len(quar.Messages))
+	}
+
+	// Allowlisting bob promotes him to the main inbox.
+	e.doJSON("PUT", "/v1/agents/self/policy", aliceKey, map[string]any{"accept": "known", "allow": []string{"bob@local"}}, nil)
+	e.doJSON("POST", "/v1/send", bobKey, map[string]any{"to": []string{"alice@local"}, "note": "again"}, nil)
+	e.doJSON("GET", "/v1/inbox", aliceKey, nil, &main)
+	if len(main.Messages) != 1 {
+		t.Fatalf("allowlisted bob should reach main inbox, got %d", len(main.Messages))
+	}
+
+	// A space co-member is "known" without any allowlist entry.
+	_, eveKey := e.createAgent("eve")
+	_, frankKey := e.createAgent("frank")
+	e.doJSON("PUT", "/v1/agents/self/policy", eveKey, map[string]any{"accept": "known"}, nil)
+	var sp struct {
+		Space store.Space `json:"space"`
+	}
+	e.doJSON("POST", "/v1/spaces", eveKey, map[string]any{"name": "crew"}, &sp)
+	e.doJSON("POST", "/v1/spaces/"+sp.Space.ID+"/members", eveKey, map[string]any{"agent": "frank@local"}, nil)
+	e.doJSON("POST", "/v1/send", frankKey, map[string]any{"to": []string{"eve@local"}, "note": "teammate"}, nil)
+	var emain inbox
+	e.doJSON("GET", "/v1/inbox", eveKey, nil, &emain)
+	if len(emain.Messages) != 1 {
+		t.Fatalf("space co-member frank should reach eve's main inbox, got %d", len(emain.Messages))
+	}
+
+	// "closed": an unknown sender is refused outright (no message stored).
+	_, daveKey := e.createAgent("dave")
+	e.doJSON("PUT", "/v1/agents/self/policy", daveKey, map[string]any{"accept": "closed"}, nil)
+	var rej delivery
+	e.doJSON("POST", "/v1/send", aliceKey, map[string]any{"to": []string{"dave@local"}, "note": "let me in"}, &rej)
+	if len(rej.Delivered) != 1 || rej.Delivered[0]["via"] != "rejected" {
+		t.Fatalf("alice→closed dave via = %+v, want rejected", rej.Delivered)
+	}
+	var dmain, dquar inbox
+	e.doJSON("GET", "/v1/inbox", daveKey, nil, &dmain)
+	e.doJSON("GET", "/v1/inbox?quarantined=1", daveKey, nil, &dquar)
+	if len(dmain.Messages) != 0 || len(dquar.Messages) != 0 {
+		t.Fatalf("closed dave should have nothing, main=%d quar=%d", len(dmain.Messages), len(dquar.Messages))
+	}
+}
+
+// A malformed or bare-name recipient is a clean 400 before the relay is ever
+// touched — not a 502 leaking SMTP internals. Regression for battle-test B1.
+func TestSendRejectsBadRecipient(t *testing.T) {
+	e := newEnv(t)
+	_, key := e.createAgent("alice")
+	// Bare name (no @): rejected with an agent-first hint toward name@instance.
+	if code := e.doJSON("POST", "/v1/send", key, map[string]any{"to": []string{"bob"}, "note": "hi"}, nil); code != 400 {
+		t.Fatalf("send to bare name: want 400 got %d", code)
+	}
+	// Syntactically invalid address: rejected before the relay.
+	if code := e.doJSON("POST", "/v1/send", key, map[string]any{"to": []string{"weird@@double"}, "note": "hi"}, nil); code != 400 {
+		t.Fatalf("send to malformed address: want 400 got %d", code)
 	}
 }
 

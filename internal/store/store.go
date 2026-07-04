@@ -50,6 +50,14 @@ type Agent struct {
 	OwnerEmail    string `json:"owner_email,omitempty"`
 	OwnerVerified bool   `json:"owner_verified"`
 	AlwaysCCOwner bool   `json:"always_cc_owner"`
+	// Pubkey is the agent's published X25519 recipient ("age1...") for sealed
+	// transfers, or "" if it hasn't set one. Senders fetch it to encrypt so
+	// only this agent can decrypt; the private half never reaches the server.
+	Pubkey string `json:"pubkey,omitempty"`
+	// AcceptPolicy governs who reaches this agent's main inbox vs quarantine:
+	// "open" (all), "known" (allowlisted or a space co-member; others quarantine),
+	// "closed" (known only; others rejected).
+	AcceptPolicy string `json:"accept_policy,omitempty"`
 	// HumanRecipientsMax overrides the instance-wide cap on unique remote
 	// recipients for this agent: 0 = instance default, <0 = unlimited.
 	HumanRecipientsMax int64 `json:"-"`
@@ -113,7 +121,10 @@ type Message struct {
 	DKIM        string       `json:"dkim"`
 	SPF         string       `json:"spf"`
 	Read        bool         `json:"read"`
-	ReceivedAt  int64        `json:"received_at"`
+	// Quarantined marks a message held out of the main inbox by the recipient's
+	// accept policy (unknown sender). It's still readable via ?quarantined=1.
+	Quarantined bool  `json:"quarantined,omitempty"`
+	ReceivedAt  int64 `json:"received_at"`
 }
 
 // UploadRequest is a one-time browser upload page handed to a human.
@@ -165,17 +176,10 @@ func Open(dataDir, adminToken string) (s *Store, firstBootAdminToken string, err
 	// modernc.org/sqlite serializes writes; a single connection avoids
 	// SQLITE_BUSY between our own writers.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, "", fmt.Errorf("migrate: %w", err)
 	}
-	if _, err := db.Exec(schemaConnect); err != nil {
-		db.Close()
-		return nil, "", fmt.Errorf("migrate connect: %w", err)
-	}
-	// Additive column migrations for databases created before the column
-	// existed; the duplicate-column error on fresh databases is expected.
-	_, _ = db.Exec(`ALTER TABLE agents ADD COLUMN human_recipients_max INTEGER NOT NULL DEFAULT 0`)
 
 	s = &Store{DB: db, dataDir: dataDir, instance: "local"}
 
@@ -247,7 +251,10 @@ func (s *Store) IsAdmin(tok string) bool {
 	return subtle.ConstantTimeCompare([]byte(hashToken(tok)), []byte(s.adminHash)) == 1
 }
 
-const schema = `
+// schemaBase is migration 1: the base tables. Agent-scoped children carry
+// ON DELETE CASCADE so DeleteAgent only removes the parent row. Blobs have no
+// refcount column — orphans are computed on demand by DeleteOrphanBlobs.
+const schemaBase = `
 CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -259,12 +266,13 @@ CREATE TABLE IF NOT EXISTS agents (
   owner_verified INTEGER NOT NULL DEFAULT 0,
   always_cc_owner INTEGER NOT NULL DEFAULT 0,
   human_recipients_max INTEGER NOT NULL DEFAULT 0,
+  pubkey TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agents_key ON agents(key_hash);
 
 CREATE TABLE IF NOT EXISTS human_recipients (
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   addr TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (agent_id, addr)
@@ -278,13 +286,12 @@ CREATE TABLE IF NOT EXISTS suppressed (
 CREATE TABLE IF NOT EXISTS blobs (
   sha256 TEXT PRIMARY KEY,
   size INTEGER NOT NULL,
-  refs INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   sha256 TEXT NOT NULL,
   name TEXT NOT NULL,
   mime TEXT NOT NULL DEFAULT 'application/octet-stream',
@@ -296,11 +303,12 @@ CREATE TABLE IF NOT EXISTS files (
   UNIQUE(agent_id, name, sha256)
 );
 CREATE INDEX IF NOT EXISTS idx_files_agent ON files(agent_id);
+CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
 CREATE INDEX IF NOT EXISTS idx_files_expiry ON files(expires_at) WHERE expires_at > 0;
 
 CREATE TABLE IF NOT EXISTS links (
   token TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   sha256 TEXT NOT NULL,
   name TEXT NOT NULL,
   mime TEXT NOT NULL,
@@ -312,11 +320,12 @@ CREATE TABLE IF NOT EXISTS links (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_links_agent ON links(agent_id);
+CREATE INDEX IF NOT EXISTS idx_links_sha ON links(sha256) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_links_expiry ON links(expires_at);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   from_addr TEXT NOT NULL,
   to_addrs TEXT NOT NULL DEFAULT '[]',
   subject TEXT NOT NULL DEFAULT '',
@@ -350,7 +359,7 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE INDEX IF NOT EXISTS idx_receipts_actor ON receipts(actor, seq);
 
 CREATE TABLE IF NOT EXISTS idempotency (
-  agent_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   key TEXT NOT NULL,
   response TEXT NOT NULL,
   created_at INTEGER NOT NULL,
@@ -365,7 +374,7 @@ CREATE TABLE IF NOT EXISTS verify_tokens (
 
 CREATE TABLE IF NOT EXISTS upload_requests (
   token TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   note TEXT NOT NULL DEFAULT '',
   used INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER NOT NULL,
@@ -380,6 +389,43 @@ CREATE TABLE IF NOT EXISTS counters (
   PRIMARY KEY (agent_id, day, kind)
 );
 `
+
+// migrations is the ordered list of schema versions. Each entry is applied once,
+// in order, inside a transaction; PRAGMA user_version records how many have run.
+// Append new migrations — never edit a shipped one. Index i is "version i+1".
+var migrations = []string{
+	schemaBase + schemaConnect + schemaWebhooks, // v1
+	schemaCards,  // v2: opt-in discovery cards + directory
+	schemaSpaces, // v3: spaces
+	schemaPolicy, // v4: recipient accept policy + quarantine
+}
+
+// migrate brings db up to len(migrations) via PRAGMA user_version.
+func migrate(db *sql.DB) error {
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		return err
+	}
+	for i := ver; i < len(migrations); i++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		// PRAGMA can't bind params; the value is a trusted loop int.
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, i+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // ---- settings ----
 
@@ -472,7 +518,7 @@ func validAgentName(name string) bool {
 func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	var a Agent
 	var ver, cc int
-	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -481,7 +527,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	return a, err
 }
 
-const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,created_at`
+const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,created_at`
 
 // AgentByKey resolves an API key to its agent.
 func (s *Store) AgentByKey(key string) (Agent, error) {
@@ -552,56 +598,32 @@ func (s *Store) DeleteAgent(agentID string) (Agent, []string, error) {
 	}
 	defer tx.Rollback()
 
-	// Active links each hold a blob ref and may have live downloads.
-	lrows, err := tx.Query(`SELECT token, sha256 FROM links WHERE agent_id=? AND status='active'`, agentID)
+	// Active links may have live downloads — return their tokens so the caller
+	// can sever them.
+	lrows, err := tx.Query(`SELECT token FROM links WHERE agent_id=? AND status='active'`, agentID)
 	if err != nil {
 		return a, nil, err
 	}
-	var activeTokens, releaseShas []string
+	var activeTokens []string
 	for lrows.Next() {
-		var tok, sha string
-		if err := lrows.Scan(&tok, &sha); err != nil {
+		var tok string
+		if err := lrows.Scan(&tok); err != nil {
 			lrows.Close()
 			return a, nil, err
 		}
 		activeTokens = append(activeTokens, tok)
-		releaseShas = append(releaseShas, sha)
 	}
 	lrows.Close()
 
-	// Each folder file holds a blob ref too (one per row).
-	frows, err := tx.Query(`SELECT sha256 FROM files WHERE agent_id=?`, agentID)
-	if err != nil {
-		return a, nil, err
-	}
-	for frows.Next() {
-		var sha string
-		if err := frows.Scan(&sha); err != nil {
-			frows.Close()
-			return a, nil, err
-		}
-		releaseShas = append(releaseShas, sha)
-	}
-	frows.Close()
-
-	// Release exactly this agent's refs (the guard keeps a shared/deduped blob
-	// positive so another agent's copy is never GC'd out from under it).
-	for _, sha := range releaseShas {
-		if _, err := tx.Exec(`UPDATE blobs SET refs=refs-1 WHERE sha256=? AND refs>0`, sha); err != nil {
-			return a, nil, err
-		}
-	}
-
-	// Children before the parent (foreign keys are ON). Receipts are pointedly
-	// absent — they key on actor email, not agent id, and stay.
+	// counters and verify_tokens overload agent_id (connect egress metering,
+	// connect verification tokens) so they carry no agents FK — delete them
+	// explicitly. Every genuinely agent-scoped table has ON DELETE CASCADE, so
+	// deleting the agent row removes files, links, messages, webhooks,
+	// idempotency, human_recipients, and upload_requests with it. Receipts are
+	// pointedly absent — they key on actor email, not agent id, and stay. Blobs
+	// are reclaimed by orphan GC once unreferenced.
 	for _, q := range []string{
-		`DELETE FROM links WHERE agent_id=?`,
-		`DELETE FROM files WHERE agent_id=?`,
-		`DELETE FROM messages WHERE agent_id=?`,
-		`DELETE FROM human_recipients WHERE agent_id=?`,
-		`DELETE FROM upload_requests WHERE agent_id=?`,
 		`DELETE FROM counters WHERE agent_id=?`,
-		`DELETE FROM idempotency WHERE agent_id=?`,
 		`DELETE FROM verify_tokens WHERE agent_id=?`,
 		`DELETE FROM agents WHERE id=?`,
 	} {
@@ -619,6 +641,19 @@ func (s *Store) DeleteAgent(agentID string) (Agent, []string, error) {
 func (s *Store) SetAlwaysCC(agentID string, v bool) error {
 	_, err := s.DB.Exec(`UPDATE agents SET always_cc_owner=? WHERE id=?`, boolInt(v), agentID)
 	return err
+}
+
+// SetPubkey publishes the agent's X25519 recipient ("age1...") for sealed
+// transfers (or clears it with "").
+func (s *Store) SetPubkey(agentID, pubkey string) error {
+	res, err := s.DB.Exec(`UPDATE agents SET pubkey=? WHERE id=?`, strings.TrimSpace(pubkey), agentID)
+	if err != nil {
+		return err
+	}
+	if k, _ := res.RowsAffected(); k == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // SetHumanRecipientsMax sets the per-agent recipient-circle override
@@ -802,7 +837,7 @@ func (s *Store) PutBlob(r io.Reader, limit int64) (sha string, size int64, err e
 	// reference (AddFile/CreateLink, moments later).
 	s.blobMu.Lock()
 	defer s.blobMu.Unlock()
-	if _, err := s.DB.Exec(`INSERT INTO blobs(sha256,size,refs,created_at) VALUES(?,?,0,?)
+	if _, err := s.DB.Exec(`INSERT INTO blobs(sha256,size,created_at) VALUES(?,?,?)
 		ON CONFLICT(sha256) DO UPDATE SET created_at=excluded.created_at`, sha, size, now()); err != nil {
 		return "", 0, err
 	}
@@ -833,28 +868,29 @@ func (s *Store) OpenBlob(sha string) (*os.File, error) {
 	return f, err
 }
 
-func (s *Store) incRef(sha string) error {
-	_, err := s.DB.Exec(`UPDATE blobs SET refs=refs+1 WHERE sha256=?`, sha)
-	return err
-}
+// blobReferencedSQL is the predicate for "some row still points at this blob."
+// Orphan GC deletes blobs matching none of these. Every blob-holding table must
+// appear here — kept in one place so a new kind of reference can't be forgotten.
+const blobReferencedSQL = `EXISTS (SELECT 1 FROM files WHERE files.sha256=blobs.sha256)
+	OR EXISTS (SELECT 1 FROM links WHERE links.sha256=blobs.sha256 AND status='active')
+	OR EXISTS (SELECT 1 FROM space_events WHERE space_events.sha256=blobs.sha256)`
 
-func (s *Store) decRef(sha string) error {
-	_, err := s.DB.Exec(`UPDATE blobs SET refs=refs-1 WHERE sha256=? AND refs>0`, sha)
-	return err
-}
-
-// DeleteOrphanBlobs removes blobs with zero references from db and disk.
+// DeleteOrphanBlobs removes blobs no longer referenced by any file or active
+// link, from db and disk. Reference-ness is computed on demand — there is no
+// refcount column to keep consistent, so a committed row always protects its
+// blob.
 //
-// Safety has three layers. The grace period skips young rows entirely —
-// PutBlob creates (or refreshes) the row at refs=0 and the first reference
-// lands moments later. The row DELETE re-checks refs AND age, so a blob
-// re-referenced or re-put since the scan is left alone. And each delete +
-// unlink pair runs under blobMu so it can't interleave with PutBlob's
-// row-write + byte-write pair — without the lock, a dedup upload could see
-// the bytes on disk, skip writing them, and then lose them to the unlink.
+// Safety has three layers. The grace period skips young rows: PutBlob inserts
+// (or refreshes) the row moments before its first file/link reference lands, so
+// a fresh created_at keeps a not-yet-referenced blob out of GC. The row DELETE
+// re-checks the reference predicate AND age, so a blob referenced or re-put
+// since the scan is left alone. And each delete + unlink pair runs under blobMu
+// so it can't interleave with PutBlob's row-write + byte-write pair — without
+// the lock, a dedup upload could see the bytes on disk, skip writing them, and
+// then lose them to the unlink.
 func (s *Store) DeleteOrphanBlobs() (int, error) {
 	grace := now() - 300
-	rows, err := s.DB.Query(`SELECT sha256 FROM blobs WHERE refs<=0 AND created_at<=?`, grace)
+	rows, err := s.DB.Query(`SELECT sha256 FROM blobs WHERE created_at<=? AND NOT (`+blobReferencedSQL+`)`, grace)
 	if err != nil {
 		return 0, err
 	}
@@ -871,7 +907,7 @@ func (s *Store) DeleteOrphanBlobs() (int, error) {
 	n := 0
 	for _, sha := range shas {
 		s.blobMu.Lock()
-		res, err := s.DB.Exec(`DELETE FROM blobs WHERE sha256=? AND refs<=0 AND created_at<=?`, sha, grace)
+		res, err := s.DB.Exec(`DELETE FROM blobs WHERE sha256=? AND created_at<=? AND NOT (`+blobReferencedSQL+`)`, sha, grace)
 		if err == nil {
 			if k, _ := res.RowsAffected(); k == 1 {
 				if err := os.Remove(s.blobPath(sha)); err == nil || os.IsNotExist(err) {
@@ -886,31 +922,21 @@ func (s *Store) DeleteOrphanBlobs() (int, error) {
 
 // ---- files (the folder) ----
 
-// AddFile records a folder entry over an existing blob and takes a blob
-// reference. Re-adding the same (name, sha) refreshes the row instead.
+// AddFile records a folder entry over an existing blob. Re-adding the same
+// (name, sha) refreshes the row instead of duplicating it. The blob is kept
+// alive simply by this row existing (orphan GC computes reference-ness).
 func (s *Store) AddFile(agentID, sha, name, mime string, size int64, source string, claimed bool, expiresAt int64) (File, error) {
 	f := File{
 		ID: NewID("fil"), AgentID: agentID, SHA256: sha, Name: safeName(name), MIME: mime,
 		Size: size, Source: source, Claimed: claimed, ExpiresAt: expiresAt, CreatedAt: now(),
 	}
-	res, err := s.DB.Exec(`INSERT INTO files(id,agent_id,sha256,name,mime,size,source,claimed,expires_at,created_at)
+	if _, err := s.DB.Exec(`INSERT INTO files(id,agent_id,sha256,name,mime,size,source,claimed,expires_at,created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(agent_id,name,sha256) DO UPDATE SET claimed=MAX(files.claimed,excluded.claimed), expires_at=excluded.expires_at`,
-		f.ID, f.AgentID, f.SHA256, f.Name, f.MIME, f.Size, f.Source, boolInt(f.Claimed), f.ExpiresAt, f.CreatedAt)
-	if err != nil {
+		f.ID, f.AgentID, f.SHA256, f.Name, f.MIME, f.Size, f.Source, boolInt(f.Claimed), f.ExpiresAt, f.CreatedAt); err != nil {
 		return f, err
 	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		// Fresh insert (not upsert): take a reference.
-		var id string
-		if err := s.DB.QueryRow(`SELECT id FROM files WHERE agent_id=? AND name=? AND sha256=?`, agentID, f.Name, sha).Scan(&id); err == nil && id == f.ID {
-			if err := s.incRef(sha); err != nil {
-				return f, err
-			}
-			return f, nil
-		}
-	}
-	// Row existed: return the existing one.
+	// Return the canonical row (whether freshly inserted or already present).
 	row := s.DB.QueryRow(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND name=? AND sha256=?`, agentID, f.Name, sha)
 	return scanFile(row)
 }
@@ -981,8 +1007,8 @@ func (s *Store) FileByName(agentID, name string) (File, error) {
 	return scanFile(s.DB.QueryRow(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND name=? ORDER BY created_at DESC LIMIT 1`, agentID, name))
 }
 
-// DeleteFile removes folder entries for a hash and drops their blob refs.
-// It returns the removed entries.
+// DeleteFile removes folder entries for a hash. It returns the removed entries;
+// the blob is reclaimed by orphan GC once nothing references it.
 func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
 	rows, err := s.DB.Query(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND sha256=?`, agentID, sha)
 	if err != nil {
@@ -1005,14 +1031,7 @@ func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Decrement by what THIS delete actually removed — a concurrent duplicate
-	// delete must not double-decrement the blob ref.
 	deleted, _ := res.RowsAffected()
-	for i := int64(0); i < deleted; i++ {
-		if err := s.decRef(sha); err != nil {
-			return nil, err
-		}
-	}
 	if deleted == 0 {
 		return nil, ErrNotFound
 	}
@@ -1111,10 +1130,7 @@ func (s *Store) ExpireFiles(cutoff int64) ([]File, error) {
 			return nil, err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			continue // someone else deleted it first; they took the decrement
-		}
-		if err := s.decRef(f.SHA256); err != nil {
-			return nil, err
+			continue // someone else deleted it first
 		}
 		expired = append(expired, f)
 	}
@@ -1123,7 +1139,8 @@ func (s *Store) ExpireFiles(cutoff int64) ([]File, error) {
 
 // ---- links ----
 
-// CreateLink mints an ephemeral share link over a blob and takes a blob ref.
+// CreateLink mints an ephemeral share link over a blob. The active link keeps
+// the blob alive (orphan GC computes reference-ness on demand).
 func (s *Store) CreateLink(agentID, sha, name, mime string, size int64, once bool, ttl time.Duration) (Link, error) {
 	l := Link{
 		Token: NewLinkToken(), AgentID: agentID, SHA256: sha, Name: safeName(name), MIME: mime,
@@ -1133,10 +1150,7 @@ func (s *Store) CreateLink(agentID, sha, name, mime string, size int64, once boo
 	_, err := s.DB.Exec(`INSERT INTO links(token,agent_id,sha256,name,mime,size,once,downloads,status,expires_at,created_at)
 		VALUES(?,?,?,?,?,?,?,0,'active',?,?)`,
 		l.Token, l.AgentID, l.SHA256, l.Name, l.MIME, l.Size, boolInt(l.Once), l.ExpiresAt, l.CreatedAt)
-	if err != nil {
-		return l, err
-	}
-	return l, s.incRef(sha)
+	return l, err
 }
 
 const linkCols = `token,agent_id,sha256,name,mime,size,once,downloads,status,expires_at,created_at`
@@ -1175,10 +1189,9 @@ func (s *Store) ListLinks(agentID string) ([]Link, error) {
 	return out, rows.Err()
 }
 
-// closeLink transitions an active link to a terminal status and drops its
-// ref. The ref is decremented only when THIS call won the transition —
-// concurrent burn/revoke/expire on the same token must not double-decrement,
-// or a deduped blob still referenced elsewhere gets GC'd (data loss).
+// closeLink transitions an active link to a terminal status. Once it's no
+// longer active it stops keeping its blob alive; orphan GC reclaims the bytes
+// if nothing else references them.
 func (s *Store) closeLink(token, status string) (Link, error) {
 	l, err := s.GetLink(token)
 	if err != nil {
@@ -1195,7 +1208,7 @@ func (s *Store) closeLink(token, status string) (Link, error) {
 		return l, ErrNotFound // lost the race to another closer
 	}
 	l.Status = status
-	return l, s.decRef(l.SHA256)
+	return l, nil
 }
 
 // RevokeLink kills a link now.
@@ -1277,19 +1290,19 @@ func (s *Store) AddMessage(m Message) (Message, error) {
 	if m.Attachments == nil {
 		attJSON = []byte("[]")
 	}
-	_, err := s.DB.Exec(`INSERT INTO messages(id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,received_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
-		m.ID, m.AgentID, m.From, string(toJSON), m.Subject, m.Text, m.MessageID, m.InReplyTo, m.References, m.Manifest, string(attJSON), m.DKIM, m.SPF, m.ReceivedAt)
+	_, err := s.DB.Exec(`INSERT INTO messages(id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,quarantined,received_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
+		m.ID, m.AgentID, m.From, string(toJSON), m.Subject, m.Text, m.MessageID, m.InReplyTo, m.References, m.Manifest, string(attJSON), m.DKIM, m.SPF, boolInt(m.Quarantined), m.ReceivedAt)
 	return m, err
 }
 
-const msgCols = `id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,received_at`
+const msgCols = `id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,quarantined,received_at`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
 	var to, att string
-	var read int
-	err := row.Scan(&m.ID, &m.AgentID, &m.From, &to, &m.Subject, &m.Text, &m.MessageID, &m.InReplyTo, &m.References, &m.Manifest, &att, &m.DKIM, &m.SPF, &read, &m.ReceivedAt)
+	var read, quar int
+	err := row.Scan(&m.ID, &m.AgentID, &m.From, &to, &m.Subject, &m.Text, &m.MessageID, &m.InReplyTo, &m.References, &m.Manifest, &att, &m.DKIM, &m.SPF, &read, &quar, &m.ReceivedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -1297,6 +1310,7 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 		return m, err
 	}
 	m.Read = read == 1
+	m.Quarantined = quar == 1
 	_ = json.Unmarshal([]byte(to), &m.To)
 	_ = json.Unmarshal([]byte(att), &m.Attachments)
 	if m.Attachments == nil {
@@ -1308,7 +1322,7 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 // ListInbox returns inbox messages, oldest first. thread filters by an
 // AgentTransfer message id (matches the message or replies to it).
 func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit int) ([]Message, error) {
-	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=?`
+	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=0`
 	args := []any{agentID}
 	if unreadOnly {
 		q += ` AND read=0`
@@ -1322,6 +1336,29 @@ func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit 
 		q += fmt.Sprintf(` LIMIT %d`, limit)
 	}
 	rows, err := s.DB.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ListQuarantine returns messages held out of the main inbox by the recipient's
+// accept policy (unknown senders), newest first.
+func (s *Store) ListQuarantine(agentID string, limit int) ([]Message, error) {
+	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=1 ORDER BY received_at DESC, id`
+	if limit > 0 {
+		q += fmt.Sprintf(` LIMIT %d`, limit)
+	}
+	rows, err := s.DB.Query(q, agentID)
 	if err != nil {
 		return nil, err
 	}

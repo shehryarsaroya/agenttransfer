@@ -238,6 +238,15 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 		atts = append(atts, store.Attachment{SHA256: sha, Name: f.Name, MIME: a.MIME, Size: size})
 	}
 
+	// The recipient's accept policy applies to inbound email too. For an
+	// external sender only the allowlist counts as "known" (no shared spaces).
+	deliver, quarantined := s.decideInbound(agent, from)
+	if !deliver {
+		// "closed" recipient, unknown sender — drop silently (no bounce). Any
+		// attachments already ingested are unclaimed and expire on their own.
+		return nil
+	}
+
 	m := store.Message{
 		AgentID:     agent.ID,
 		From:        from,
@@ -251,12 +260,16 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 		Attachments: atts,
 		DKIM:        dkimResult,
 		SPF:         "none", // SPF checking is a documented v1.1 item
+		Quarantined: quarantined,
 	}
 	msg, err := s.st.AddMessage(m)
 	if err != nil {
 		return err
 	}
-	s.hub.notify(agent.ID)
+	if !quarantined {
+		s.hub.notify(agent.ID)
+		s.enqueueWebhooks(agent.ID, "message.received", msg.ID, from)
+	}
 
 	sha, size := "", int64(0)
 	if len(atts) > 0 {

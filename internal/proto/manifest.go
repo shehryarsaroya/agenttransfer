@@ -45,23 +45,41 @@ const (
 	MetaSize      = "agenttransfer.size"
 	MetaExpiresAt = "agenttransfer.expiresAt"
 	MetaOnce      = "agenttransfer.once"
+	// MetaEncMode marks a client-encrypted file so a receiver knows to
+	// decrypt: "symmetric" (needs the out-of-band key) or "sealed" (needs the
+	// recipient's own identity). Absent/empty means plaintext. The bytes are
+	// encrypted client-side; the server only relays this hint and never holds
+	// a key. sha256 above is over the CIPHERTEXT, so integrity is verifiable
+	// without the key.
+	MetaEncMode = "agenttransfer.encMode"
+)
+
+// Encryption modes for MetaEncMode.
+const (
+	EncSymmetric = "symmetric"
+	EncSealed    = "sealed"
 )
 
 // TextPart builds an A2A text part.
 func TextPart(text string) Part { return Part{Kind: "text", Text: text} }
 
 // FilePart builds an A2A file part carrying an AgentTransfer share link plus
-// integrity metadata.
-func FilePart(name, mimeType, uri, sha256 string, size int64, expiresAt string, once bool) Part {
+// integrity metadata. encMode is "" for plaintext, or proto.EncSymmetric /
+// proto.EncSealed for a client-encrypted file.
+func FilePart(name, mimeType, uri, sha256 string, size int64, expiresAt string, once bool, encMode string) Part {
+	meta := map[string]any{
+		MetaSHA256:    sha256,
+		MetaSize:      size,
+		MetaExpiresAt: expiresAt,
+		MetaOnce:      once,
+	}
+	if encMode != "" {
+		meta[MetaEncMode] = encMode
+	}
 	return Part{
-		Kind: "file",
-		File: &FileRef{Name: name, MIMEType: mimeType, URI: uri},
-		Metadata: map[string]any{
-			MetaSHA256:    sha256,
-			MetaSize:      size,
-			MetaExpiresAt: expiresAt,
-			MetaOnce:      once,
-		},
+		Kind:     "file",
+		File:     &FileRef{Name: name, MIMEType: mimeType, URI: uri},
+		Metadata: meta,
 	}
 }
 

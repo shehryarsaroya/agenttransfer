@@ -11,20 +11,26 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/seal"
 )
 
 // clientConfig is what `agenttransfer login` writes.
 type clientConfig struct {
 	URL    string `json:"url"`
 	APIKey string `json:"api_key"`
+	// Identity is this login's sealed-transfer secret ("AGE-SECRET-KEY-1...").
+	// It never leaves the machine; only its public half is published.
+	Identity string `json:"identity,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -41,6 +47,16 @@ func loadConfig() (clientConfig, error) {
 		c.URL = strings.TrimRight(u, "/")
 		c.APIKey = os.Getenv("AGENTTRANSFER_KEY")
 		if c.APIKey != "" {
+			c.Identity = strings.TrimSpace(os.Getenv("AGENTTRANSFER_IDENTITY"))
+			// Fall back to the config file's sealed-transfer identity when the
+			// env doesn't carry one. Without this, env-auth would shadow (and
+			// rotate-key would then overwrite) a good on-disk identity, and
+			// `get --seal` couldn't find it.
+			if c.Identity == "" {
+				if fc, ferr := readFileConfig(); ferr == nil {
+					c.Identity = fc.Identity
+				}
+			}
 			return c, nil
 		}
 	}
@@ -61,6 +77,21 @@ func loadConfig() (clientConfig, error) {
 	return c, nil
 }
 
+// readFileConfig reads ONLY the on-disk config (ignoring env), for callers that
+// must not let env-auth shadow the file (identity preservation on rotate-key).
+func readFileConfig() (clientConfig, error) {
+	var c clientConfig
+	p, err := configPath()
+	if err != nil {
+		return c, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return c, err
+	}
+	return c, json.Unmarshal(data, &c)
+}
+
 // api is a tiny authenticated HTTP client.
 type api struct {
 	base string
@@ -69,7 +100,50 @@ type api struct {
 }
 
 func newAPI(c clientConfig) *api {
-	return &api{base: strings.TrimRight(c.URL, "/"), key: c.APIKey, hc: &http.Client{Timeout: 10 * time.Minute}}
+	return &api{base: strings.TrimRight(c.URL, "/"), key: c.APIKey, hc: &http.Client{
+		// No overall Timeout: a multi-GB upload/download must stream for as
+		// long as it needs (a 10-minute cap truncated real 5 GB transfers).
+		// Bound the connect and response-header stages instead, so a dead
+		// server still fails fast without cutting off a slow-but-live stream.
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
+	}}
+}
+
+// sameOrigin reports whether rawURL targets the exact same scheme+host as base.
+// The bearer key is attached ONLY when this holds, so a share URL that merely
+// string-prefixes the instance base (e.g. https://base@evil.com/… or
+// https://base.evil.com/…) never receives the credential.
+func sameOrigin(rawURL, base string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == b.Scheme && strings.EqualFold(u.Host, b.Host)
+}
+
+// ageMagic is the first bytes of an age-encrypted stream; used to warn when a
+// file looks encrypted but no key/identity was supplied.
+const ageMagic = "age-encryption.org/v1"
+
+// looksEncrypted reports whether the file at path begins with the age header.
+func looksEncrypted(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, len(ageMagic))
+	n, _ := io.ReadFull(f, buf)
+	return string(buf[:n]) == ageMagic
 }
 
 func (a *api) req(method, path string, body io.Reader, contentType string) (*http.Response, error) {
@@ -186,6 +260,10 @@ func Run(args []string) int {
 		err = cmdLink(rest)
 	case "request":
 		err = cmdRequest(rest)
+	case "mcp":
+		err = cmdMCP(rest)
+	case "webhooks":
+		err = cmdWebhooks(rest)
 	case "log":
 		err = cmdLog(rest)
 	case "verify":
@@ -196,6 +274,26 @@ func Run(args []string) int {
 		err = cmdDeleteSelf(rest)
 	case "agents":
 		err = cmdAgents(rest)
+	case "directory":
+		err = cmdDirectory(rest)
+	case "card":
+		err = cmdCard(rest)
+	case "card-set":
+		err = cmdCardSet(rest)
+	case "spaces":
+		err = cmdSpaces(rest)
+	case "space-new":
+		err = cmdSpaceNew(rest)
+	case "space":
+		err = cmdSpace(rest)
+	case "space-add":
+		err = cmdSpaceAdd(rest)
+	case "space-post":
+		err = cmdSpacePost(rest)
+	case "space-pull":
+		err = cmdSpacePull(rest)
+	case "space-watch":
+		err = cmdSpaceWatch(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
 		usage()
@@ -214,29 +312,43 @@ func usage() {
 server:
   agenttransfer serve                 run the server (env-configured; see docs)
   agenttransfer serve --connect [url] go live via a connect host: public URL + email, zero setup
+  agenttransfer mcp                   local MCP (stdio) bridge for agents — streams big files
   agenttransfer demo                  30-second local end-to-end demo
   agenttransfer doctor                self-host preflight checks
 
 client:
-  agenttransfer signup <url> --name n --owner you@example.com   create your own agent + log in
+  agenttransfer signup <url> --name n [--owner you@example.com]  create your own agent + log in
   agenttransfer login <url> --key K   store credentials (in your OS user-config dir)
   agenttransfer whoami
-  agenttransfer put <file> [--share] [--ttl 3h] [--once]        upload into your folder
-  agenttransfer send <file> --to a@b[,c@d] [--note s] [--subject s] [--ttl 3h] [--once] [--cc-owner]
+  agenttransfer put <file> [--share] [--ttl 3h] [--once] [--encrypt]   upload into your folder
+  agenttransfer send <file> --to a@b[,c@d] [--note s] [--ttl 3h] [--once] [--cc-owner] [--encrypt|--seal]
   agenttransfer msg <text> --to a@b [--reply-to msg_...] [--subject s] [--cc-owner]
   agenttransfer inbox [--wait N] [--all] [--json]
-  agenttransfer get <msg_...|url|sha256:...> [-o path]
+  agenttransfer get <msg_...|url|sha256:...> [-o path] [--key atk_...]
   agenttransfer ls [--links]
   agenttransfer rm <sha256:...|link-token>
   agenttransfer keep <sha256:...>
   agenttransfer link <sha256:...|name-in-folder> [--ttl 3h] [--once]
   agenttransfer request [--note s] [--ttl 24h]
+  agenttransfer webhooks add <url> | ls | rm <id>              push notifications on arrival
   agenttransfer log [--verify] [--json]
   agenttransfer verify <receipts.jsonl|instance-url>
   agenttransfer rotate-key
   agenttransfer delete-self          delete your own agent (receipts are kept)
   agenttransfer agents create --name n [--owner e] [--url u] [--admin-token t]
   agenttransfer agents rm <agent_id> [--url u] [--admin-token t]   delete an agent (keeps its receipts)
+
+discovery & spaces (agent-to-agent coordination):
+  agenttransfer directory [--capability X] [--limit N]         find listed agents (by capability)
+  agenttransfer card <name>                                    show an agent's public discovery card
+  agenttransfer card-set --description "..." [--capabilities a,b,c] [--listed]   publish your own card
+  agenttransfer spaces                                         list your shared spaces
+  agenttransfer space-new <name>                               create a space (prints its id)
+  agenttransfer space <id>                                     show a space: members + recent events
+  agenttransfer space-add <id> <agent>                         add a member (owner only)
+  agenttransfer space-post <id> [--text "..."] [--file REF]    post a message and/or offer a folder file
+  agenttransfer space-pull <id> <sha> <outfile>                download a file shared in the space (verifies sha256)
+  agenttransfer space-watch <id> [--since N]                   long-poll the event stream (Ctrl-C to stop)
 
 Flags may go before or after positional arguments.
 env: AGENTTRANSFER_URL + AGENTTRANSFER_KEY override the config file;
@@ -245,18 +357,40 @@ env: AGENTTRANSFER_URL + AGENTTRANSFER_KEY override the config file;
 `)
 }
 
+// printDelivery renders one send result, wording it by outcome so a refused or
+// quarantined recipient doesn't read as a checkmarked success.
+func printDelivery(d map[string]any) {
+	to := d["to"]
+	switch d["via"] {
+	case "rejected":
+		if reason, ok := d["reason"]; ok {
+			fmt.Printf("✗ %v rejected (%v)\n", to, reason)
+		} else {
+			fmt.Printf("✗ %v rejected\n", to)
+		}
+	case "suppressed":
+		fmt.Printf("– %v skipped (unsubscribed)\n", to)
+	case "error":
+		fmt.Printf("✗ %v failed: %v\n", to, d["error"])
+	case "quarantined":
+		fmt.Printf("• %v delivered to quarantine (recipient accepts known senders only)\n", to)
+	default: // inbox, email
+		fmt.Printf("✓ delivered to %v via %v\n", to, d["via"])
+	}
+}
+
 // cmdSignup self-registers an agent on an open-signup instance (no admin
 // token needed) and logs in as it — the one-command onboarding path.
 func cmdSignup(args []string) error {
 	fs := flag.NewFlagSet("signup", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (becomes the address localpart)")
-	owner := fs.String("owner", "", "your human email (required; verifies outbound email later)")
+	owner := fs.String("owner", "", "your human email (optional; only needed to email humans off-instance)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 || *name == "" || *owner == "" {
-		return errors.New("usage: agenttransfer signup <url> --name my-agent --owner you@example.com")
+	if len(pos) < 1 || *name == "" {
+		return errors.New("usage: agenttransfer signup <url> --name my-agent [--owner you@example.com]")
 	}
 	base := strings.TrimRight(pos[0], "/")
 
@@ -268,22 +402,22 @@ func cmdSignup(args []string) error {
 		Verification string `json:"verification"`
 		Note         string `json:"note"`
 	}
-	if err := a.json("POST", "/v1/agents", map[string]any{"name": *name, "owner_email": *owner}, &out); err != nil {
+	// owner_email is optional — omit it for a keyed agent (no human in the loop).
+	body := map[string]any{"name": *name}
+	if *owner != "" {
+		body["owner_email"] = *owner
+	}
+	if err := a.json("POST", "/v1/agents", body, &out); err != nil {
 		return err
 	}
 
 	c := clientConfig{URL: base, APIKey: out.APIKey}
-	p, err := configPath()
-	if err != nil {
+	if err := saveConfig(c); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	buf, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(p, buf, 0o600); err != nil {
-		return err
-	}
+	// Generate + publish a sealed-transfer identity so `send --seal` works.
+	_, _ = ensureIdentity(newAPI(c), &c)
+	p, _ := configPath()
 
 	fmt.Printf("✓ you are %s\n", out.Email)
 	if out.Note != "" {
@@ -295,8 +429,12 @@ func cmdSignup(args []string) error {
 		fmt.Printf("  a verification link was emailed to %s — confirm it to unlock sending email to humans\n", *owner)
 	case "pending":
 		fmt.Printf("  outbound email to humans stays locked until the operator verifies %s\n", *owner)
+	case "not_required":
+		if *owner == "" {
+			fmt.Println("  keyed agent — no owner needed; to email humans off-instance, sign up with --owner")
+		}
 	}
-	fmt.Println("  everything else works now: put, send (to agents), inbox, get")
+	fmt.Println("  everything else works now: put, send (to agents), spaces, directory, inbox, get")
 	return nil
 }
 
@@ -319,6 +457,12 @@ func cmdLogin(args []string) error {
 		return errors.New("provide --key at_live_... (from agent creation)")
 	}
 	c := clientConfig{URL: url, APIKey: k}
+	// Preserve any existing sealed-transfer identity (an X25519 keypair is fine
+	// to reuse across instances; regenerating it would orphan already-received
+	// sealed files). Read the file directly so env-auth can't hide it.
+	if prev, err := readFileConfig(); err == nil {
+		c.Identity = prev.Identity
+	}
 	a := newAPI(c)
 	var who struct {
 		Email string `json:"email"`
@@ -326,17 +470,10 @@ func cmdLogin(args []string) error {
 	if err := a.json("GET", "/v1/whoami", nil, &who); err != nil {
 		return fmt.Errorf("login check failed: %w", err)
 	}
-	p, err := configPath()
-	if err != nil {
+	if err := saveConfig(c); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	buf, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(p, buf, 0o600); err != nil {
-		return err
-	}
+	_, _ = ensureIdentity(a, &c) // generate + publish sealed-transfer key if absent
 	fmt.Printf("✓ logged in as %s (%s)\n", who.Email, url)
 	return nil
 }
@@ -375,23 +512,33 @@ func cmdPut(args []string) error {
 	share := fs.Bool("share", false, "also mint a share link")
 	ttl := fs.String("ttl", "", "share link TTL (e.g. 3h, max 24h); implies --share")
 	once := fs.Bool("once", false, "burn-after-read share link; implies --share")
+	encrypt := fs.Bool("encrypt", false, "encrypt locally before upload; prints a key to share out-of-band")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return errors.New("usage: agenttransfer put <file> [--share] [--ttl 3h] [--once]")
+		return errors.New("usage: agenttransfer put <file> [--share] [--ttl 3h] [--once] [--encrypt]")
 	}
 	a, err := client()
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(pos[0])
+	name := filepath.Base(pos[0])
+
+	// Body is either the raw file or a streaming encrypting reader.
+	var body io.ReadCloser
+	var encKey string
+	if *encrypt {
+		encKey = seal.NewKey()
+		body, err = encryptingReader(pos[0], encKey, nil)
+	} else {
+		body, err = os.Open(pos[0])
+	}
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	name := filepath.Base(pos[0])
+	defer body.Close()
 
 	q := url.Values{}
 	if *share || *ttl != "" || *once {
@@ -407,7 +554,7 @@ func cmdPut(args []string) error {
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
-	resp, err := a.req("PUT", path, f, "application/octet-stream")
+	resp, err := a.req("PUT", path, body, "application/octet-stream")
 	if err != nil {
 		return err
 	}
@@ -428,7 +575,12 @@ func cmdPut(args []string) error {
 	if err := json.Unmarshal(data, &up); err != nil {
 		return err
 	}
-	fmt.Printf("✓ %s (%d bytes) sha256:%s\n", name, up.Size, up.SHA256)
+	if *encrypt {
+		fmt.Printf("🔒 %s encrypted and uploaded — sha256:%s (ciphertext)\n", name, up.SHA256)
+		fmt.Printf("  key: %s\n  share this key out-of-band; the recipient runs: agenttransfer get <ref> --key %s\n", encKey, encKey)
+	} else {
+		fmt.Printf("✓ %s (%d bytes) sha256:%s\n", name, up.Size, up.SHA256)
+	}
 	if up.Link != nil {
 		fmt.Printf("  link: %s (expires %s, once=%v)\n", up.Link.URL, up.Link.ExpiresAt, up.Link.Once)
 	}
@@ -443,26 +595,55 @@ func cmdSend(args []string) error {
 	ttl := fs.String("ttl", "", "link TTL (e.g. 3h, max 24h)")
 	once := fs.Bool("once", false, "burn-after-read link")
 	ccOwner := fs.Bool("cc-owner", false, "CC your human owner")
+	encrypt := fs.Bool("encrypt", false, "encrypt with a symmetric key printed for out-of-band sharing")
+	sealed := fs.Bool("seal", false, "encrypt to the recipients' keys — only they can decrypt (same-instance)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 || *to == "" {
-		return errors.New("usage: agenttransfer send <file> --to a@b[,c@d] [--note ...]")
+		return errors.New("usage: agenttransfer send <file> --to a@b[,c@d] [--note ...] [--encrypt|--seal]")
+	}
+	if *encrypt && *sealed {
+		return errors.New("--encrypt and --seal are mutually exclusive")
 	}
 	path := pos[0]
 	a, err := client()
 	if err != nil {
 		return err
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	recipients := splitComma(*to)
 	name := filepath.Base(path)
-	resp, err := a.req("PUT", "/v1/files/"+name, f, "application/octet-stream")
+
+	// Resolve encryption mode + build the (possibly encrypting) upload body.
+	encMode, encKey := "", ""
+	var body io.ReadCloser
+	switch {
+	case *sealed:
+		keys, err := resolveRecipientKeys(a, recipients)
+		if err != nil {
+			return err
+		}
+		encMode = "sealed"
+		body, err = encryptingReader(path, "", keys)
+		if err != nil {
+			return err
+		}
+	case *encrypt:
+		encMode, encKey = "symmetric", seal.NewKey()
+		body, err = encryptingReader(path, encKey, nil)
+		if err != nil {
+			return err
+		}
+	default:
+		body, err = os.Open(path)
+		if err != nil {
+			return err
+		}
+	}
+	defer body.Close()
+
+	resp, err := a.req("PUT", "/v1/files/"+name, body, "application/octet-stream")
 	if err != nil {
 		return err
 	}
@@ -478,7 +659,11 @@ func cmdSend(args []string) error {
 	if err := json.Unmarshal(data, &up); err != nil {
 		return err
 	}
-	fmt.Printf("✓ uploaded %s (%d bytes) sha256:%s\n", name, up.Size, up.SHA256)
+	if encMode != "" {
+		fmt.Printf("🔒 uploaded %s encrypted (%s) sha256:%s\n", name, encMode, up.SHA256)
+	} else {
+		fmt.Printf("✓ uploaded %s (%d bytes) sha256:%s\n", name, up.Size, up.SHA256)
+	}
 
 	var out struct {
 		MessageID string           `json:"message_id"`
@@ -490,7 +675,7 @@ func cmdSend(args []string) error {
 		CCOwner string `json:"cc_owner"`
 	}
 	req := map[string]any{
-		"to":   splitComma(*to),
+		"to":   recipients,
 		"file": "sha256:" + up.SHA256,
 	}
 	if *note != "" {
@@ -508,11 +693,17 @@ func cmdSend(args []string) error {
 	if *ccOwner {
 		req["cc_owner"] = true
 	}
+	if encMode != "" {
+		req["enc_mode"] = encMode
+	}
 	if err := a.json("POST", "/v1/send", req, &out); err != nil {
 		return err
 	}
+	if encMode == "symmetric" {
+		fmt.Printf("  key: %s  (share out-of-band; recipient: agenttransfer get %s --key %s)\n", encKey, out.MessageID, encKey)
+	}
 	for _, d := range out.Delivered {
-		fmt.Printf("✓ delivered to %v via %v\n", d["to"], d["via"])
+		printDelivery(d)
 	}
 	if out.Link != nil {
 		fmt.Printf("  link: %s (expires %s)\n", out.Link.URL, out.Link.ExpiresAt)
@@ -569,7 +760,7 @@ func cmdMsg(args []string) error {
 		return err
 	}
 	for _, d := range out.Delivered {
-		fmt.Printf("✓ delivered to %v via %v\n", d["to"], d["via"])
+		printDelivery(d)
 	}
 	fmt.Printf("  message: %s\n", out.MessageID)
 	return nil
@@ -637,20 +828,23 @@ func firstLine(s string) string {
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	out := fs.String("o", "", "output path (default: original filename)")
+	key := fs.String("key", "", "decryption key for a --encrypt'd file (atk_...)")
+	sealedFlag := fs.Bool("seal", false, "force sealed decryption with your identity (auto-detected for msg_ offers)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return errors.New("usage: agenttransfer get <msg_...|share-url|sha256:...> [-o path]")
+		return errors.New("usage: agenttransfer get <msg_...|share-url|sha256:...> [-o path] [--key atk_...]")
 	}
 	ref := pos[0]
-	a, err := client()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
+	a := newAPI(cfg)
 
-	var url, wantSHA, name string
+	var url, wantSHA, name, encMode, markRead string
 	switch {
 	case strings.HasPrefix(ref, "msg_"):
 		var m map[string]any
@@ -664,7 +858,8 @@ func cmdGet(args []string) error {
 		url, _ = offer["url"].(string)
 		wantSHA, _ = offer["sha256"].(string)
 		name, _ = offer["name"].(string)
-		defer a.json("POST", "/v1/inbox/"+ref+"/read", map[string]any{}, nil)
+		encMode, _ = offer["enc_mode"].(string) // "", "symmetric", or "sealed"
+		markRead = ref                          // marked read only on success, below
 	case strings.HasPrefix(ref, "http://"), strings.HasPrefix(ref, "https://"):
 		url = ref
 	case strings.HasPrefix(ref, "sha256:") || len(ref) == 64:
@@ -675,11 +870,29 @@ func cmdGet(args []string) error {
 		return fmt.Errorf("don't know how to fetch %q", ref)
 	}
 
+	// Decide decryption. --key forces symmetric; --seal or a sealed offer forces
+	// sealed (identity); a symmetric offer needs --key.
+	var ident *seal.Identity
+	decryptSym := *key != ""
+	decryptSealed := *sealedFlag || encMode == "sealed"
+	if encMode == "symmetric" && *key == "" {
+		return errors.New("this file is encrypted — supply the shared key with --key atk_...")
+	}
+	if decryptSym && decryptSealed {
+		return errors.New("--key (symmetric) and --seal cannot combine")
+	}
+	if decryptSealed {
+		ident, err = loadIdentity(cfg)
+		if err != nil {
+			return err
+		}
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(url, a.base) {
+	if sameOrigin(url, a.base) {
 		req.Header.Set("Authorization", "Bearer "+a.key)
 	}
 	req.Header.Set("Accept", "application/octet-stream")
@@ -703,6 +916,16 @@ func cmdGet(args []string) error {
 		wantSHA = strings.TrimPrefix(resp.Header.Get("X-Sha256"), "sha256:")
 	}
 
+	// Encrypted path: verify the ciphertext hash and decrypt to dest in one stream.
+	if decryptSym || decryptSealed {
+		if err := verifyAndDecrypt(resp.Body, dest, wantSHA, *key, ident); err != nil {
+			return err
+		}
+		markReadIfSet(a, markRead)
+		fmt.Printf("🔓 %s (decrypted; ciphertext sha256 verified)\n", dest)
+		return nil
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".agenttransfer-*")
 	if err != nil {
 		return err
@@ -723,12 +946,28 @@ func cmdGet(args []string) error {
 		os.Remove(tmp.Name())
 		return err
 	}
+	markReadIfSet(a, markRead)
+	// A file that arrived encrypted but wasn't decrypted (no --key/--seal, or an
+	// offer whose enc_mode was stripped) is raw ciphertext — don't call it verified.
+	if looksEncrypted(dest) {
+		fmt.Printf("⚠ %s looks age-encrypted but no key was supplied — this is raw ciphertext.\n"+
+			"  Re-run with --key atk_... (symmetric) or --seal (sealed to you).\n", dest)
+		return nil
+	}
 	if wantSHA != "" {
 		fmt.Printf("✓ %s (sha256 verified: %s)\n", dest, got)
 	} else {
 		fmt.Printf("✓ %s (sha256: %s — no expected hash to verify against)\n", dest, got)
 	}
 	return nil
+}
+
+// markReadIfSet marks an inbox message read after a successful download (so a
+// failed get leaves it unread and resurfaceable).
+func markReadIfSet(a *api, ref string) {
+	if ref != "" {
+		_ = a.json("POST", "/v1/inbox/"+url.PathEscape(ref)+"/read", map[string]any{}, nil)
+	}
 }
 
 func nameFromResponse(resp *http.Response, url string) string {
@@ -816,6 +1055,63 @@ func cmdRm(args []string) error {
 	}
 	fmt.Println("✓ link revoked (in-flight downloads severed)")
 	return nil
+}
+
+// cmdWebhooks manages push endpoints: add <url>, ls, rm <id>.
+func cmdWebhooks(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: agenttransfer webhooks add <url> | ls | rm <id>")
+	}
+	a, err := client()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "add":
+		if len(args) < 2 {
+			return errors.New("usage: agenttransfer webhooks add <https-url>")
+		}
+		var out struct {
+			ID     string `json:"id"`
+			URL    string `json:"url"`
+			Secret string `json:"secret"`
+		}
+		if err := a.json("POST", "/v1/webhooks", map[string]any{"url": args[1]}, &out); err != nil {
+			return err
+		}
+		fmt.Printf("✓ webhook %s → %s\n", out.ID, out.URL)
+		fmt.Printf("  secret (shown once — verify Webhook-Signature with it): %s\n", out.Secret)
+		return nil
+	case "ls":
+		var out struct {
+			Webhooks []map[string]any `json:"webhooks"`
+		}
+		if err := a.json("GET", "/v1/webhooks", nil, &out); err != nil {
+			return err
+		}
+		if len(out.Webhooks) == 0 {
+			fmt.Println("no webhooks")
+			return nil
+		}
+		for _, wh := range out.Webhooks {
+			status := "enabled"
+			if en, _ := wh["enabled"].(bool); !en {
+				status = fmt.Sprintf("DISABLED (%v)", wh["disabled_reason"])
+			}
+			fmt.Printf("%v  %-9s fails=%v  %v\n", wh["id"], status, wh["fail_count"], wh["url"])
+		}
+		return nil
+	case "rm":
+		if len(args) < 2 {
+			return errors.New("usage: agenttransfer webhooks rm <id>")
+		}
+		if err := a.json("DELETE", "/v1/webhooks/"+args[1], nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("✓ webhook removed")
+		return nil
+	}
+	return fmt.Errorf("unknown webhooks subcommand %q (add|ls|rm)", args[0])
 }
 
 func cmdKeep(args []string) error {
@@ -1034,13 +1330,10 @@ func cmdRotateKey(args []string) error {
 		return err
 	}
 	// Persist the new key immediately — the old one is already dead.
+	// saveConfig keeps the sealed-transfer identity intact.
 	c, _ := loadConfig()
 	c.APIKey = out.APIKey
-	p, err := configPath()
-	if err == nil {
-		buf, _ := json.MarshalIndent(c, "", "  ")
-		_ = os.WriteFile(p, buf, 0o600)
-	}
+	_ = saveConfig(c)
 	fmt.Printf("✓ key rotated and saved\n  new key: %s\n", out.APIKey)
 	return nil
 }
@@ -1111,4 +1404,134 @@ func cmdAgents(args []string) error {
 		return err
 	}
 	return printJSON(out)
+}
+
+// card is an agent's public discovery profile, decoded from the wire form the
+// server returns (store.Card). The CLI never imports server/store types.
+type card struct {
+	Name         string   `json:"name"`
+	Pubkey       string   `json:"pubkey"`
+	Description  string   `json:"description"`
+	Capabilities []string `json:"capabilities"`
+	Listed       bool     `json:"listed"`
+	UpdatedAt    int64    `json:"updated_at"`
+}
+
+// cmdDirectory lists agents that opted into discovery — how an agent finds peers
+// by what they can do.
+func cmdDirectory(args []string) error {
+	fs := flag.NewFlagSet("directory", flag.ExitOnError)
+	capability := fs.String("capability", "", "filter to agents advertising this capability tag")
+	limit := fs.Int("limit", 0, "max agents to list (server caps at 200)")
+	if _, err := parseArgs(fs, args); err != nil {
+		return err
+	}
+	a, err := client()
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if *capability != "" {
+		q.Set("capability", *capability)
+	}
+	if *limit > 0 {
+		q.Set("limit", strconv.Itoa(*limit))
+	}
+	path := "/v1/directory"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out struct {
+		Agents []card `json:"agents"`
+		Count  int    `json:"count"`
+	}
+	if err := a.json("GET", path, nil, &out); err != nil {
+		return err
+	}
+	if out.Count == 0 {
+		fmt.Println("no agents listed in the directory")
+		return nil
+	}
+	for _, ag := range out.Agents {
+		parts := []string{ag.Name}
+		if ag.Description != "" {
+			parts = append(parts, ag.Description)
+		}
+		if len(ag.Capabilities) > 0 {
+			parts = append(parts, strings.Join(ag.Capabilities, ", "))
+		}
+		fmt.Println(strings.Join(parts, " — "))
+	}
+	return nil
+}
+
+// cmdCard shows another agent's public card (404 if it's unlisted or absent).
+func cmdCard(args []string) error {
+	fs := flag.NewFlagSet("card", flag.ExitOnError)
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 {
+		return errors.New("usage: agenttransfer card <name>")
+	}
+	a, err := client()
+	if err != nil {
+		return err
+	}
+	var c card
+	if err := a.json("GET", "/v1/agents/"+url.PathEscape(pos[0])+"/card", nil, &c); err != nil {
+		return err
+	}
+	fmt.Println(c.Name)
+	if c.Description != "" {
+		fmt.Printf("  %s\n", c.Description)
+	}
+	if len(c.Capabilities) > 0 {
+		fmt.Printf("  capabilities: %s\n", strings.Join(c.Capabilities, ", "))
+	}
+	if c.Pubkey != "" {
+		fmt.Printf("  pubkey: %s\n", c.Pubkey)
+	}
+	return nil
+}
+
+// cmdCardSet publishes/updates the caller's own discovery card. It is a full
+// upsert (PUT): capabilities and listed are replaced with what's supplied here.
+func cmdCardSet(args []string) error {
+	fs := flag.NewFlagSet("card-set", flag.ExitOnError)
+	description := fs.String("description", "", "one-line description of what your agent does")
+	capabilities := fs.String("capabilities", "", "comma-separated capability tags")
+	listed := fs.Bool("listed", false, "opt into the public directory")
+	if _, err := parseArgs(fs, args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*description) == "" {
+		return errors.New(`usage: agenttransfer card-set --description "..." [--capabilities a,b,c] [--listed]`)
+	}
+	a, err := client()
+	if err != nil {
+		return err
+	}
+	req := map[string]any{
+		"description":  *description,
+		"capabilities": splitComma(*capabilities),
+		"listed":       *listed,
+	}
+	var c card
+	if err := a.json("PUT", "/v1/agents/self/card", req, &c); err != nil {
+		return err
+	}
+	state := "unlisted (not discoverable)"
+	if c.Listed {
+		state = "listed in the directory"
+	}
+	fmt.Printf("✓ card published — %s\n", state)
+	if c.Description != "" {
+		fmt.Printf("  %s\n", c.Description)
+	}
+	if len(c.Capabilities) > 0 {
+		fmt.Printf("  capabilities: %s\n", strings.Join(c.Capabilities, ", "))
+	}
+	return nil
 }

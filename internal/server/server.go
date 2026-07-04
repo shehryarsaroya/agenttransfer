@@ -61,6 +61,10 @@ type Server struct {
 	// nil when IP_RATE is disabled.
 	unauthLimiter *ipLimiter
 
+	// allowPrivateWebhooks disables the SSRF address guard so tests can deliver
+	// to a loopback sink. NEVER set in production.
+	allowPrivateWebhooks bool
+
 	// lastDiskLog throttles the disk-guard log line to one per minute.
 	lastDiskLog atomic.Int64
 
@@ -175,6 +179,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/agents/self", s.auth(s.handleDeleteSelf))
 	mux.HandleFunc("DELETE /v1/agents/{id}", s.handleDeleteAgent) // admin
 	mux.HandleFunc("GET /v1/whoami", s.auth(s.handleWhoami))
+	mux.HandleFunc("GET /v1/agents/{name}/pubkey", s.auth(s.handlePubkey)) // sealed-transfer key lookup
+	mux.HandleFunc("PUT /v1/agents/self/card", s.auth(s.handleSetCard))
+	mux.HandleFunc("GET /v1/agents/{name}/card", s.auth(s.handleGetCard))
+	mux.HandleFunc("GET /v1/directory", s.auth(s.handleDirectory))          // opt-in agent discovery
+	mux.HandleFunc("PUT /v1/agents/self/policy", s.auth(s.handleSetPolicy)) // recipient accept policy
 
 	// Folder.
 	mux.HandleFunc("POST /v1/files", s.auth(s.handleUpload))
@@ -196,8 +205,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/inbox/{id}", s.auth(s.handleGetMessage))
 	mux.HandleFunc("POST /v1/inbox/{id}/read", s.auth(s.handleMarkRead))
 
+	// Spaces (shared multi-agent coordination contexts).
+	mux.HandleFunc("POST /v1/spaces", s.auth(s.handleCreateSpace))
+	mux.HandleFunc("GET /v1/spaces", s.auth(s.handleListSpaces))
+	mux.HandleFunc("GET /v1/spaces/{id}", s.auth(s.handleGetSpace))
+	mux.HandleFunc("POST /v1/spaces/{id}/members", s.auth(s.handleAddSpaceMember))
+	mux.HandleFunc("DELETE /v1/spaces/{id}/members/{name}", s.auth(s.handleRemoveSpaceMember))
+	mux.HandleFunc("POST /v1/spaces/{id}/events", s.auth(s.handlePostSpaceEvent))
+	mux.HandleFunc("GET /v1/spaces/{id}/events", s.auth(s.handleSpaceEvents))
+	mux.HandleFunc("GET /v1/spaces/{id}/files/{sha}/content", s.auth(s.handleSpaceFileContent))
+
 	// Upload requests (human → agent).
 	mux.HandleFunc("POST /v1/requests", s.auth(s.handleCreateRequest))
+
+	// Webhooks (push delivery).
+	mux.HandleFunc("POST /v1/webhooks", s.auth(s.handleCreateWebhook))
+	mux.HandleFunc("GET /v1/webhooks", s.auth(s.handleListWebhooks))
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.auth(s.handleDeleteWebhook))
 
 	// Receipts.
 	mux.HandleFunc("GET /v1/receipts", s.auth(s.handleReceipts))
@@ -360,6 +384,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	go s.janitorLoop(ctx)
+	go s.webhookWorker(ctx)
 
 	// Connect host: reap dead registrations.
 	if s.connect != nil {
@@ -440,6 +465,11 @@ func (s *Server) JanitorOnce() error {
 		}
 	}
 	s.severMu.Unlock()
+
+	// Reclaim deliveries wedged 'delivering' for >5 min (a lost terminal
+	// write), and drop terminal delivery rows older than a day.
+	_ = s.st.ReclaimStuckDeliveries(now - 300)
+	_ = s.st.PruneWebhookDeliveries(now - 24*3600)
 
 	return s.st.Prune()
 }

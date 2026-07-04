@@ -19,6 +19,7 @@ import (
 	afmail "github.com/shehryarsaroya/agenttransfer/internal/mail"
 	"github.com/shehryarsaroya/agenttransfer/internal/proto"
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/seal"
 	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
 
@@ -191,9 +192,16 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name       string `json:"name"`
 		OwnerEmail string `json:"owner_email"`
+		Pubkey     string `json:"pubkey"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	// A registered pubkey is the agent's sealed-transfer identity (age recipient).
+	// Optional, but if present it must be a real recipient.
+	if req.Pubkey != "" && !seal.ValidRecipient(req.Pubkey) {
+		errJSON(w, http.StatusBadRequest, "pubkey must be a valid age recipient (age1...)")
 		return
 	}
 
@@ -208,21 +216,27 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusTooManyRequests, "signup rate limit: try again later")
 			return
 		}
-		if _, err := mail.ParseAddress(req.OwnerEmail); err != nil {
-			errJSON(w, http.StatusBadRequest, "owner_email (a valid address) is required for open signup")
-			return
-		}
 		if reservedNames[requested] {
 			errJSON(w, http.StatusBadRequest, "the name %q is reserved on this instance", requested)
 			return
 		}
-		// Identities must not be free in bulk: one owner address can register
-		// only so many agents (each with its own quota) via open signup.
-		if max := s.cfg.MaxAgentsPerOwner; max > 0 {
-			if n, err := s.st.CountAgentsByOwner(req.OwnerEmail); err == nil && n >= max {
-				errJSON(w, http.StatusForbidden,
-					"this owner email already has %d agents (max %d) — delete one (DELETE /v1/agents/self) or ask the operator", n, max)
+		// owner_email is OPTIONAL. A keyed agent (no owner) is a first-class
+		// citizen: it operates fully same-instance and over native federation
+		// with no human in the loop. An owner is needed only to unlock the
+		// outbound *email* projection (reaching humans / non-federated hosts),
+		// and then it must be valid and caps how many agents it can spawn. Bulk
+		// anonymous signup is bounded by the per-IP rate limiter above.
+		if req.OwnerEmail != "" {
+			if _, err := mail.ParseAddress(req.OwnerEmail); err != nil {
+				errJSON(w, http.StatusBadRequest, "owner_email, if given, must be a valid address")
 				return
+			}
+			if max := s.cfg.MaxAgentsPerOwner; max > 0 {
+				if n, err := s.st.CountAgentsByOwner(req.OwnerEmail); err == nil && n >= max {
+					errJSON(w, http.StatusForbidden,
+						"this owner email already has %d agents (max %d) — delete one (DELETE /v1/agents/self) or ask the operator", n, max)
+					return
+				}
 			}
 		}
 	}
@@ -239,9 +253,17 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "%v", err)
 		return
 	}
+	if req.Pubkey != "" {
+		if err := s.st.SetPubkey(agent.ID, req.Pubkey); err == nil {
+			agent.Pubkey = req.Pubkey
+		}
+	}
 
+	// Nothing to verify for a keyed agent with no owner — it's ready to work.
+	// (An owner is set here at signup or by an admin verify; there is no
+	// self-service path to add one afterward.)
 	verification := "not_required"
-	if !agent.OwnerVerified {
+	if agent.OwnerEmail != "" && !agent.OwnerVerified {
 		verification = "pending"
 		if s.emailCapable() {
 			if err := s.sendVerificationEmail(agent); err == nil {
@@ -255,6 +277,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		"name":           agent.Name,
 		"email":          agent.Email,
 		"api_key":        key,
+		"pubkey":         agent.Pubkey,
 		"owner_email":    agent.OwnerEmail,
 		"owner_verified": agent.OwnerVerified,
 		"verification":   verification,
@@ -462,7 +485,8 @@ func (s *Server) handleRotateKey(w http.ResponseWriter, r *http.Request, agent s
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	var req struct {
-		AlwaysCCOwner *bool `json:"always_cc_owner"`
+		AlwaysCCOwner *bool   `json:"always_cc_owner"`
+		Pubkey        *string `json:"pubkey"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "%v", err)
@@ -475,7 +499,146 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, agent st
 		}
 		agent.AlwaysCCOwner = *req.AlwaysCCOwner
 	}
+	if req.Pubkey != nil {
+		// Publish the agent's sealed-transfer recipient. Validate the "age1..."
+		// shape so a garbage value can't silently break every sealed send to it.
+		pk := strings.TrimSpace(*req.Pubkey)
+		if pk != "" && !seal.ValidRecipient(pk) {
+			errJSON(w, http.StatusBadRequest, "pubkey must be a valid age recipient (age1...)")
+			return
+		}
+		if err := s.st.SetPubkey(agent.ID, pk); err != nil {
+			errJSON(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		agent.Pubkey = pk
+	}
 	writeJSON(w, http.StatusOK, agent)
+}
+
+// handlePubkey (auth'd) returns an agent's published sealed-transfer recipient
+// by name. Auth-gated to prevent anonymous enumeration; any valid agent — local
+// or, cross-instance, a remote sender's instance calling out — can look it up.
+func (s *Server) handlePubkey(w http.ResponseWriter, r *http.Request, _ store.Agent) {
+	name := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
+	a, err := s.st.AgentByName(name)
+	// One 404 for both "no such agent" and "no key published" so an
+	// authenticated caller can't enumerate which names exist.
+	if err != nil || a.Pubkey == "" {
+		errJSON(w, http.StatusNotFound, "no published sealed-transfer key for %q", name)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": a.Name, "email": a.Email, "pubkey": a.Pubkey})
+}
+
+// handleSetCard (PUT /v1/agents/self/card) sets the agent's discovery profile.
+// listed:true opts into the directory; the rest is free-form capability tags.
+func (s *Server) handleSetCard(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	var req struct {
+		Description  string   `json:"description"`
+		Capabilities []string `json:"capabilities"`
+		Listed       bool     `json:"listed"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	if len(req.Description) > 2000 {
+		errJSON(w, http.StatusBadRequest, "description too long (max 2000 chars)")
+		return
+	}
+	if len(req.Capabilities) > 32 {
+		errJSON(w, http.StatusBadRequest, "too many capabilities (max 32)")
+		return
+	}
+	if err := s.st.SetCard(agent.ID, req.Description, req.Capabilities, req.Listed); err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	c, err := s.st.CardOf(agent.ID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+// handleGetCard (GET /v1/agents/{name}/card) returns a listed agent's public
+// discovery card. Unlisted or absent → 404 (indistinguishable, so it can't be
+// used to enumerate which names exist).
+func (s *Server) handleGetCard(w http.ResponseWriter, r *http.Request, _ store.Agent) {
+	name := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
+	c, err := s.st.CardByName(name)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "no public card for %q", name)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+// handleDirectory (GET /v1/directory?capability=&limit=) lists agents that
+// opted into discovery — how an agent finds peers by what they can do.
+func (s *Server) handleDirectory(w http.ResponseWriter, r *http.Request, _ store.Agent) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	cards, err := s.st.Directory(r.URL.Query().Get("capability"), limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if cards == nil {
+		cards = []store.Card{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": cards, "count": len(cards)})
+}
+
+// decideInbound applies the recipient's accept policy to an incoming sender,
+// returning whether to deliver at all and whether it lands in quarantine.
+func (s *Server) decideInbound(recipient store.Agent, senderAddr string) (deliver, quarantined bool) {
+	switch recipient.AcceptPolicy {
+	case "known", "closed":
+		if known, _ := s.st.SenderKnown(recipient.ID, senderAddr); known {
+			return true, false
+		}
+		// closed → refuse unknown; known → accept but quarantine.
+		return recipient.AcceptPolicy != "closed", true
+	default: // "open" or unset
+		return true, false
+	}
+}
+
+func policyOr(p string) string {
+	if p == "" {
+		return "open"
+	}
+	return p
+}
+
+// handleSetPolicy (PUT /v1/agents/self/policy) sets who reaches the agent's main
+// inbox. Recipient-side trust: an agent decides which senders it accepts rather
+// than the sender needing to be vouched for.
+func (s *Server) handleSetPolicy(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	var req struct {
+		Accept string   `json:"accept"`
+		Allow  []string `json:"allow"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	if len(req.Allow) > 1000 {
+		errJSON(w, http.StatusBadRequest, "allowlist too long (max 1000)")
+		return
+	}
+	if err := s.st.SetPolicy(agent.ID, req.Accept, req.Allow); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	allow, _ := s.st.Allowlist(agent.ID)
+	accept := req.Accept
+	if accept == "" {
+		accept = "open"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accept": accept, "allow": allow})
 }
 
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent store.Agent) {
@@ -496,6 +659,9 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent stor
 		"owner_email":    agent.OwnerEmail,
 		"owner_verified": agent.OwnerVerified,
 		"instance":       s.st.Instance(),
+		"pubkey":         agent.Pubkey,
+		"sealed_enabled": agent.Pubkey != "",
+		"accept_policy":  policyOr(agent.AcceptPolicy),
 		"storage":        storage,
 		"limits": map[string]any{
 			"max_file_size": s.cfg.MaxFileSize,
@@ -839,6 +1005,11 @@ type sendRequest struct {
 	Once    bool     `json:"once,omitempty"`
 	ReplyTo string   `json:"reply_to,omitempty"`
 	CCOwner bool     `json:"cc_owner,omitempty"`
+	// EncMode, when set to proto.EncSymmetric or proto.EncSealed, marks the
+	// referenced file as client-encrypted so the recipient knows to decrypt.
+	// The server never sees plaintext or any key — this is only a manifest
+	// hint set by the sending client.
+	EncMode string `json:"enc_mode,omitempty"`
 }
 
 type sendResult struct {
@@ -917,6 +1088,11 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	if req.File == "" && strings.TrimSpace(req.Note) == "" {
 		return nil, http.StatusBadRequest, errors.New("nothing to send: provide \"file\", \"note\", or both")
 	}
+	// Reject an unknown enc_mode: otherwise a garbage value would ride into the
+	// offer and the recipient would silently save undecryptable ciphertext.
+	if req.EncMode != "" && req.EncMode != proto.EncSymmetric && req.EncMode != proto.EncSealed {
+		return nil, http.StatusBadRequest, fmt.Errorf("enc_mode must be %q, %q, or empty", proto.EncSymmetric, proto.EncSealed)
+	}
 
 	// Threading.
 	var inReplyTo, references, replySubject string
@@ -953,6 +1129,16 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 			}
 			localAgents = append(localAgents, la)
 			continue
+		}
+		// Anything else is treated as a remote email recipient — so it must be a
+		// syntactically valid address. Validate here, before the relay, so a bad
+		// value is a clean 400 (not a 502 leaking relay internals) and a bare
+		// agent name gets an agent-first hint toward the local address form.
+		if _, err := mail.ParseAddress(addr); err != nil {
+			if !strings.Contains(addr, "@") {
+				return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not an address — for an agent on this instance use %q, or give a full email for a remote recipient", addr, addr+"@"+instance)
+			}
+			return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not a valid email address", addr)
 		}
 		remote = append(remote, addr)
 	}
@@ -1037,7 +1223,7 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 		}
 		link = &l
 		p := proto.FilePart(l.Name, l.MIME, s.linkURL(l.Token), l.SHA256, l.Size,
-			time.Unix(l.ExpiresAt, 0).UTC().Format(time.RFC3339), l.Once)
+			time.Unix(l.ExpiresAt, 0).UTC().Format(time.RFC3339), l.Once, req.EncMode)
 		filePart = &p
 	}
 
@@ -1074,21 +1260,40 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 		res.Link = &lj
 	}
 
-	// Local fast path: same-instance recipients skip SMTP entirely.
+	// Local fast path: same-instance recipients skip SMTP entirely. Each
+	// recipient's accept policy decides whether the message lands in the main
+	// inbox, is held in quarantine, or (for "closed") is refused outright.
 	for _, la := range localAgents {
-		_, err := s.st.AddMessage(store.Message{
+		deliver, quarantined := s.decideInbound(la, agent.Email)
+		if !deliver {
+			res.Delivered = append(res.Delivered, map[string]any{"to": la.Email, "via": "rejected", "reason": "recipient only accepts known senders"})
+			continue
+		}
+		lm, err := s.st.AddMessage(store.Message{
 			AgentID: la.ID, From: agent.Email, To: req.To, Subject: subject,
 			Text: strings.TrimSpace(req.Note), MessageID: rfcMsgID,
 			InReplyTo: inReplyTo, References: references,
 			Manifest: string(manifestJSON), DKIM: "local", SPF: "local",
+			Quarantined: quarantined,
 		})
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
-		s.hub.notify(la.ID)
+		// A quarantined message is held out of the main inbox, so it must not
+		// wake a long-poll or fire a webhook — that would defeat quarantine as a
+		// spam control. It's still receipted (it did arrive) and readable via
+		// GET /v1/inbox?quarantined=1.
+		if !quarantined {
+			s.hub.notify(la.ID)
+			s.enqueueWebhooks(la.ID, "message.received", lm.ID, agent.Email)
+		}
 		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionSent, shaOf(link), sizeOf(link), la.Email, msgID)
 		_, _ = s.st.AppendReceipt(la.Email, receipt.ActionReceived, shaOf(link), sizeOf(link), agent.Email, msgID)
-		res.Delivered = append(res.Delivered, map[string]any{"to": la.Email, "via": "inbox"})
+		via := "inbox"
+		if quarantined {
+			via = "quarantined"
+		}
+		res.Delivered = append(res.Delivered, map[string]any{"to": la.Email, "via": via})
 	}
 
 	// Remote: one real email PER recipient through the relay, each carrying
@@ -1276,6 +1481,9 @@ func (s *Server) messageJSON(m store.Message) map[string]any {
 		"attachments": m.Attachments,
 		"received_at": time.Unix(m.ReceivedAt, 0).UTC().Format(time.RFC3339),
 	}
+	if m.Quarantined {
+		out["quarantined"] = true
+	}
 	if m.InReplyTo != "" {
 		out["in_reply_to"] = m.InReplyTo
 	}
@@ -1298,6 +1506,12 @@ func (s *Server) messageJSON(m store.Message) map[string]any {
 					// download consumes them.
 					"once": fp.MetaBool(proto.MetaOnce),
 				}
+				// Client-encrypted file: tell the recipient it must decrypt
+				// (symmetric = supply the out-of-band key; sealed = use its
+				// own identity). Absent for plaintext.
+				if enc := fp.MetaString(proto.MetaEncMode); enc != "" {
+					offer["enc_mode"] = enc
+				}
 				// Only auto-trust offers with authenticated provenance.
 				offer["trusted"] = m.DKIM == "pass" || m.DKIM == "local"
 				out["offer"] = offer
@@ -1311,7 +1525,14 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request, agent store
 	q := r.URL.Query()
 	unread := q.Get("unread") == "1" || q.Get("unread") == "true"
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	msgs, err := s.st.ListInbox(agent.ID, unread, q.Get("thread"), limit)
+	var msgs []store.Message
+	var err error
+	if q.Get("quarantined") == "1" || q.Get("quarantined") == "true" {
+		// The quarantine bucket: messages held back by the accept policy.
+		msgs, err = s.st.ListQuarantine(agent.ID, limit)
+	} else {
+		msgs, err = s.st.ListInbox(agent.ID, unread, q.Get("thread"), limit)
+	}
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return

@@ -36,6 +36,7 @@ Design rules:
 
 - **`parts` aligns field-for-field with A2A** (`TextPart`, `FilePart` with `FileWithUri`): `kind`, `text`, `file.name`, `file.mimeType`, `file.uri`, `metadata`. An A2A agent can lift `parts` straight into an A2A message. AgentTransfer extensions live only in namespaced `metadata` keys (`agenttransfer.*`), which A2A tolerates.
 - **Bytes never ride in the manifest.** `file.uri` points at an HTTPS share link; `agenttransfer.sha256` lets any receiver verify what it fetched. Links expire (`agenttransfer.expiresAt`, ≤ 24h on default configs) — fetch promptly or ask again.
+- **Encryption is optional and client-side.** When a file is encrypted (see [encryption.md](encryption.md)), the linked bytes are [age](https://age-encryption.org) ciphertext, `agenttransfer.sha256` is the hash of *that ciphertext*, and one extra key marks it: `"agenttransfer.encMode": "symmetric" | "sealed"`. The protocol carries only this tag — never a key. A receiver without the tag still verifies integrity via the sha256; a receiver that has the key (symmetric) or is the sealed recipient decrypts locally. Instances relaying the manifest see ciphertext and metadata only.
 - **Authenticity = aligned DKIM.** A receiving instance records the DKIM verdict of the carrying email and marks the parsed offer `trusted` only on `pass` (or same-instance delivery). `pass` requires a valid signature whose `d=` domain **aligns with the From domain** — equal, or parent/subdomain on a label boundary, as in DMARC relaxed alignment. A valid signature from an unrelated domain proves nothing about the claimed sender and is recorded as `fail`. Consumers should not auto-fetch untrusted offers.
 - **Receivers must not auto-fetch at ingest.** Fetching URLs out of inbound mail server-side is SSRF; AgentTransfer stores the reference and lets the recipient agent download explicitly.
 - Versioning: `v` bumps only on breaking changes; unknown fields must be ignored.
@@ -76,7 +77,7 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
 ```json
 {
   "name": "agenttransfer",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "instance": "agents.example.com",
   "receipt_pubkey": "ed25519:...",
   "max_file_size": 5368709120,

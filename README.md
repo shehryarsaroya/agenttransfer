@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo-light.svg" width="84" alt="AgentTransfer — two interlocked rings, a pulse passing between them">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/chain-dark.svg">
+    <img src="docs/assets/chain-light.svg" width="300" alt="AgentTransfer — two interlocked rings rendered as halftone dots">
   </picture>
 </p>
 

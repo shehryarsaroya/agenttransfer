@@ -8,9 +8,9 @@ Base URL: `https://<instance>/v1`. Authenticate with `Authorization: Bearer <api
 Admin token, or open (when `OPEN_SIGNUP=true`; per-IP rate-limited).
 
 ```json
-{"name": "openclaw-dev", "owner_email": "you@example.com", "pubkey": "age1..."}
+{"name": "openclaw-dev", "owner_email": "you@example.com", "pubkey": "age1...", "as": "shehryar"}
 ```
-`owner_email` and `pubkey` are both optional. → `201`
+`owner_email`, `pubkey`, and `as` are all optional. → `201`
 ```json
 {
   "agent_id": "agt_...", "name": "openclaw-dev",
@@ -28,7 +28,9 @@ Admin token, or open (when `OPEN_SIGNUP=true`; per-IP rate-limited).
 
 `verification` is `not_required` (no owner), `sent` (owner set, confirmation email dispatched), or `pending` (owner set, but the instance has no outbound path to send the email yet). An agent with an owner cannot send email off the instance until that owner confirms via the emailed link. `api_key` is shown once and stored hashed. Admin-created agents are pre-verified.
 
-On open signup a taken name is auto-suffixed (`openclaw-dev-x7k2`) rather than rejected (the response carries a `note` when that happens), and operational names (`abuse`, `postmaster`, `no-reply`, …) are reserved; admins asking for an exact taken name still get an error. When `owner_email` is given on open signup, one owner email can register at most `MAX_AGENTS_PER_OWNER` agents (default 10) → `403` past that; admins bypass. Non-admin signup on a non-open instance → `403`; too many signups from one IP → `429`.
+On open signup a taken name is auto-suffixed (`openclaw-dev-x7k2`) rather than rejected (the response carries a `note` when that happens), and operational names (`abuse`, `postmaster`, `no-reply`, `concierge`, …) are reserved; admins asking for an exact taken name still get an error. When `owner_email` is given on open signup, one owner email can register at most `MAX_AGENTS_PER_OWNER` agents (default 10) → `403` past that; admins bypass. Non-admin signup on a non-open instance → `403`; too many signups from one IP → `429`.
+
+**`as` — person-owned agents (fleets).** With `as` set, `name` becomes the tag and the agent lives at `handle+tag@instance` (`{"name":"laptop","as":"shehryar"}` → `shehryar+laptop@…`). First use of a handle creates the *person* (then `owner_email` is required — the person **is** that address); later uses join the fleet. Every person-owned agent starts **attach-pending**: the person receives an email from the agent itself and approves with one click — the first click also verifies the person and activates the handle. Pending agents authenticate and work, but are unreachable (no delivery at their plus-address, no fan-out, `404` on pubkey lookup — indistinguishable from nonexistent), so a squatter's `dana+evil` can never intercept Dana's mail. Delivery: `handle@instance` fans out to every *approved* agent in the fleet; `handle+tag@instance` reaches that agent; an unknown tag falls back to the person (standard plus-addressing). Never-verified handles are released after 48 h. The response adds `person` and `person_address`; the person's public page is `GET /@handle` (404 until verified). Handles share the localpart namespace with flat agent names — neither can claim the other's.
 
 - `POST /v1/agents/self/rotate_key` → new `api_key`; the old key dies immediately. Rotation does not touch the agent's sealed-transfer keypair.
 - `POST /v1/agents/self/settings` — `{"always_cc_owner": true}`, `{"pubkey": "age1..."}` to publish the sealed-transfer public key, and/or `{"public_contact": "support@…"}` to publish an opt-in contact (≤200 chars). The pubkey must be a valid age X25519 recipient or the call is rejected. This endpoint does **not** set `owner_email` (that stays private).

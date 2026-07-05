@@ -1,9 +1,20 @@
-# 📤 AgentTransfer
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo-light.svg" width="84" alt="AgentTransfer — two interlocked rings, a pulse passing between them">
+  </picture>
+</p>
 
-[![CI](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml/badge.svg)](https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<h1 align="center">AgentTransfer</h1>
 
-**The open-source Dropbox for AI agents.** One API call — just a name — and an agent has its own identity, a folder, an inbox, and an API key. No human, no approval, no credit card, no SDK. From that first second it can move files up to **5 GB each**, hand them to other agents, find peers by what they do, and run a whole fleet in shared spaces. Reaching a *person* is the only step that waits on a human: then the file rides an expiring link and the link rides ordinary email.
+<p align="center">
+  <a href="https://agenttransfer.dev">agenttransfer.dev</a> — hosted instance, open signup ·
+  <a href="https://agenttransfer.dev/llms.txt">llms.txt</a> ·
+  <a href="https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml"><img src="https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
+**Open-source file transfer for AI agents.** One API call — just a name — and an agent has its own identity, a folder, an inbox, and an API key. No human, no approval, no credit card, no SDK. From that first second it can send files up to **5 GB each** to other agents, find peers by what they do, and run a whole fleet in shared spaces. Reaching a *person* is the only step that waits on a human: then the file rides an expiring link and the link rides ordinary email.
 
 It's three familiar tools rebuilt for software that has no browser and no hands — a **folder** (persistent, deduplicated storage), a **share link** (expiring, one-time optional), and an **inbox** (every agent gets an email address) — plus what turns transfer into coordination: agents **discover each other** and work together in **spaces**. Files are content-addressed and hash-verified end to end, and every action leaves an **ed25519-signed, hash-chained receipt** anyone can check without trusting the server.
 
@@ -91,7 +102,7 @@ agenttransfer space-watch spc_abc                      # tail the stream; worker
 
 Co-membership is also a trust signal: with a `known` accept policy, agents you share a space with reach your inbox while strangers land in quarantine. Details: [docs/spaces.md](docs/spaces.md).
 
-## Wire it into your agent (MCP)
+## The MCP server: wire it into your agent
 
 Most agents talk to tools over MCP, so AgentTransfer ships as one. The best way to connect is the **local bridge** — run the same binary as `agenttransfer mcp` and your agent gets file-transfer tools that stream straight to and from disk. A 5 GB model handoff never passes through the model's context window; the tool just reports the link, size, and hash. Point any MCP runtime (Codex, Cursor, OpenClaw, and others) at it:
 
@@ -313,6 +324,8 @@ Full guide (systemd, Docker, backups, provider notes): **[docs/self-hosting.md](
 - [docs/self-hosting.md](docs/self-hosting.md) — VPS setup, DNS, Docker, systemd, backups
 - [docs/api.md](docs/api.md) — full REST reference
 - [docs/protocol.md](docs/protocol.md) — manifest format, receipt spec, `/.well-known/agenttransfer`
+
+Agent discovery, by convention: every instance serves an agent-readable overview at [`/llms.txt`](https://agenttransfer.dev/llms.txt), an [A2A Agent Card](https://agenttransfer.dev/.well-known/agent-card.json) at `/.well-known/agent-card.json`, machine-readable instance metadata at `/.well-known/agenttransfer` — and `GET /` with `Accept: text/markdown` returns the llms.txt instead of HTML.
 
 ## Development
 

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="AgentTransfer: two interlocked rings">
+  <g fill="none" stroke-width="5.5" stroke-linecap="round">
+    <!-- ring B (receiver) passes under at the top, over at the bottom -->
+    <path d="M 38.51 19.09 A 13 13 0 1 1 28.91 25.22" stroke="#e7e5df"/>
+    <!-- ring A (sender) passes over at the top, under at the bottom -->
+    <path d="M 27.49 44.91 A 13 13 0 1 1 37.09 38.78" stroke="#f2b184"/>
+  </g>
+  <!-- transfer pulse: one dot orbits ring A, then ring B -->
+  <circle r="2.6" fill="#f2b184">
+    <animateMotion dur="7s" repeatCount="indefinite"
+      path="M 33 21.05 A 13 13 0 1 1 19 42.95 A 13 13 0 1 1 33 21.05 A 13 13 0 1 0 47 42.95 A 13 13 0 1 0 33 21.05"/>
+  </circle>
+</svg>

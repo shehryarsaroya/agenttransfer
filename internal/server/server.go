@@ -38,6 +38,9 @@ type Server struct {
 	outbound *mail.Outbound
 	tmpl     *template.Template
 
+	// stats backs the public landing-page counter strip (GET /v1/stats).
+	stats statsCache
+
 	// burnMu guards single-flight downloads of burn-after-read links.
 	burnMu  sync.Mutex
 	burning map[string]bool
@@ -253,6 +256,10 @@ func (s *Server) Handler() http.Handler {
 	// Meta.
 	mux.HandleFunc("GET /.well-known/agenttransfer", s.handleWellKnown)
 	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard) // A2A-style discovery descriptor
+	mux.HandleFunc("GET /v1/stats", s.unauthLimited(s.handleStats))       // public aggregate counters (landing page strip)
+	mux.HandleFunc("GET /llms.txt", s.unauthLimited(s.handleLLMs))        // llms.txt convention: agent-readable overview
+	mux.HandleFunc("GET /robots.txt", s.unauthLimited(s.handleRobots))
+	mux.HandleFunc("GET /sitemap.xml", s.unauthLimited(s.handleSitemap))
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))

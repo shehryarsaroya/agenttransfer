@@ -62,9 +62,10 @@ func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"protocolVersion":    "0.3.0",
 		"name":               "agenttransfer",
-		"description":        "Verifiable file transfer and coordination for AI agents: each agent self-provisions an identity, folder, and inbox; move files up to 5GB via content-addressed, hash-verified links; discover peers and coordinate in shared spaces; every action leaves a signed receipt. MCP bridge at /mcp.",
+		"description":        "Open-source file transfer for AI agents: each agent self-provisions an identity, folder, inbox, and email address; send files up to 5GB between agents via content-addressed, hash-verified links; discover peers and coordinate in shared spaces; every action leaves a signed receipt. MCP server at /mcp.",
 		"url":                base + "/v1",
 		"preferredTransport": "HTTP+JSON",
+		"documentationUrl":   base + "/llms.txt",
 		"version":            Version,
 		"provider": map[string]any{
 			"organization": s.st.Instance(),
@@ -81,10 +82,14 @@ func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 		},
 		"security": []map[string]any{{"bearer": []string{}}},
 		"skills": []map[string]any{
-			{"id": "transfer", "name": "Transfer files", "description": "Send files up to 5GB to agents or humans; recipients download over HTTPS and verify the sha256.", "tags": []string{"files", "transfer", "sha256"}},
-			{"id": "inbox", "name": "Receive", "description": "Every agent has an inbox and email address; long-poll or webhook on arrival.", "tags": []string{"messaging", "email"}},
-			{"id": "spaces", "name": "Coordinate", "description": "Shared spaces where a fleet of agents exchanges messages and files.", "tags": []string{"coordination", "spaces"}},
-			{"id": "discovery", "name": "Discover", "description": "Publish a capability card and find peers via the directory.", "tags": []string{"discovery", "directory"}},
+			{"id": "transfer", "name": "Transfer files", "description": "Send files up to 5GB to agents or humans; recipients download over HTTPS and verify the sha256.", "tags": []string{"files", "transfer", "sha256"},
+				"examples": []string{"send weights.tar.gz to codex-bot@" + s.st.Instance(), "share a 2GB dataset with another agent and verify the hash"}},
+			{"id": "inbox", "name": "Receive", "description": "Every agent has an inbox and email address; long-poll or webhook on arrival.", "tags": []string{"messaging", "email"},
+				"examples": []string{"wait for the next file to arrive in my inbox"}},
+			{"id": "spaces", "name": "Coordinate", "description": "Shared spaces where a fleet of agents exchanges messages and files.", "tags": []string{"coordination", "spaces"},
+				"examples": []string{"post scene.blend to the render-fleet space"}},
+			{"id": "discovery", "name": "Discover", "description": "Publish a capability card and find peers via the directory.", "tags": []string{"discovery", "directory"},
+				"examples": []string{"find an agent that can render"}},
 		},
 	})
 }

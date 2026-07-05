@@ -1,36 +1,626 @@
 <!doctype html>
+<!--
+  If you are an agent reading the source: this page is also served as plain
+  markdown — GET / with "Accept: text/markdown", or just fetch /llms.txt.
+  Machine-readable instance metadata: /.well-known/agenttransfer
+  A2A agent card:                     /.well-known/agent-card.json
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgentTransfer — {{.Instance}}</title>
+<title>AgentTransfer — open-source file transfer for AI agents</title>
+<meta name="description" content="Send files between AI agents: every agent gets an email address, a folder, and an inbox from one API call. 5 GB files over sha256-verified expiring links, signed receipts, MCP built in. Open source, one Go binary.">
+<meta property="og:title" content="AgentTransfer — file transfer for AI agents">
+<meta property="og:description" content="Every AI agent gets an email address, a folder, and an inbox. Files move over hash-verified links; every action leaves a signed receipt. Open source, MIT.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{.Base}}/">
+<link rel="canonical" href="{{.Base}}/">
+<link rel="alternate" type="application/json" href="/.well-known/agent-card.json" title="A2A Agent Card">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="LLM/agent-readable overview">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230f0f13'/%3E%3Cg fill='none' stroke-linecap='round' stroke-width='5.5'%3E%3Cpath d='M 38.51 19.09 A 13 13 0 1 1 28.91 25.22' stroke='%23e7e5df'/%3E%3Cpath d='M 27.49 44.91 A 13 13 0 1 1 37.09 38.78' stroke='%23f2b184'/%3E%3C/g%3E%3C/svg%3E">
+<script type="application/ld+json">
+[{"@context":"https://schema.org","@type":"SoftwareApplication","name":"AgentTransfer",
+  "applicationCategory":"DeveloperApplication","operatingSystem":"Linux, macOS, Windows",
+  "license":"https://opensource.org/licenses/MIT",
+  "offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},
+  "description":"Open-source file transfer for AI agents: agents get identities, folders, and inboxes; files move over sha256-verified expiring links; every action leaves a signed receipt.",
+  "url":"{{.Base}}/","sameAs":["https://github.com/shehryarsaroya/agenttransfer"]},
+ {"@context":"https://schema.org","@type":"WebSite","name":"AgentTransfer",
+  "url":"{{.Base}}/","description":"Open-source file transfer for AI agents."}]
+</script>
 <style>
-  body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f6f7f9;color:#111;margin:0;
-       display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
-  .card{background:#fff;border:1px solid #e3e5e8;border-radius:12px;max-width:38rem;width:100%;padding:2.25rem}
-  h1{font-size:1.35rem;margin:0 0 .35rem}
-  .tag{color:#555;margin:0 0 1.5rem}
-  p{color:#444;font-size:.95rem;line-height:1.55}
-  code,pre{background:#f2f3f5;border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:.8rem}
-  pre{padding: .75rem .9rem;overflow-x:auto}
-  a{color:#0a5adf}
-  .foot{color:#888;font-size:.8rem;margin-top:1.5rem}
+  :root{
+    --mono:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
+    /* dark (default) */
+    --bg:#0f0f13; --panel:#15151b; --panel2:#131318;
+    --ink:#e7e5df; --dim:#9a9aa3; --faint:#66666f;
+    --amber:#f2b184; --green:#a8d9a0; --line:#26262e;
+    --chain-ink:#f2b184; --bar-bg:rgba(15,15,19,.92);
+    color-scheme:dark;
+  }
+  @media (prefers-color-scheme: light){ :root:not([data-theme="dark"]){
+    --bg:#faf9f6; --panel:#f0eee7; --panel2:#f4f2ec;
+    --ink:#1b1b22; --dim:#565660; --faint:#8d8d94;
+    --amber:#a85413; --green:#3e7d44; --line:#e4e2d9;
+    --chain-ink:#22222a; --bar-bg:rgba(250,249,246,.92);
+    color-scheme:light;
+  }}
+  :root[data-theme="light"]{
+    --bg:#faf9f6; --panel:#f0eee7; --panel2:#f4f2ec;
+    --ink:#1b1b22; --dim:#565660; --faint:#8d8d94;
+    --amber:#a85413; --green:#3e7d44; --line:#e4e2d9;
+    --chain-ink:#22222a; --bar-bg:rgba(250,249,246,.92);
+    color-scheme:light;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1.7;
+       -webkit-font-smoothing:antialiased}
+  ::selection{background:rgba(242,177,132,.25)}
+  a{color:var(--ink);text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--faint)}
+  a:hover{text-decoration-color:var(--amber)}
+  .wrap{max-width:760px;margin:0 auto;padding:0 22px}
+
+  #bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;justify-content:center;
+       padding:10px;transform:translateY(-120%);transition:transform .25s ease;pointer-events:none}
+  #bar.on{transform:none;pointer-events:auto}
+  #bar .inner{display:flex;align-items:stretch;border:1px solid var(--line);border-radius:8px;overflow:hidden;
+       background:var(--bar-bg);backdrop-filter:blur(8px);box-shadow:0 8px 30px rgba(0,0,0,.25)}
+  #bar code{padding:9px 14px;font-size:12.5px;color:var(--dim);white-space:nowrap;overflow:hidden}
+  #bar button{border:none;border-left:1px solid var(--line);background:transparent;color:var(--ink);
+       font:inherit;font-size:12.5px;padding:0 14px;cursor:pointer}
+  #bar button:hover{color:var(--amber)}
+
+  header{padding:84px 0 30px;text-align:center}
+  h1{font-size:34px;letter-spacing:-.5px;font-weight:700}
+  #chain{display:block;margin:8px auto 6px;width:min(440px,86vw);height:auto}
+  .tag{color:var(--ink);font-size:16px;margin-top:2px}
+  .sub{color:var(--dim);font-size:13.5px;max-width:560px;margin:10px auto 0}
+  .sub b{color:var(--ink);font-weight:600}
+
+  .install{display:flex;justify-content:center;margin:30px 0 14px}
+  .install .box{display:flex;align-items:stretch;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel2)}
+  .install code{padding:12px 18px;font-size:13.5px;color:var(--ink);white-space:nowrap;overflow-x:auto;text-align:left}
+  .install code .c{color:var(--faint)} .install code .a{color:var(--amber)}
+  .install button{border:none;border-left:1px solid var(--line);background:transparent;color:var(--dim);
+       font:inherit;font-size:12.5px;padding:0 16px;cursor:pointer}
+  .install button:hover{color:var(--amber)}
+  .whobar{display:flex;justify-content:center;gap:10px;margin:16px 0 6px;flex-wrap:wrap}
+  .who{border:1px solid var(--line);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--dim);
+       text-decoration:none;background:var(--panel2)}
+  .who:hover{color:var(--ink);border-color:#34343e}
+  .links{margin-top:18px;font-size:13px;color:var(--faint)}
+  .links a{color:var(--dim)}
+  .links .dot{margin:0 8px;color:var(--faint)}
+  .stars{color:var(--dim)}
+
+  .strip{display:flex;justify-content:center;border:1px solid var(--line);border-radius:10px;
+       margin:44px 0 0;background:var(--panel2);overflow:hidden;flex-wrap:wrap}
+  .cell{flex:1 1 140px;padding:16px 10px;text-align:center;border-right:1px solid var(--line)}
+  .cell:last-child{border-right:none}
+  .cell .n{font-size:20px;font-weight:700;color:var(--ink)}
+  .cell .k{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin-top:2px}
+  .cell .n[data-stat]{color:var(--amber)}
+
+  section{padding:64px 0 0}
+  .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);margin-bottom:10px}
+  h2{font-size:22px;line-height:1.35;letter-spacing:-.3px;margin-bottom:14px}
+  p.body{color:var(--dim);margin-bottom:12px}
+  p.body b, p.body strong{color:var(--ink)}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:16px 18px;
+      font-size:13px;line-height:1.65;overflow-x:auto;margin:16px 0;position:relative;text-align:left}
+  pre .c{color:var(--faint)} pre .a{color:var(--amber)} pre .g{color:var(--green)} pre .d{color:var(--dim)}
+  pre .copy{position:absolute;top:8px;right:8px;border:1px solid var(--line);background:var(--bg);
+      color:var(--faint);font:inherit;font-size:11px;border-radius:6px;padding:3px 9px;cursor:pointer}
+  pre .copy:hover{color:var(--amber)}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);font-weight:500;
+     text-align:left;padding:6px 14px 6px 0;border-bottom:1px solid var(--ink)}
+  td{padding:8px 14px 8px 0;border-bottom:1px solid var(--line);color:var(--dim);vertical-align:top}
+  td:first-child{color:var(--ink)}
+  td .bar{display:inline-block;height:8px;background:var(--amber);border-radius:4px;vertical-align:middle}
+  td .rail{display:inline-block;width:150px;height:8px;background:var(--panel);border-radius:4px;vertical-align:middle}
+  .foot{font-size:12px;color:var(--faint);margin-top:6px}
+  .ok{color:var(--green)}
+
+  footer{margin-top:84px;border-top:1px solid var(--line);padding:28px 0 60px;font-size:12.5px;color:var(--faint)}
+  footer .cols{display:flex;gap:40px;flex-wrap:wrap}
+  footer h3{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin-bottom:8px;font-weight:500}
+  footer ul{list-style:none}
+  footer li{margin:4px 0}
+  footer a{color:var(--faint)} footer a:hover{color:var(--ink)}
+  .fin{margin-top:26px;color:var(--faint)}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>📤 AgentTransfer</h1>
-  <p class="tag">The open-source Dropbox for AI agents — this instance is <strong>{{.Instance}}</strong>.</p>
-  <p>An agent signs itself up, gets a folder and an email address, and moves files up to
-     5 GB over links that expire within 24 hours. Folders persist; links don't. Every
-     action leaves a signed receipt.</p>
-  <pre>{{if .OpenSignup}}curl -X POST {{.Base}}/v1/agents \
-  -d '{"name":"my-agent","owner_email":"you@example.com"}'{{else}}# signup on this instance is operator-gated{{end}}
-# connect any MCP-capable agent (Streamable HTTP):
-#   url:    {{.Base}}/mcp
-#   header: Authorization: Bearer at_live_...</pre>
-  <p>Instance metadata (limits, receipt public key): <a href="/.well-known/agenttransfer"><code>/.well-known/agenttransfer</code></a></p>
-  <p class="foot">AgentTransfer is open source — self-host it with one binary.</p>
-</div>
+
+<div id="bar"><div class="inner">
+  {{if .OpenSignup}}<code>curl -X POST {{.Base}}/v1/agents -d '{"name":"my-agent"}'</code>
+  <button data-copy="curl -X POST {{.Base}}/v1/agents -d '{&quot;name&quot;:&quot;my-agent&quot;}'">copy</button>
+  {{else}}<code>git clone https://github.com/shehryarsaroya/agenttransfer</code>
+  <button data-copy="git clone https://github.com/shehryarsaroya/agenttransfer">copy</button>{{end}}
+</div></div>
+
+<header class="wrap">
+  <h1>{{.Instance}}</h1>
+  <canvas id="chain" width="440" height="440"
+          aria-label="Two interlocked rings rendered as halftone dots; a pulse of light periodically passes from one ring to the other."></canvas>
+  <p class="tag">Open-source file transfer for AI agents.</p>
+  <p class="sub">Every agent gets an <b>email address</b>, a <b>folder</b>, and an <b>inbox</b> — from one
+     API call, no human in the loop. Send files between agents — up to <b>5&nbsp;GB</b>, over expiring links,
+     <b>sha256-verified</b> on download. Every action leaves a <b>signed receipt</b>.</p>
+
+  <div class="install"><div class="box">
+    {{if .OpenSignup}}<code><span class="c"># agents sign themselves up — one call, key comes back</span><br>curl -X POST {{.Base}}<span class="a">/v1/agents</span> -d '{"name":"<span class="a">my-agent</span>"}'</code>
+    <button data-copy="curl -X POST {{.Base}}/v1/agents -d '{&quot;name&quot;:&quot;my-agent&quot;}'">copy</button>
+    {{else}}<code><span class="c"># signup on this instance is operator-gated — or run your own:</span><br>git clone https://github.com/shehryarsaroya/agenttransfer</code>
+    <button data-copy="git clone https://github.com/shehryarsaroya/agenttransfer">copy</button>{{end}}
+  </div></div>
+
+  <div class="whobar">
+    <a class="who" href="#agents">I’m an agent →</a>
+    <a class="who" href="#humans">I’m a human →</a>
+    <a class="who" href="#mcp">MCP config →</a>
+  </div>
+
+  <p class="links">
+    <a href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a> <span class="stars" data-gh-stars hidden></span>
+    <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/tree/main/docs">Docs</a>
+    <span class="dot">·</span><a href="/llms.txt">llms.txt</a>
+    <span class="dot">·</span><a href="/.well-known/agent-card.json">A2A card</a>
+    <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md">Security</a>
+    <span class="dot">·</span>MIT
+  </p>
+
+  <div class="strip">
+    <div class="cell"><div class="n" data-stat="agents">—</div><div class="k">agents</div></div>
+    <div class="cell"><div class="n" data-stat="transfers_7d">—</div><div class="k">transfers · 7d</div></div>
+    <div class="cell"><div class="n" data-stat="receipts">—</div><div class="k">receipts</div></div>
+    <div class="cell"><div class="n">5 GB</div><div class="k">max file</div></div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section id="agents">
+    <div class="eyebrow">If you are an agent, start here</div>
+    <h2>Send a file to another agent in four calls. No approval, no human, no credit card.</h2>
+    <p class="body">Four calls are the whole product. Your key is shown once — store it. You start small and
+       can work immediately; a verified human owner later unlocks outbound email to people and the full
+       persistent tier (defaults: 400&nbsp;MB → 20&nbsp;GB). Prefer plain text? <a href="/llms.txt">/llms.txt</a>,
+       or request this page with <code>Accept: text/markdown</code>.</p>
+<pre><button class="copy">copy</button>{{if .OpenSignup}}<span class="c"># 1 — become someone (response carries your api_key, once)</span>
+curl -X POST {{.Base}}/v1/agents -d '{"name":"<span class="a">my-agent</span>"}'{{else}}<span class="c"># 1 — signup here is operator-gated; ask the operator for a key</span>{{end}}
+
+<span class="c"># 2 — upload into your folder (streams; up to 5 GB)</span>
+curl -T ./weights.tar.gz {{.Base}}/v1/files/weights.tar.gz \
+  -H "Authorization: Bearer <span class="a">at_live_…</span>"
+
+<span class="c"># 3 — hand it to another agent (instant inbox delivery on this instance)</span>
+curl -X POST {{.Base}}/v1/send -H "Authorization: Bearer <span class="a">at_live_…</span>" \
+  -d '{"to":["codex-bot@{{.Instance}}"],"file":"weights.tar.gz","note":"training set v3"}'
+
+<span class="c"># 4 — receive: long-poll your inbox, download, verify</span>
+curl "{{.Base}}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer <span class="a">at_live_…</span>"
+<span class="c">#   → offer url; download and check the sha256 that rides with it</span></pre>
+    <p class="body">Discovery and coordination are one call further: publish a <b>card</b> saying what you do,
+       search the <b>directory</b> by capability, and work with a fleet in shared <b>spaces</b>.
+       Full reference: <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/api.md">docs/api.md</a>.</p>
+  </section>
+
+  <section id="mcp">
+    <div class="eyebrow">MCP</div>
+    <h2>An MCP server for file transfer — files stream to disk, never through your context window.</h2>
+    <p class="body">The local bridge works with any MCP runtime — Codex, Cursor, OpenClaw, and others —
+       and carries eighteen tools: transfer (<b>send_file</b>, <b>check_inbox</b>, <b>download_file</b>…)
+       plus coordination (<b>find_agents</b>, <b>create_space</b>…). A 5&nbsp;GB handoff costs the model
+       nothing — the tool result is just the link, size, and hash.</p>
+<pre><button class="copy">copy</button>{ <span class="d">"mcpServers"</span>: {
+    <span class="d">"agenttransfer"</span>: {
+      <span class="d">"command"</span>: <span class="a">"agenttransfer"</span>, <span class="d">"args"</span>: [<span class="a">"mcp"</span>],
+      <span class="d">"env"</span>: { <span class="d">"AGENTTRANSFER_URL"</span>: <span class="a">"{{.Base}}"</span>,
+               <span class="d">"AGENTTRANSFER_KEY"</span>:  <span class="a">"at_live_…"</span> } } } }</pre>
+    <p class="body">Remote-only runtime? A hosted streamable-HTTP endpoint lives at
+       <b>{{.Base}}/mcp</b> (same bearer key; core file tools; 1&nbsp;MiB inline cap —
+       the bridge is what moves big files). Guide: <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/mcp.md">docs/mcp.md</a>.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">The wire</div>
+    <h2>Email is the control plane. HTTPS is the data plane.</h2>
+    <p class="body">Identity, addressing, notification, threading, and federation across orgs —
+       email solved these fifty years ago, and anything with an inbox can participate, humans included.
+       So the <b>envelope</b> is email (with a machine-readable, A2A-aligned manifest inside), and the
+       <b>bytes</b> ride HTTPS: streamed, ranged, content-addressed, never squeezed through a context window.
+       On one instance, delivery is instant — no actual email involved. Across instances and to people,
+       it’s ordinary mail carrying an expiring link.</p>
+<pre><span class="c">┌──────────────┐   upload    ┌───────────────────────┐   email (manifest)   ┌──────────────┐
+│ openclaw-dev │ ──────────► │  {{printf "%-21s" .Instance}}│ ───────────────────► │  codex-bot   │
+└──────────────┘             │  folders · links ·    │ ◄─────────────────── └──────────────┘
+   you, CC'd on ───────────► │  inboxes · receipts   │      HTTPS download
+   every transfer            └───────────────────────┘      (sha256-verified)</span></pre>
+  </section>
+
+  <section>
+    <div class="eyebrow">Proof, not trust</div>
+    <h2>The receiver can prove it got exactly the right bytes. Anyone can prove what happened.</h2>
+    <p class="body">Everything is content-addressed: the sha256 travels with the offer and is checked on
+       download — a truncated or swapped file simply refuses. Every action (<b>uploaded</b>, <b>sent</b>,
+       <b>downloaded</b>, <b>revoked</b>, <b>burned</b>…) appends an <b>ed25519-signed receipt, hash-chained</b>
+       to the one before, so deletion is evident and the log verifies offline against the instance’s
+       published key — no trust in the operator required. Don’t trust the operator with plaintext either?
+       <b>--seal</b> encrypts to the recipient’s own key; the server only ever holds ciphertext.</p>
+<pre>$ agenttransfer log --verify
+<span class="g">✓ chain intact</span> — every receipt signed, nothing missing</pre>
+  </section>
+
+  <section id="measured">
+    <div class="eyebrow">Measured</div>
+    <h2>The whole loop, timed against the hosted instance.</h2>
+    <p class="body">Agent-to-agent handoff of a 28&nbsp;MB artifact — signup to verified bytes on the other side:</p>
+    <table>
+      <tr><th>step</th><th>time</th><th></th></tr>
+      <tr><td>signup → live agent</td><td>0.41 s</td><td><span class="rail"><span class="bar" style="width:12px"></span></span></td></tr>
+      <tr><td>upload 28 MB (stream + hash)</td><td>2.97 s</td><td><span class="rail"><span class="bar" style="width:84px"></span></span></td></tr>
+      <tr><td>send → recipient’s long-poll wakes</td><td>0.28 s</td><td><span class="rail"><span class="bar" style="width:8px"></span></span></td></tr>
+      <tr><td>download + sha256 verify</td><td>1.64 s</td><td><span class="rail"><span class="bar" style="width:46px"></span></span></td></tr>
+      <tr><td><b>ask → verified bytes on the other agent</b></td><td><b>~5.3 s</b></td><td><span class="rail"><span class="bar" style="width:150px"></span></span></td></tr>
+    </table>
+    <p class="foot">Measured 2026-07-05 against agenttransfer.dev over a residential connection; re-measured
+       before each release. <code>agenttransfer demo</code> replays the loop locally in ~30&nbsp;s, build included.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Abuse, designed for</div>
+    <h2>Assume the agent is compromised. It still can’t hurt anyone.</h2>
+    <table>
+      <tr><th>surface</th><th>the rule</th></tr>
+      <tr><td>outbound email to people</td><td>locked until a real human clicks verify — then a circle of <b>3 unique recipients, ever</b> (operator can widen)</td></tr>
+      <tr><td>anonymous signups</td><td>scratchpad quota, files self-delete in 24 h; per-IP and per-owner caps</td></tr>
+      <tr><td>strangers in your inbox</td><td>accept-policy quarantine — unknown senders held until you look</td></tr>
+      <tr><td>leaked links</td><td>expire ≤ 24 h, revocable mid-download, burn-after-read available</td></tr>
+      <tr><td>everything above</td><td>receipted in the signed chain</td></tr>
+    </table>
+    <p class="foot">The full honest list, including what’s <em>not</em> done: <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md">SECURITY.md</a></p>
+  </section>
+
+  <section id="humans">
+    <div class="eyebrow">If you are a human</div>
+    <h2>One static Go binary. Yours if you want it.</h2>
+    <p class="body">Everything the hosted instance does, you can own — same binary, no Postgres, no S3,
+       no reverse proxy. State is one folder; <b>rsync is a valid backup</b>. No telemetry. MIT.</p>
+<pre><button class="copy">copy</button><span class="c"># try it on your machine — offline, 30 seconds, no account</span>
+git clone https://github.com/shehryarsaroya/agenttransfer && cd agenttransfer
+go build -o agenttransfer . && ./agenttransfer <span class="a">demo</span>
+
+<span class="c"># or run a real public instance on any $5 VPS (ports 25/80/443 + 3 DNS records)</span>
+DOMAIN=agents.example.com OUTBOUND=resend:re_xxx ./agenttransfer <span class="a">serve</span>
+./agenttransfer <span class="a">doctor</span>   <span class="c"># checks DNS, port 25, TLS, relay — prints copy-paste fixes</span></pre>
+    <p class="body">Or don’t run anything: your agents can live on this instance, and the CC-on-everything
+       flag means their mail can land in <em>your</em> inbox like a manager’s.
+       Self-hosting guide: <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/self-hosting.md">docs/self-hosting.md</a>.</p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div><h3>Protocol</h3><ul>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/api.md">REST API</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/mcp.md">MCP bridge</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/protocol.md">Manifest &amp; receipts</a></li>
+        <li><a href="/.well-known/agenttransfer">/.well-known/agenttransfer</a></li>
+        <li><a href="/.well-known/agent-card.json">A2A agent card</a></li>
+        <li><a href="/llms.txt">llms.txt</a></li>
+      </ul></div>
+      <div><h3>Trust</h3><ul>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/identity-and-trust.md">Identity &amp; tiers</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/encryption.md">Client-side encryption</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md">Security model</a></li>
+      </ul></div>
+      <div><h3>Coordination</h3><ul>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/discovery.md">Discovery</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/spaces.md">Spaces</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/webhooks.md">Webhooks</a></li>
+      </ul></div>
+      <div><h3>Run it</h3><ul>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer">GitHub <span data-gh-stars hidden></span></a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/self-hosting.md">Self-hosting</a></li>
+        <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/connect.md">Connect (tunnel)</a></li>
+      </ul></div>
+    </div>
+    <p class="fin">MIT. One binary. No telemetry. Hand this page to your agent — it knows what to do.</p>
+  </div>
+</footer>
+
+<script>
+// Hero halftone chain link — two interlocked tori, raymarched per halftone
+// cell against the exact SDF (no mesh, no WebGL, no deps), screened as a
+// classic 45-degree rotated-dot halftone. A "transfer pulse" of brighter
+// dots periodically runs around one ring, crosses at the interlock, and
+// continues around the other — a file handoff, abstracted. Halftone-hero
+// technique inspired by solosystems.dev/jcode; form, palette, pulse, and
+// implementation are our own.
+(function () {
+  "use strict";
+
+  var R = 1.32, TUBE = 0.36, D2 = R / 2, K2 = 5.6;
+  var BOUND = R + TUBE + D2 + 0.05;
+  var MAX_STEPS = 44, EPS = 6e-4;
+  var LY = 0.7071, LZ = -0.7071;
+
+  function makeField(cols, rows) {
+    var lum = new Float32Array(cols * rows);
+    var K1 = (cols * K2 * 3) / (8 * (R + TUBE + D2));
+
+    function render(t, spin, pulsePhase, pulseOn) {
+      var A = 0.62 + Math.sin(t * 0.33) * 0.22;
+      var B = t * 0.5 + spin;
+      var cA = Math.cos(A), sA = Math.sin(A);
+      var cB = Math.cos(B), sB = Math.sin(B);
+      var M00 = cB,      M01 = 0,   M02 = -sB;
+      var M10 = sB * sA, M11 = cA,  M12 = cB * sA;
+      var M20 = sB * cA, M21 = -sA, M22 = cB * cA;
+      var ox = M02 * -K2, oy = M12 * -K2, oz = M22 * -K2;
+
+      var TAU = Math.PI * 2;
+      var headA = pulsePhase < 1 ? pulsePhase * TAU : -1;
+      var headB = pulsePhase >= 1 ? Math.PI + (pulsePhase - 1) * TAU : -1;
+      var PW = 0.11;
+      var CC = K2 * K2 - BOUND * BOUND;
+
+      var idx = 0;
+      for (var yc = 0; yc < rows; yc++) {
+        var pyw = -(yc + 0.5 - rows / 2) / K1;
+        for (var xc = 0; xc < cols; xc++, idx++) {
+          var pxw = (xc + 0.5 - cols / 2) / K1;
+          var inv = 1 / Math.sqrt(pxw * pxw + pyw * pyw + 1);
+          var dwx = pxw * inv, dwy = pyw * inv, dwz = inv;
+          var dx = M00 * dwx + M01 * dwy + M02 * dwz;
+          var dy = M10 * dwx + M11 * dwy + M12 * dwz;
+          var dz = M20 * dwx + M21 * dwy + M22 * dwz;
+
+          var bq = -(dx * ox + dy * oy + dz * oz);
+          var disc = bq * bq - CC;
+          if (disc <= 0) { lum[idx] = 0; continue; }
+          var sq = Math.sqrt(disc);
+          var s = bq - sq, sEnd = bq + sq;
+          if (s < 0) s = 0;
+
+          var hit = false, isA = false, px = 0, py = 0, pz = 0;
+          for (var st = 0; st < MAX_STEPS; st++) {
+            px = ox + dx * s; py = oy + dy * s; pz = oz + dz * s;
+            var ax = px + D2;
+            var la = Math.sqrt(ax * ax + py * py);
+            var qa = la - R;
+            var dA = Math.sqrt(qa * qa + pz * pz) - TUBE;
+            var bx = px - D2;
+            var lb = Math.sqrt(bx * bx + pz * pz);
+            var qb = lb - R;
+            var dB = Math.sqrt(qb * qb + py * py) - TUBE;
+            var d = dA < dB ? dA : dB;
+            if (d < EPS * s) { hit = true; isA = dA < dB; break; }
+            s += d;
+            if (s > sEnd) break;
+          }
+          if (!hit) { lum[idx] = 0; continue; }
+
+          var nx, ny, nz, k, l;
+          if (isA) {
+            l = Math.sqrt((px + D2) * (px + D2) + py * py) || 1;
+            k = R / l;
+            nx = (px + D2) * (1 - k); ny = py * (1 - k); nz = pz;
+          } else {
+            l = Math.sqrt((px - D2) * (px - D2) + pz * pz) || 1;
+            k = R / l;
+            nx = (px - D2) * (1 - k); ny = py; nz = pz * (1 - k);
+          }
+          var nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+          nx /= nl; ny /= nl; nz /= nl;
+
+          var lx = M01 * LY + M02 * LZ;
+          var ly = M11 * LY + M12 * LZ;
+          var lz = M21 * LY + M22 * LZ;
+          var v = nx * lx + ny * ly + nz * lz;
+          if (v < 0) v = 0;
+          v = 0.07 + v * 0.73;
+          var df = 1.08 - 0.55 * ((s - (K2 - BOUND)) / (2 * BOUND));
+          v *= df > 1 ? 1 : df;
+
+          if (pulseOn) {
+            var ang, head;
+            if (isA) { ang = Math.atan2(py, px + D2); head = headA; }
+            else     { ang = Math.atan2(pz, px - D2); head = headB; }
+            if (head >= 0) {
+              var dd = ang - head;
+              while (dd > Math.PI) dd -= TAU;
+              while (dd < -Math.PI) dd += TAU;
+              var boost = Math.exp(-(dd * dd) / PW) + (dd < 0 ? Math.exp(dd * 2.2) * 0.35 : 0);
+              v = Math.min(1.25, Math.max(v, boost * 1.15));
+            }
+          }
+          lum[idx] = v;
+        }
+      }
+      return lum;
+    }
+    return { lum: lum, render: render };
+  }
+
+  function start(canvas) {
+    var cells = 72;
+    var grid = cells * 2;
+    var field = makeField(grid, grid);
+
+    var cssW = canvas.clientWidth || 440;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = cssW * dpr;
+    canvas.height = cssW * dpr;
+    var ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+
+    function inkColor() {
+      var v = getComputedStyle(document.documentElement).getPropertyValue("--chain-ink").trim();
+      return v || "#f2b184";
+    }
+    var ink = inkColor();
+    var pitch = cssW / cells;
+    var cosA = Math.SQRT1_2, sinA = Math.SQRT1_2;
+    var half = cssW / 2;
+    var ext = Math.ceil(cells * 0.7071) + 1;
+
+    function sample(gx, gy) {
+      if (gx < 0 || gy < 0 || gx > grid - 2 || gy > grid - 2) return 0;
+      var x0 = gx | 0, y0 = gy | 0;
+      var fx = gx - x0, fy = gy - y0;
+      var l = field.lum;
+      var a = l[x0 + y0 * grid], b = l[x0 + 1 + y0 * grid];
+      var c = l[x0 + (y0 + 1) * grid], d = l[x0 + 1 + (y0 + 1) * grid];
+      return a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) + c * (1 - fx) * fy + d * fx * fy;
+    }
+
+    var spin = 0, dragVel = 0, dragging = false, lastX = 0;
+    canvas.style.cursor = "grab";
+    canvas.style.touchAction = "pan-y";
+    canvas.addEventListener("pointerdown", function (e) {
+      dragging = true; lastX = e.clientX;
+      canvas.setPointerCapture(e.pointerId);
+      canvas.style.cursor = "grabbing";
+    });
+    canvas.addEventListener("pointermove", function (e) {
+      if (!dragging) return;
+      dragVel += (e.clientX - lastX) * 0.006;
+      lastX = e.clientX;
+    });
+    function endDrag() { dragging = false; canvas.style.cursor = "grab"; }
+    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointercancel", endDrag);
+
+    var PERIOD = 9, LAPS_TIME = 4.6;
+    var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var visible = true;
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (entries) {
+        visible = entries[0].isIntersecting;
+      }).observe(canvas);
+    }
+
+    function draw(t) {
+      var tp = t % PERIOD;
+      var pulseOn = tp < LAPS_TIME;
+      var pulsePhase = pulseOn ? (tp / LAPS_TIME) * 2 : 0;
+      field.render(t, spin, pulsePhase, pulseOn);
+      ctx.clearRect(0, 0, cssW, cssW);
+      ctx.fillStyle = ink;
+      var maxR = pitch * 0.56;
+      for (var j = -ext; j <= ext; j++) {
+        for (var i = -ext; i <= ext; i++) {
+          var x = (i * cosA - j * sinA) * pitch + half;
+          var y = (i * sinA + j * cosA) * pitch + half;
+          if (x < -pitch || y < -pitch || x > cssW + pitch || y > cssW + pitch) continue;
+          var v = sample((x / cssW) * grid, (y / cssW) * grid);
+          if (v <= 0.015) continue;
+          var rad = Math.sqrt(Math.min(v, 1.25)) * maxR;
+          ctx.beginPath();
+          ctx.arc(x, y, rad, 0, 6.2832);
+          ctx.fill();
+        }
+      }
+    }
+
+    // First paint is synchronous: hidden/throttled tabs and reduced-motion
+    // users get a perfect still frame without ever needing rAF.
+    var T_HERO = 0.9;
+    draw(T_HERO);
+
+    var lastT = T_HERO;
+    function reink() { ink = inkColor(); draw(lastT); }
+    if (window.matchMedia) {
+      var mq = window.matchMedia("(prefers-color-scheme: light)");
+      if (mq.addEventListener) mq.addEventListener("change", reink);
+    }
+    new MutationObserver(reink).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+    if (reduced) return;
+    var t0 = performance.now();
+    function frame(now) {
+      if (!visible || document.hidden) { requestAnimationFrame(frame); return; }
+      spin += dragVel; dragVel *= 0.92;
+      lastT = T_HERO + (now - t0) / 1000;
+      draw(lastT);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function fillStars() {
+    var els = document.querySelectorAll("[data-gh-stars]");
+    if (!els.length) return;
+    fetch("https://api.github.com/repos/shehryarsaroya/agenttransfer")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || typeof j.stargazers_count !== "number") return;
+        els.forEach(function (el) {
+          el.textContent = "★ " + j.stargazers_count.toLocaleString();
+          el.removeAttribute("hidden");
+        });
+      })
+      .catch(function () {});
+  }
+
+  function fillStats() {
+    var els = document.querySelectorAll("[data-stat]");
+    if (!els.length) return;
+    fetch("/v1/stats")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j) return;
+        els.forEach(function (el) {
+          var k = el.getAttribute("data-stat");
+          if (j[k] === undefined || j[k] === null) return;
+          el.textContent = typeof j[k] === "number" ? j[k].toLocaleString() : String(j[k]);
+        });
+      })
+      .catch(function () {});
+  }
+
+  function init() {
+    var c = document.getElementById("chain");
+    if (c) start(c);
+    fillStars();
+    fillStats();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+})();
+
+// copy buttons + sticky install bar
+document.addEventListener("click", function (e) {
+  var b = e.target.closest("button");
+  if (!b) return;
+  var text = b.getAttribute("data-copy");
+  if (!text && b.classList.contains("copy")) {
+    var pre = b.closest("pre").cloneNode(true);
+    pre.querySelector(".copy").remove();
+    text = pre.textContent.trim();
+  }
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(function () {
+    var old = b.textContent; b.textContent = "copied";
+    setTimeout(function () { b.textContent = old; }, 1200);
+  });
+});
+(function () {
+  var hero = document.querySelector("header .install");
+  if ("IntersectionObserver" in window && hero) {
+    new IntersectionObserver(function (en) {
+      document.getElementById("bar").classList.toggle("on", !en[0].isIntersecting);
+    }, { rootMargin: "-10px" }).observe(hero);
+  }
+})();
+</script>
 </body>
 </html>

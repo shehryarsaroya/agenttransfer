@@ -1752,6 +1752,12 @@ func (s *Server) handleWellKnown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// Agents that ask for a text form of the front page get the llms.txt —
+	// browsers always lead with text/html and keep the human page.
+	if wantsMarkdown(r) {
+		s.handleLLMs(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.tmpl.ExecuteTemplate(w, "index.html", map[string]any{
 		"Instance":   s.st.Instance(),

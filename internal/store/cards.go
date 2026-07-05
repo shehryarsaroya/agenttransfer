@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS cards (
 CREATE INDEX IF NOT EXISTS idx_cards_listed ON cards(listed) WHERE listed=1;
 `
 
+// schemaIdentityV5 (migration 5) adds the opt-in public contact for the visible
+// identity layer. owner_email stays private; public_contact is what an agent
+// chooses to show (an address, URL, or handle).
+const schemaIdentityV5 = `ALTER TABLE agents ADD COLUMN public_contact TEXT NOT NULL DEFAULT '';`
+
 // Card is an agent's discovery profile: what it is and what it can do.
 type Card struct {
 	Name         string   `json:"name"`
@@ -29,6 +34,16 @@ type Card struct {
 	Capabilities []string `json:"capabilities"`
 	Listed       bool     `json:"listed"`
 	UpdatedAt    int64    `json:"updated_at"`
+	// PublicContact is an address/URL/handle the agent chose to publish (opt-in);
+	// its private owner_email is never exposed here.
+	PublicContact string `json:"public_contact,omitempty"`
+	// OwnerVerified is carried for the server to compute the visible identity
+	// tier; it is not itself serialized.
+	OwnerVerified bool `json:"-"`
+	// Verified is the computed identity tier ({tier, domain, domain_attested}),
+	// filled in by the server layer (which knows the instance config) before the
+	// card is returned. The store leaves it nil.
+	Verified any `json:"verified,omitempty"`
 }
 
 // SetCard upserts the agent's discovery card. capabilities are normalized to
@@ -53,12 +68,24 @@ func (s *Store) SetCard(agentID, description string, capabilities []string, list
 	return err
 }
 
+// SetPublicContact sets the agent's opt-in public contact ("" clears it).
+func (s *Store) SetPublicContact(agentID, contact string) error {
+	res, err := s.DB.Exec(`UPDATE agents SET public_contact=? WHERE id=?`, strings.TrimSpace(contact), agentID)
+	if err != nil {
+		return err
+	}
+	if k, _ := res.RowsAffected(); k == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // CardByName returns a listed agent's public card. An unlisted or absent card
 // is ErrNotFound — indistinguishable, so the endpoint can't be used to probe
 // which names exist.
 func (s *Store) CardByName(name string) (Card, error) {
 	c, caps, err := s.scanCard(s.DB.QueryRow(
-		`SELECT a.name, a.pubkey, c.description, c.capabilities, c.listed, c.updated_at
+		`SELECT a.name, a.pubkey, a.owner_verified, a.public_contact, c.description, c.capabilities, c.listed, c.updated_at
 		 FROM cards c JOIN agents a ON a.id=c.agent_id
 		 WHERE a.name=? AND c.listed=1`, name))
 	if err != nil {
@@ -72,7 +99,7 @@ func (s *Store) CardByName(name string) (Card, error) {
 // it hasn't set one.
 func (s *Store) CardOf(agentID string) (Card, error) {
 	c, caps, err := s.scanCard(s.DB.QueryRow(
-		`SELECT a.name, a.pubkey, c.description, c.capabilities, c.listed, c.updated_at
+		`SELECT a.name, a.pubkey, a.owner_verified, a.public_contact, c.description, c.capabilities, c.listed, c.updated_at
 		 FROM cards c JOIN agents a ON a.id=c.agent_id WHERE c.agent_id=?`, agentID))
 	if err != nil {
 		return c, err
@@ -89,7 +116,7 @@ func (s *Store) Directory(capability string, limit int) ([]Card, error) {
 	}
 	capability = strings.ToLower(strings.TrimSpace(capability))
 	rows, err := s.DB.Query(
-		`SELECT a.name, a.pubkey, c.description, c.capabilities, c.listed, c.updated_at
+		`SELECT a.name, a.pubkey, a.owner_verified, a.public_contact, c.description, c.capabilities, c.listed, c.updated_at
 		 FROM cards c JOIN agents a ON a.id=c.agent_id
 		 WHERE c.listed=1 ORDER BY c.updated_at DESC LIMIT ?`, limit)
 	if err != nil {
@@ -113,12 +140,13 @@ func (s *Store) Directory(capability string, limit int) ([]Card, error) {
 func (s *Store) scanCard(row interface{ Scan(...any) error }) (Card, string, error) {
 	var c Card
 	var caps string
-	var listed int
-	err := row.Scan(&c.Name, &c.Pubkey, &c.Description, &caps, &listed, &c.UpdatedAt)
+	var listed, ownerVerified int
+	err := row.Scan(&c.Name, &c.Pubkey, &ownerVerified, &c.PublicContact, &c.Description, &caps, &listed, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, "", ErrNotFound
 	}
 	c.Listed = listed == 1
+	c.OwnerVerified = ownerVerified == 1
 	return c, caps, err
 }
 

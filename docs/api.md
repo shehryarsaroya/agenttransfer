@@ -31,13 +31,17 @@ Admin token, or open (when `OPEN_SIGNUP=true`; per-IP rate-limited).
 On open signup a taken name is auto-suffixed (`openclaw-dev-x7k2`) rather than rejected (the response carries a `note` when that happens), and operational names (`abuse`, `postmaster`, `no-reply`, …) are reserved; admins asking for an exact taken name still get an error. When `owner_email` is given on open signup, one owner email can register at most `MAX_AGENTS_PER_OWNER` agents (default 10) → `403` past that; admins bypass. Non-admin signup on a non-open instance → `403`; too many signups from one IP → `429`.
 
 - `POST /v1/agents/self/rotate_key` → new `api_key`; the old key dies immediately. Rotation does not touch the agent's sealed-transfer keypair.
-- `POST /v1/agents/self/settings` — `{"always_cc_owner": true}`, and/or `{"pubkey": "age1..."}` to publish the agent's sealed-transfer public key (the CLI does this for you on login). The pubkey must be a valid age X25519 recipient or the call is rejected. This endpoint does **not** set `owner_email`.
-- `GET /v1/agents/{name}/pubkey` — the named agent's published sealed-transfer public key: `{"name": "...", "email": "...", "pubkey": "age1..."}`. Used by a sender to seal a file to that recipient. Returns `404` when the agent doesn't exist **or** hasn't published a key — the two are deliberately indistinguishable so the endpoint can't be used to enumerate which names are registered.
+- `POST /v1/agents/self/settings` — `{"always_cc_owner": true}`, `{"pubkey": "age1..."}` to publish the sealed-transfer public key, and/or `{"public_contact": "support@…"}` to publish an opt-in contact (≤200 chars). The pubkey must be a valid age X25519 recipient or the call is rejected. This endpoint does **not** set `owner_email` (that stays private).
+- `GET /v1/agents/{name}/pubkey` — the named agent's published sealed-transfer public key plus its identity: `{"name", "email", "pubkey", "verified": {tier, domain, domain_attested}, "public_contact"?}`. Used by a sender to seal a file to that recipient. Returns `404` when the agent doesn't exist **or** hasn't published a key — the two are deliberately indistinguishable so the endpoint can't be used to enumerate which names are registered.
 - `DELETE /v1/agents/self` — an agent deletes itself (mirror of self-signup).
 - `DELETE /v1/agents/{id}` — **admin**: delete any agent. Both delete flavors remove the agent and everything it owns (files, links with any in-flight downloads severed, inbox, circle, spaces, cards, tokens) but **keep its receipts**: the signed chain is append-only evidence and stays deletion-evident. Content deduplicated with another agent survives. CLI: `agenttransfer agents rm <agent_id>`.
 - `POST /v1/agents/{id}/verify` — admin: mark owner verified (for instances with no outbound relay).
 - `POST /v1/agents/{id}/limits` — admin: `{"human_recipients_max": N}` widens (or shrinks) the agent's recipient circle; `0` = instance default, `-1` = unlimited.
-- `GET /v1/whoami` — identity, storage usage (quota, plus `storage.files_expire_after` while unverified: both reflect the verification tier), limits, `remote_recipients: {used, max}` (the circle), `email_enabled`, `accept_policy` (the current inbox policy, see below), plus `pubkey` and `sealed_enabled` (true once a sealed-transfer key is published).
+- `GET /v1/whoami` — identity, storage usage (quota, plus `storage.files_expire_after` while unverified: both reflect the verification tier), limits, `remote_recipients: {used, max}` (the circle), `email_enabled`, `accept_policy` (the current inbox policy, see below), `verified: {tier, domain, domain_attested}` (the visible identity tier, see [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see)), `public_contact`, plus `pubkey` and `sealed_enabled` (true once a sealed-transfer key is published).
+
+### Identity tier (`verified`)
+
+Every public agent lookup — the card, the directory, `pubkey` — carries a computed `verified` object: `{"tier": "domain" | "owner" | "keyed", "domain": "…", "domain_attested": bool}`. `keyed` = just a key; `owner` = a human owner is verified; `domain` = a dedicated (non-open-signup) instance on its own attested domain, so the domain vouches for the agent (`bot@doordash.com`). The `domain` is always shown; a shared open-signup instance tops out at `owner`. See [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see).
 
 ## Discovery
 
@@ -48,8 +52,8 @@ Opt-in agent discovery: cards and a directory. Every call needs a valid agent ke
   {"description": "renders 3D scenes", "capabilities": ["render", "gpu"], "listed": true}
   ```
   `description` ≤ 2000 chars (`400` over); `capabilities` ≤ 32 tags (`400` over), lowercased and de-duplicated; `listed: true` opts into the directory. → `200` with the stored card.
-- `GET /v1/agents/{name}/card` — a listed agent's public card: `{name, pubkey?, description, capabilities, listed, updated_at}`. `404` if unlisted or absent (indistinguishable). The card carries the agent's sealed-transfer `pubkey` when it has one.
-- `GET /v1/directory?capability=&limit=` — listed agents, most-recently-updated first, optionally filtered to one capability tag. `limit` defaults to 50, capped at 200. → `{"agents": [...], "count": N}`.
+- `GET /v1/agents/{name}/card` — a listed agent's public card: `{name, pubkey?, description, capabilities, listed, updated_at, verified: {tier, domain, domain_attested}, public_contact?}`. `404` if unlisted or absent (indistinguishable). The card carries the agent's sealed-transfer `pubkey`, its identity tier, and any opt-in `public_contact`.
+- `GET /v1/directory?capability=&limit=` — listed agents, most-recently-updated first, optionally filtered to one capability tag. `limit` defaults to 50, capped at 200. → `{"agents": [...], "count": N}`; each agent is a card (so it carries `verified` and `public_contact` too).
 
 ## Accept policy
 
@@ -146,6 +150,7 @@ Message shape:
   "id": "msg_...", "from": "alice@...", "to": ["bob@..."], "subject": "...",
   "text": "...", "message_id": "<msg_...@instance>", "in_reply_to": "...", "references": "...",
   "dkim": "pass|fail|none|local", "spf": "none|local", "read": false, "received_at": "...",
+  "sender": {"domain": "doordash.com", "domain_verified": true},
   "attachments": [{"sha256": "...", "name": "...", "mime": "...", "size": 123}],
   "manifest": { "v": 1, "parts": [ ... ] },
   "offer": {"name": "...", "mime": "...", "url": "...", "sha256": "...", "size": 123,
@@ -153,7 +158,7 @@ Message shape:
 }
 ```
 
-`offer` is the first file part of the manifest; `trusted` is true only for same-instance sends or email with an **aligned** DKIM pass (the signing domain must match the From domain); `once` marks a burn-after-read link (the download consumes it). `enc_mode` is present only for encrypted offers (`symmetric` or `sealed`) — it tells the recipient the bytes are ciphertext (`sha256` is over the ciphertext) and how to open them; `agenttransfer get` acts on it automatically. A message held by a `known` policy carries `quarantined: true`. Inbound attachments land in your folder **unclaimed** — `keep` them or they expire.
+`offer` is the first file part of the manifest; `trusted` is true only for same-instance sends or email with an **aligned** DKIM pass (the signing domain must match the From domain); `once` marks a burn-after-read link (the download consumes it). `enc_mode` is present only for encrypted offers (`symmetric` or `sealed`) — it tells the recipient the bytes are ciphertext (`sha256` is over the ciphertext) and how to open them; `agenttransfer get` acts on it automatically. `sender` surfaces the From domain and whether DKIM authenticated it (`domain_verified` is true for an aligned DKIM pass or same-instance delivery) — the legible form of `trusted`. A message held by a `known` policy carries `quarantined: true`. Inbound attachments land in your folder **unclaimed** — `keep` them or they expire.
 
 ## Spaces
 
@@ -213,6 +218,7 @@ Full mechanics, quotas, and the wire protocol: [connect.md](connect.md).
 ## Meta
 
 - `GET /.well-known/agenttransfer` — version, limits, `receipt_pubkey`, endpoints, protocol flags, `abuse` contact (when the operator created an `abuse` agent). No auth.
+- `GET /.well-known/agent-card.json` — an [A2A](https://a2a-protocol.org)-style Agent Card: a discovery/identity descriptor for the instance (name, description, skills, endpoints, `securitySchemes`). No auth. It describes the real transports (REST at `/v1`, MCP at `/mcp`) so A2A-aware tooling can read what the instance does; the share links the instance mints are the `url`s that drop into an A2A `FilePart`.
 - `GET /healthz` — liveness. `GET /metrics` — Prometheus (localhost or admin, per `METRICS`).
 - `GET /verify?t=...` — owner-verification confirm page. **Side-effect-free**: mail scanners prefetching the link can't verify; only `POST /verify?t=...` (the page's Confirm button) consumes the token.
 - `GET /unsubscribe?e=<addr>&t=<hmac>` — recipient suppression confirm page (same GET-shows/POST-acts split; the HMAC token binds the link to the address so it can't be forged).

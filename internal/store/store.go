@@ -58,6 +58,9 @@ type Agent struct {
 	// "open" (all), "known" (allowlisted or a space co-member; others quarantine),
 	// "closed" (known only; others rejected).
 	AcceptPolicy string `json:"accept_policy,omitempty"`
+	// PublicContact is an address/URL/handle the agent opted to publish. Its
+	// private owner_email is never exposed; this is the selectively-disclosed one.
+	PublicContact string `json:"public_contact,omitempty"`
 	// HumanRecipientsMax overrides the instance-wide cap on unique remote
 	// recipients for this agent: 0 = instance default, <0 = unlimited.
 	HumanRecipientsMax int64 `json:"-"`
@@ -395,9 +398,10 @@ CREATE TABLE IF NOT EXISTS counters (
 // Append new migrations — never edit a shipped one. Index i is "version i+1".
 var migrations = []string{
 	schemaBase + schemaConnect + schemaWebhooks, // v1
-	schemaCards,  // v2: opt-in discovery cards + directory
-	schemaSpaces, // v3: spaces
-	schemaPolicy, // v4: recipient accept policy + quarantine
+	schemaCards,      // v2: opt-in discovery cards + directory
+	schemaSpaces,     // v3: spaces
+	schemaPolicy,     // v4: recipient accept policy + quarantine
+	schemaIdentityV5, // v5: opt-in public_contact for the visible identity layer
 }
 
 // migrate brings db up to len(migrations) via PRAGMA user_version.
@@ -518,7 +522,7 @@ func validAgentName(name string) bool {
 func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	var a Agent
 	var ver, cc int
-	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -527,7 +531,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	return a, err
 }
 
-const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,created_at`
+const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,created_at`
 
 // AgentByKey resolves an API key to its agent.
 func (s *Store) AgentByKey(key string) (Agent, error) {

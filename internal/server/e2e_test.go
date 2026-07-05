@@ -663,6 +663,67 @@ func TestSendRejectsBadRecipient(t *testing.T) {
 	}
 }
 
+// Visible identity: the computed tier + selectively-disclosed public_contact show
+// up on whoami / card / pubkey, and the A2A Agent Card is served and well-formed.
+func TestVisibleIdentityAndAgentCard(t *testing.T) {
+	e := newEnv(t) // no DOMAIN → not domain-attested; createAgent is admin → owner-verified
+	_, aliceKey := e.createAgent("alice")
+
+	var who struct {
+		Verified struct {
+			Tier           string `json:"tier"`
+			Domain         string `json:"domain"`
+			DomainAttested bool   `json:"domain_attested"`
+		} `json:"verified"`
+		PublicContact string `json:"public_contact"`
+	}
+	if code := e.doJSON("GET", "/v1/whoami", aliceKey, nil, &who); code != 200 {
+		t.Fatalf("whoami: %d", code)
+	}
+	if who.Verified.Tier != "owner" || who.Verified.DomainAttested {
+		t.Fatalf("tier=%q domain_attested=%v, want owner/false", who.Verified.Tier, who.Verified.DomainAttested)
+	}
+
+	// public_contact round-trips (selective disclosure); owner_email never appears.
+	e.doJSON("POST", "/v1/agents/self/settings", aliceKey, map[string]any{"public_contact": "support@alice.example"}, nil)
+	if code := e.doJSON("GET", "/v1/whoami", aliceKey, nil, &who); code != 200 || who.PublicContact != "support@alice.example" {
+		t.Fatalf("public_contact: %d %q", code, who.PublicContact)
+	}
+
+	// A listed card carries the verified tier + public_contact.
+	var card store.Card
+	e.doJSON("PUT", "/v1/agents/self/card", aliceKey, map[string]any{"description": "renders scenes", "listed": true}, &card)
+	if card.Verified == nil || card.PublicContact != "support@alice.example" {
+		t.Fatalf("card missing verified/contact: %+v", card)
+	}
+
+	// The pubkey lookup exposes the tier too (once a key is published).
+	_, bobKey := e.createAgent("bob")
+	e.doJSON("POST", "/v1/agents/self/settings", aliceKey, map[string]any{"pubkey": testRecipient(t)}, nil)
+	var pk struct {
+		Verified struct {
+			Tier string `json:"tier"`
+		} `json:"verified"`
+	}
+	if code := e.doJSON("GET", "/v1/agents/alice/pubkey", bobKey, nil, &pk); code != 200 || pk.Verified.Tier != "owner" {
+		t.Fatalf("pubkey verified: %d %q", code, pk.Verified.Tier)
+	}
+
+	// The A2A Agent Card is public and well-formed.
+	var ac struct {
+		Name            string           `json:"name"`
+		ProtocolVersion string           `json:"protocolVersion"`
+		Skills          []map[string]any `json:"skills"`
+		SecuritySchemes map[string]any   `json:"securitySchemes"`
+	}
+	if code := e.doJSON("GET", "/.well-known/agent-card.json", "", nil, &ac); code != 200 {
+		t.Fatalf("agent-card: %d", code)
+	}
+	if ac.Name != "agenttransfer" || ac.ProtocolVersion == "" || len(ac.Skills) == 0 || ac.SecuritySchemes["bearer"] == nil {
+		t.Fatalf("agent-card malformed: %+v", ac)
+	}
+}
+
 func TestMCPToolFlow(t *testing.T) {
 	e := newEnv(t)
 	_, key := e.createAgent("alice")

@@ -252,6 +252,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Meta.
 	mux.HandleFunc("GET /.well-known/agenttransfer", s.handleWellKnown)
+	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard) // A2A-style discovery descriptor
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))

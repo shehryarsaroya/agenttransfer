@@ -487,10 +487,23 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, agent st
 	var req struct {
 		AlwaysCCOwner *bool   `json:"always_cc_owner"`
 		Pubkey        *string `json:"pubkey"`
+		PublicContact *string `json:"public_contact"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "%v", err)
 		return
+	}
+	if req.PublicContact != nil {
+		pc := strings.TrimSpace(*req.PublicContact)
+		if len(pc) > 200 {
+			errJSON(w, http.StatusBadRequest, "public_contact too long (max 200 chars)")
+			return
+		}
+		if err := s.st.SetPublicContact(agent.ID, pc); err != nil {
+			errJSON(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		agent.PublicContact = pc
 	}
 	if req.AlwaysCCOwner != nil {
 		if err := s.st.SetAlwaysCC(agent.ID, *req.AlwaysCCOwner); err != nil {
@@ -528,7 +541,11 @@ func (s *Server) handlePubkey(w http.ResponseWriter, r *http.Request, _ store.Ag
 		errJSON(w, http.StatusNotFound, "no published sealed-transfer key for %q", name)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": a.Name, "email": a.Email, "pubkey": a.Pubkey})
+	out := map[string]any{"name": a.Name, "email": a.Email, "pubkey": a.Pubkey, "verified": s.identityFor(a.OwnerVerified)}
+	if a.PublicContact != "" {
+		out["public_contact"] = a.PublicContact
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleSetCard (PUT /v1/agents/self/card) sets the agent's discovery profile.
@@ -560,6 +577,7 @@ func (s *Server) handleSetCard(w http.ResponseWriter, r *http.Request, agent sto
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
+	c.Verified = s.identityFor(c.OwnerVerified)
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -573,6 +591,7 @@ func (s *Server) handleGetCard(w http.ResponseWriter, r *http.Request, _ store.A
 		errJSON(w, http.StatusNotFound, "no public card for %q", name)
 		return
 	}
+	c.Verified = s.identityFor(c.OwnerVerified)
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -587,6 +606,9 @@ func (s *Server) handleDirectory(w http.ResponseWriter, r *http.Request, _ store
 	}
 	if cards == nil {
 		cards = []store.Card{}
+	}
+	for i := range cards {
+		cards[i].Verified = s.identityFor(cards[i].OwnerVerified)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": cards, "count": len(cards)})
 }
@@ -662,6 +684,8 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent stor
 		"pubkey":         agent.Pubkey,
 		"sealed_enabled": agent.Pubkey != "",
 		"accept_policy":  policyOr(agent.AcceptPolicy),
+		"verified":       s.identityFor(agent.OwnerVerified),
+		"public_contact": agent.PublicContact,
 		"storage":        storage,
 		"limits": map[string]any{
 			"max_file_size": s.cfg.MaxFileSize,
@@ -1481,6 +1505,7 @@ func (s *Server) messageJSON(m store.Message) map[string]any {
 		"attachments": m.Attachments,
 		"received_at": time.Unix(m.ReceivedAt, 0).UTC().Format(time.RFC3339),
 	}
+	out["sender"] = senderIdentity(m.DKIM, m.From)
 	if m.Quarantined {
 		out["quarantined"] = true
 	}

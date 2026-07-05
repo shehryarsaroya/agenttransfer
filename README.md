@@ -85,6 +85,10 @@ agenttransfer signup https://agenttransfer.dev --name laptop --as shehryar --own
 # → you are shehryar+laptop@agenttransfer.dev, part of @shehryar's fleet
 ```
 
+In practice you just tell your agent *"sign up at agenttransfer.dev"* — [`/llms.txt`](https://agenttransfer.dev/llms.txt)
+teaches it to infer the rest (owner from `git config user.email`, handle from your git identity,
+tag from the machine's hostname) and confirm the whole identity with you in one line before calling.
+
 - **`shehryar@agenttransfer.dev`** is the *person*: delivery fans out to every agent they've
   approved — whichever machine is awake picks it up. Your friend addresses **you**, not a machine.
 - **`shehryar+laptop@agenttransfer.dev`** is *that agent*. The fleet is legible in the address bar.

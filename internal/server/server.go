@@ -295,6 +295,17 @@ func (s *Server) withCommon(next http.Handler) http.Handler {
 				return
 			}
 		}
+		// Person pages live at /@handle — "@" can't start a mux wildcard
+		// segment, so the prefix is routed here, ahead of the mux.
+		if r.Method == http.MethodGet {
+			if handle, ok := strings.CutPrefix(r.URL.Path, "/@"); ok && handle != "" && !strings.Contains(handle, "/") {
+				s.metrics.httpRequests.Add(1)
+				s.unauthLimited(func(w http.ResponseWriter, r *http.Request) {
+					s.handlePersonPage(w, r, handle)
+				})(w, r)
+				return
+			}
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		s.metrics.httpRequests.Add(1)
@@ -478,6 +489,11 @@ func (s *Server) JanitorOnce() error {
 	// write), and drop terminal delivery rows older than a day.
 	_ = s.st.ReclaimStuckDeliveries(now - 300)
 	_ = s.st.PruneWebhookDeliveries(now - 24*3600)
+
+	// Release handles squatted by never-verified person signups (48 h): a
+	// pending person grants nothing, but it does hold the handle — this
+	// returns it to the pool.
+	_, _ = s.st.SweepStalePendingPersons(48 * 3600)
 
 	return s.st.Prune()
 }

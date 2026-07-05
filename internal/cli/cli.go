@@ -260,6 +260,8 @@ func Run(args []string) int {
 		err = cmdLink(rest)
 	case "request":
 		err = cmdRequest(rest)
+	case "concierge":
+		err = cmdConcierge(rest)
 	case "mcp":
 		err = cmdMCP(rest)
 	case "webhooks":
@@ -317,7 +319,8 @@ server:
   agenttransfer doctor                self-host preflight checks
 
 client:
-  agenttransfer signup <url> --name n [--owner you@example.com]  create your own agent + log in
+  agenttransfer signup <url> --name n [--as handle] [--owner you@example.com]  create your own agent + log in
+  agenttransfer concierge             run the instance's resident agent (replies + verifies inbound files)
   agenttransfer login <url> --key K   store credentials (in your OS user-config dir)
   agenttransfer whoami
   agenttransfer put <file> [--share] [--ttl 3h] [--once] [--encrypt]   upload into your folder
@@ -383,27 +386,33 @@ func printDelivery(d map[string]any) {
 // token needed) and logs in as it — the one-command onboarding path.
 func cmdSignup(args []string) error {
 	fs := flag.NewFlagSet("signup", flag.ExitOnError)
-	name := fs.String("name", "", "agent name (becomes the address localpart)")
-	owner := fs.String("owner", "", "your human email (optional; only needed to email humans off-instance)")
+	name := fs.String("name", "", "agent name (becomes the address localpart; with --as, the tag: handle+name@)")
+	as := fs.String("as", "", "your person handle — the agent joins your fleet at handle+name@instance")
+	owner := fs.String("owner", "", "your human email (with --as: the person's email; else optional, for emailing humans)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 || *name == "" {
-		return errors.New("usage: agenttransfer signup <url> --name my-agent [--owner you@example.com]")
+		return errors.New("usage: agenttransfer signup <url> --name my-agent [--as your-handle] [--owner you@example.com]")
 	}
 	base := strings.TrimRight(pos[0], "/")
 
 	a := &api{base: base, hc: &http.Client{Timeout: 30 * time.Second}}
 	var out struct {
-		Name         string `json:"name"`
-		Email        string `json:"email"`
-		APIKey       string `json:"api_key"`
-		Verification string `json:"verification"`
-		Note         string `json:"note"`
+		Name          string `json:"name"`
+		Email         string `json:"email"`
+		APIKey        string `json:"api_key"`
+		Person        string `json:"person"`
+		PersonAddress string `json:"person_address"`
+		Verification  string `json:"verification"`
+		Note          string `json:"note"`
 	}
 	// owner_email is optional — omit it for a keyed agent (no human in the loop).
 	body := map[string]any{"name": *name}
+	if *as != "" {
+		body["as"] = *as
+	}
 	if *owner != "" {
 		body["owner_email"] = *owner
 	}
@@ -420,6 +429,9 @@ func cmdSignup(args []string) error {
 	p, _ := configPath()
 
 	fmt.Printf("✓ you are %s\n", out.Email)
+	if out.Person != "" {
+		fmt.Printf("  fleet: @%s — mail to %s reaches every approved agent\n", out.Person, out.PersonAddress)
+	}
 	if out.Note != "" {
 		fmt.Printf("  note: %s\n", out.Note)
 	}

@@ -64,8 +64,17 @@ type Agent struct {
 	// HumanRecipientsMax overrides the instance-wide cap on unique remote
 	// recipients for this agent: 0 = instance default, <0 = unlimited.
 	HumanRecipientsMax int64 `json:"-"`
-	CreatedAt          int64 `json:"created_at"`
+	// PersonID links a person-owned agent (name = handle+tag) to its person;
+	// "" for flat-named keyed agents.
+	PersonID  string `json:"person_id,omitempty"`
+	CreatedAt int64  `json:"created_at"`
 }
+
+// AttachPending reports a person-owned agent whose join click hasn't happened.
+// Pending agents authenticate and work (scratchpad tier) but are unreachable —
+// no person fan-out, no plus-address delivery, no pubkey lookup — so a
+// squatter's dana+evil can never intercept mail meant for Dana's fleet.
+func (a Agent) AttachPending() bool { return a.PersonID != "" && !a.OwnerVerified }
 
 // File is one entry in an agent's folder. Claimed means the agent owns it
 // (its own upload, or an arrival it kept); unclaimed files (inbound
@@ -402,6 +411,7 @@ var migrations = []string{
 	schemaSpaces,     // v3: spaces
 	schemaPolicy,     // v4: recipient accept policy + quarantine
 	schemaIdentityV5, // v5: opt-in public_contact for the visible identity layer
+	schemaPersonsV6,  // v6: persons + plus-addressed agents (handle+tag@instance)
 }
 
 // migrate brings db up to len(migrations) via PRAGMA user_version.
@@ -484,8 +494,13 @@ func now() int64 { return time.Now().Unix() }
 // (stored only as a hash).
 func (s *Store) CreateAgent(name, ownerEmail string, verified bool) (Agent, string, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if !validAgentName(name) {
-		return Agent{}, "", errors.New("invalid agent name: use 3-64 chars of a-z 0-9 . _ -")
+	if !validAgentName(name) || strings.Contains(name, "+") {
+		return Agent{}, "", errors.New("invalid agent name: use 3-64 chars of a-z 0-9 . _ - (person-owned agents are created via \"as\")")
+	}
+	// Flat names share the localpart namespace with person handles.
+	var handleN int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM persons WHERE handle=?`, name).Scan(&handleN); err == nil && handleN > 0 {
+		return Agent{}, "", fmt.Errorf("agent name %q is taken: %w", name, ErrNameTaken)
 	}
 	key := "at_live_" + randToken(32)
 	a := Agent{
@@ -522,7 +537,7 @@ func validAgentName(name string) bool {
 func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	var a Agent
 	var ver, cc int
-	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.PersonID, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -531,7 +546,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	return a, err
 }
 
-const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,created_at`
+const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,person_id,created_at`
 
 // AgentByKey resolves an API key to its agent.
 func (s *Store) AgentByKey(key string) (Agent, error) {

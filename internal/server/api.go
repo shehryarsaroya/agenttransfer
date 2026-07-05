@@ -172,6 +172,7 @@ var reservedNames = map[string]bool{
 	"mailer-daemon": true, "no-reply": true, "noreply": true, "postmaster": true,
 	"root": true, "security": true, "self": true, "support": true,
 	"system": true, "upload-request": true, "webmaster": true, "www": true,
+	"concierge": true, // the instance's resident agent (operator-created)
 }
 
 // suffixedName appends a short random tag so open signups never fail on a
@@ -191,6 +192,7 @@ func suffixedName(base string) string {
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name       string `json:"name"`
+		As         string `json:"as"` // person handle: create-or-join, name becomes the tag (handle+name@instance)
 		OwnerEmail string `json:"owner_email"`
 		Pubkey     string `json:"pubkey"`
 	}
@@ -211,11 +213,17 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requested := strings.ToLower(strings.TrimSpace(req.Name))
+	if !isAdmin && !s.signupLimiter.allow(s.clientIP(r)) {
+		errJSON(w, http.StatusTooManyRequests, "signup rate limit: try again later")
+		return
+	}
+	// Person-owned signup ("as") is its own flow: create-or-join the person,
+	// the agent lives at handle+name@instance, approval rides the email click.
+	if strings.TrimSpace(req.As) != "" {
+		s.createPersonAgent(w, r, req.Name, req.As, strings.TrimSpace(req.OwnerEmail), req.Pubkey, isAdmin)
+		return
+	}
 	if !isAdmin {
-		if !s.signupLimiter.allow(s.clientIP(r)) {
-			errJSON(w, http.StatusTooManyRequests, "signup rate limit: try again later")
-			return
-		}
 		if reservedNames[requested] {
 			errJSON(w, http.StatusBadRequest, "the name %q is reserved on this instance", requested)
 			return
@@ -300,13 +308,15 @@ func (s *Server) sendVerificationEmail(agent store.Agent) error {
 	link := s.BaseURL() + "/verify?t=" + tok
 	instance := s.st.Instance()
 	m := &afmail.Message{
-		FromName: "AgentTransfer",
-		From:     "no-reply@" + instance,
+		FromName: agent.Name,
+		From:     agent.Email,
 		To:       []string{agent.OwnerEmail},
-		Subject:  "Verify your agent " + agent.Email,
-		Text: fmt.Sprintf("An agent named %q was created with you as its owner.\n\n"+
-			"Verify to enable outbound email for it:\n\n  %s\n\n"+
-			"If this wasn't you, ignore this message.\n", agent.Name, link),
+		Subject:  fmt.Sprintf("I'm set up at %s — one click to vouch for me", agent.Email),
+		Text: fmt.Sprintf("Hi — I'm your new agent.\n\n"+
+			"    me: %s\n\n"+
+			"Vouch for me with one click, and I can send outbound email (you're\n"+
+			"exempt from my recipient cap, and you can have me CC you on everything):\n\n  %s\n\n"+
+			"If this wasn't you, ignore this message.\n", agent.Email, link),
 		MessageID: afmail.FormatRFCMessageID(store.NewID("msg"), instance),
 	}
 	raw, err := m.Build()
@@ -364,8 +374,17 @@ func (s *Server) handleVerifyOwnerConfirm(w http.ResponseWriter, r *http.Request
 		return
 	}
 	agent, _ := s.st.AgentByID(agentID)
+	// Approving a person-owned agent also verifies the person (idempotent):
+	// the first click activates the handle along with the first agent.
+	var handle string
+	if agent.PersonID != "" {
+		_ = s.st.MarkPersonVerified(agent.PersonID)
+		if p, err := s.st.PersonByID(agent.PersonID); err == nil {
+			handle = p.Handle
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = s.tmpl.ExecuteTemplate(w, "verified.html", map[string]any{"Agent": agent.Email})
+	_ = s.tmpl.ExecuteTemplate(w, "verified.html", map[string]any{"Agent": agent.Email, "Handle": handle})
 }
 
 func (s *Server) handleAdminVerify(w http.ResponseWriter, r *http.Request) {
@@ -377,6 +396,11 @@ func (s *Server) handleAdminVerify(w http.ResponseWriter, r *http.Request) {
 	if err := s.st.MarkOwnerVerified(id); err != nil {
 		errJSON(w, http.StatusNotFound, "no such agent")
 		return
+	}
+	// Operator approval carries the same weight as the owner's click: a
+	// person-owned agent's approval also verifies the person.
+	if a, err := s.st.AgentByID(id); err == nil && a.PersonID != "" {
+		_ = s.st.MarkPersonVerified(a.PersonID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "owner_verified": true})
 }
@@ -536,8 +560,10 @@ func (s *Server) handlePubkey(w http.ResponseWriter, r *http.Request, _ store.Ag
 	name := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
 	a, err := s.st.AgentByName(name)
 	// One 404 for both "no such agent" and "no key published" so an
-	// authenticated caller can't enumerate which names exist.
-	if err != nil || a.Pubkey == "" {
+	// authenticated caller can't enumerate which names exist. Attach-pending
+	// person-agents are equally invisible — sealing to a squatter's
+	// handle+tag must be impossible.
+	if err != nil || a.Pubkey == "" || a.AttachPending() {
 		errJSON(w, http.StatusNotFound, "no published sealed-transfer key for %q", name)
 		return
 	}
@@ -674,7 +700,7 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent stor
 		// The unverified tier: files are mortal until the owner verifies.
 		storage["files_expire_after"] = s.cfg.UnverifiedFileTTL.String()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	who := map[string]any{
 		"agent_id":       agent.ID,
 		"name":           agent.Name,
 		"email":          agent.Email,
@@ -700,7 +726,17 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent stor
 			"max":  s.humanCircleMax(agent),
 		},
 		"email_enabled": s.emailCapable(),
-	})
+	}
+	if agent.PersonID != "" {
+		if p, err := s.st.PersonByID(agent.PersonID); err == nil {
+			who["person"] = p.Handle
+			who["person_address"] = p.Handle + "@" + s.st.Instance()
+			if agent.AttachPending() {
+				who["person_status"] = "pending owner approval"
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, who)
 }
 
 // ---- folder ----
@@ -1147,11 +1183,22 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 		seen[addr] = true
 		localpart, domain, ok := strings.Cut(addr, "@")
 		if ok && domain == instance {
-			la, err := s.st.AgentByName(localpart)
-			if err != nil {
+			resolved := s.resolveLocalRecipient(localpart)
+			if len(resolved) == 0 {
 				return nil, http.StatusBadRequest, fmt.Errorf("no agent %q on this instance", addr)
 			}
-			localAgents = append(localAgents, la)
+			for _, la := range resolved {
+				dup := false
+				for _, have := range localAgents {
+					if have.ID == la.ID {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					localAgents = append(localAgents, la)
+				}
+			}
 			continue
 		}
 		// Anything else is treated as a remote email recipient — so it must be a

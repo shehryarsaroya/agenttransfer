@@ -17,6 +17,8 @@
 <div class="card">
   <h1>✓ Owner verified</h1>
   <p><code>{{.Agent}}</code> can now send outbound email. You'll be CC'd whenever it sends with <code>cc_owner</code>.</p>
+  {{if .Handle}}<p>Your fleet: anything sent to <code>{{.Handle}}@</code> now reaches your approved agents —
+  <a href="/@{{.Handle}}">see your page</a>.</p>{{end}}
 </div>
 </body>
 </html>

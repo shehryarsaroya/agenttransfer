@@ -96,20 +96,26 @@ func (ss *smtpSession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 	if domain != ss.s.cfg.Domain {
 		return &gosmtp.SMTPError{Code: 550, EnhancedCode: gosmtp.EnhancedCode{5, 1, 1}, Message: "relay not permitted"}
 	}
-	// Accept plus-addressing: name+tag@domain routes to name@domain.
-	localpart, _, _ = strings.Cut(localpart, "+")
-	agent, err := ss.s.st.AgentByName(localpart)
-	if err != nil {
+	// Plus-aware resolution: handle+tag@ is an agent's own name; a bare
+	// handle@ (or an unknown tag) fans out to the person's approved agents.
+	resolved := ss.s.resolveLocalRecipient(localpart)
+	if len(resolved) == 0 {
 		return &gosmtp.SMTPError{Code: 550, EnhancedCode: gosmtp.EnhancedCode{5, 1, 1}, Message: "no such agent"}
 	}
-	// Repeated RCPTs for the same agent (verbatim duplicates, or plus-tag
-	// variants of one address) must not multiply inbox copies.
-	for _, a := range ss.agents {
-		if a.ID == agent.ID {
-			return nil
+	// Repeated RCPTs for the same agent (verbatim duplicates, plus-tag
+	// variants, person fan-out overlap) must not multiply inbox copies.
+	for _, agent := range resolved {
+		dup := false
+		for _, a := range ss.agents {
+			if a.ID == agent.ID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			ss.agents = append(ss.agents, agent)
 		}
 	}
-	ss.agents = append(ss.agents, agent)
 	return nil
 }
 

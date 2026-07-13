@@ -35,6 +35,10 @@ var ErrNotFound = errors.New("not found")
 // or the max file size.
 var ErrQuota = errors.New("storage quota exceeded")
 
+// ErrDiskReserve is returned when continuing a blob stream would cross the
+// operator's free-space floor.
+var ErrDiskReserve = errors.New("disk reserve reached")
+
 // ErrCircleFull is returned when a send would add more unique remote
 // recipients than the agent's circle allows.
 var ErrCircleFull = errors.New("recipient circle full")
@@ -44,12 +48,14 @@ var ErrNameTaken = errors.New("name taken")
 
 // Agent is one identity: an email address plus an API key.
 type Agent struct {
-	ID            string `json:"agent_id"`
-	Name          string `json:"name"`
-	Email         string `json:"email"`
-	OwnerEmail    string `json:"owner_email,omitempty"`
-	OwnerVerified bool   `json:"owner_verified"`
-	AlwaysCCOwner bool   `json:"always_cc_owner"`
+	ID                      string `json:"agent_id"`
+	Name                    string `json:"name"`
+	Email                   string `json:"email"`
+	OwnerEmail              string `json:"owner_email,omitempty"`
+	OwnerVerified           bool   `json:"owner_verified"`
+	OwnerVerifiedAt         int64  `json:"owner_verified_at,omitempty"`
+	OwnerVerificationMethod string `json:"owner_verification_method,omitempty"`
+	AlwaysCCOwner           bool   `json:"always_cc_owner"`
 	// Pubkey is the agent's published X25519 recipient ("age1...") for sealed
 	// transfers, or "" if it hasn't set one. Senders fetch it to encrypt so
 	// only this agent can decrypt; the private half never reaches the server.
@@ -75,6 +81,20 @@ type Agent struct {
 // no person fan-out, no plus-address delivery, no pubkey lookup — so a
 // squatter's dana+evil can never intercept mail meant for Dana's fleet.
 func (a Agent) AttachPending() bool { return a.PersonID != "" && !a.OwnerVerified }
+
+// HumanVerified reports whether a human mailbox, rather than merely the
+// instance operator, vouched for this agent. Hosting uses this stronger gate:
+// an admin-created ownerless agent may be trusted by the operator, but it has
+// not proved control of a human email address.
+func (a Agent) HumanVerified() bool {
+	if strings.TrimSpace(a.OwnerEmail) == "" || !a.OwnerVerified {
+		return false
+	}
+	// Historical rows cannot distinguish an old admin approval from a real
+	// mailbox click. They retain the legacy mail/storage tier, but hosting is
+	// fail-closed until a fresh email challenge records "email".
+	return a.OwnerVerificationMethod == "email"
+}
 
 // File is one entry in an agent's folder. Claimed means the agent owns it
 // (its own upload, or an arrival it kept); unclaimed files (inbound
@@ -407,11 +427,15 @@ CREATE TABLE IF NOT EXISTS counters (
 // Append new migrations — never edit a shipped one. Index i is "version i+1".
 var migrations = []string{
 	schemaBase + schemaConnect + schemaWebhooks, // v1
-	schemaCards,      // v2: opt-in discovery cards + directory
-	schemaSpaces,     // v3: spaces
-	schemaPolicy,     // v4: recipient accept policy + quarantine
-	schemaIdentityV5, // v5: opt-in public_contact for the visible identity layer
-	schemaPersonsV6,  // v6: persons + plus-addressed agents (handle+tag@instance)
+	schemaCards,                 // v2: opt-in discovery cards + directory
+	schemaSpaces,                // v3: spaces
+	schemaPolicy,                // v4: recipient accept policy + quarantine
+	schemaIdentityV5,            // v5: opt-in public_contact for the visible identity layer
+	schemaPersonsV6,             // v6: persons + plus-addressed agents (handle+tag@instance)
+	schemaOwnerVerificationV7,   // v7: verification provenance (human email vs operator)
+	schemaAppsV8,                // v8: per-agent app identity + immutable deployments
+	schemaAppContainerHistoryV9, // v9: retain runner-data history across metadata reset
+	schemaVerifyTokenOwnerV10,   // v10: bind owner challenges to the nominated mailbox
 }
 
 // migrate brings db up to len(migrations) via PRAGMA user_version.
@@ -511,8 +535,14 @@ func (s *Store) CreateAgent(name, ownerEmail string, verified bool) (Agent, stri
 		OwnerVerified: verified,
 		CreatedAt:     now(),
 	}
-	_, err := s.DB.Exec(`INSERT INTO agents(id,name,email,key_hash,owner_email,owner_verified,created_at) VALUES(?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.Email, hashToken(key), a.OwnerEmail, boolInt(a.OwnerVerified), a.CreatedAt)
+	if verified {
+		a.OwnerVerifiedAt = a.CreatedAt
+		a.OwnerVerificationMethod = "operator"
+	}
+	_, err := s.DB.Exec(`INSERT INTO agents(id,name,email,key_hash,owner_email,owner_verified,
+		owner_verified_at,owner_verification_method,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Email, hashToken(key), a.OwnerEmail, boolInt(a.OwnerVerified),
+		a.OwnerVerifiedAt, a.OwnerVerificationMethod, a.CreatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return Agent{}, "", fmt.Errorf("agent name %q is taken: %w", name, ErrNameTaken)
@@ -537,7 +567,9 @@ func validAgentName(name string) bool {
 func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	var a Agent
 	var ver, cc int
-	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver, &cc, &a.HumanRecipientsMax, &a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.PersonID, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver,
+		&a.OwnerVerifiedAt, &a.OwnerVerificationMethod, &cc, &a.HumanRecipientsMax,
+		&a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.PersonID, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -546,7 +578,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	return a, err
 }
 
-const agentCols = `id,name,email,owner_email,owner_verified,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,person_id,created_at`
+const agentCols = `id,name,email,owner_email,owner_verified,owner_verified_at,owner_verification_method,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,person_id,created_at`
 
 // AgentByKey resolves an API key to its agent.
 func (s *Store) AgentByKey(key string) (Agent, error) {
@@ -586,19 +618,75 @@ func (s *Store) RotateKey(agentID string) (string, error) {
 	return key, nil
 }
 
-// MarkOwnerVerified flips owner verification on and lifts the unverified
-// storage tier: the agent's claimed files stop expiring. (Unclaimed arrivals
-// stay mortal until kept — that guard is about strangers, not the owner.)
-func (s *Store) MarkOwnerVerified(agentID string) error {
-	if _, err := s.DB.Exec(`UPDATE agents SET owner_verified=1 WHERE id=?`, agentID); err != nil {
+// SetOwnerPending sets (or replaces) the candidate owner mailbox and clears
+// all verification provenance. Existing files are left alone; a verification
+// transition may grant persistence, but starting a new challenge must not
+// destructively shorten already-earned retention.
+func (s *Store) SetOwnerPending(agentID, email string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return errors.New("owner email is required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := s.DB.Exec(`UPDATE files SET expires_at=0 WHERE agent_id=? AND claimed=1`, agentID)
-	return err
+	defer tx.Rollback()
+	// A challenge authenticates the mailbox that existed when it was minted.
+	// Replacing that mailbox must invalidate every older challenge atomically,
+	// or an old link could verify the newly supplied address.
+	if _, err := tx.Exec(`DELETE FROM verify_tokens WHERE agent_id=?`, agentID); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`UPDATE agents SET owner_email=?, owner_verified=0,
+		owner_verified_at=0, owner_verification_method='' WHERE id=?`, email, agentID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+// MarkOwnerVerifiedBy records how ownership was established and lifts the
+// unverified storage tier in the same transaction. "email" means a mailbox
+// challenge completed; "operator" is an administrative assertion and does
+// not satisfy Agent.HumanVerified; "legacy" exists only for migration/backfill
+// and also requires a fresh email challenge before hosting.
+func (s *Store) MarkOwnerVerifiedBy(agentID, method string) error {
+	switch method {
+	case "email", "operator", "legacy":
+	default:
+		return fmt.Errorf("unknown owner verification method %q", method)
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE agents SET owner_verified=1,
+		owner_verified_at=?, owner_verification_method=? WHERE id=?`, now(), method, agentID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(`UPDATE files SET expires_at=0 WHERE agent_id=? AND claimed=1`, agentID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkOwnerVerified is the compatibility/admin path. Callers handling a
+// completed email challenge should use MarkOwnerVerifiedBy(agentID, "email").
+func (s *Store) MarkOwnerVerified(agentID string) error {
+	return s.MarkOwnerVerifiedBy(agentID, "operator")
 }
 
 // DeleteAgent removes an agent and everything it owns — files, links, inbox,
-// recipient circle, upload requests, counters, idempotency + verify tokens —
+// recipient circle, upload requests, apps/deployments, counters, idempotency + verify tokens —
 // EXCEPT its receipts: the signed chain is append-only and must outlive the
 // account, or it stops being deletion-evident. Blob refs held by the agent's
 // files and active links are released (only this agent's contribution, so
@@ -840,7 +928,8 @@ func (s *Store) PutBlob(r io.Reader, limit int64) (sha string, size int64, err e
 	}()
 
 	h := sha256.New()
-	size, err = io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r, limit+1))
+	writer := &diskGuardBlobWriter{s: s, file: tmp, hash: h}
+	size, err = io.CopyBuffer(writer, io.LimitReader(r, limit+1), make([]byte, 1<<20))
 	if err != nil {
 		return "", 0, err
 	}
@@ -875,6 +964,28 @@ func (s *Store) PutBlob(r io.Reader, limit int64) (sha string, size int64, err e
 	return sha, size, nil
 }
 
+type diskGuardBlobWriter struct {
+	s    *Store
+	file *os.File
+	hash io.Writer
+}
+
+func (w *diskGuardBlobWriter) Write(p []byte) (int, error) {
+	if w.s.diskReserve > 0 {
+		free, _, statErr := VolumeStats(w.s.dataDir)
+		if statErr == nil && free-w.s.diskReserve < int64(len(p)) {
+			return 0, ErrDiskReserve
+		}
+	}
+	n, err := w.file.Write(p)
+	if n > 0 {
+		if _, hashErr := w.hash.Write(p[:n]); err == nil && hashErr != nil {
+			err = hashErr
+		}
+	}
+	return n, err
+}
+
 // OpenBlob opens a blob for reading.
 func (s *Store) OpenBlob(sha string) (*os.File, error) {
 	if len(sha) < 3 || strings.ContainsAny(sha, "/\\.") {
@@ -892,7 +1003,9 @@ func (s *Store) OpenBlob(sha string) (*os.File, error) {
 // appear here — kept in one place so a new kind of reference can't be forgotten.
 const blobReferencedSQL = `EXISTS (SELECT 1 FROM files WHERE files.sha256=blobs.sha256)
 	OR EXISTS (SELECT 1 FROM links WHERE links.sha256=blobs.sha256 AND status='active')
-	OR EXISTS (SELECT 1 FROM space_events WHERE space_events.sha256=blobs.sha256)`
+	OR EXISTS (SELECT 1 FROM space_events WHERE space_events.sha256=blobs.sha256)
+	OR EXISTS (SELECT 1 FROM app_deployments WHERE app_deployments.source_sha256=blobs.sha256)
+	OR EXISTS (SELECT 1 FROM app_files WHERE app_files.sha256=blobs.sha256)`
 
 // DeleteOrphanBlobs removes blobs no longer referenced by any file or active
 // link, from db and disk. Reference-ness is computed on demand — there is no
@@ -951,7 +1064,12 @@ func (s *Store) AddFile(agentID, sha, name, mime string, size int64, source stri
 	}
 	if _, err := s.DB.Exec(`INSERT INTO files(id,agent_id,sha256,name,mime,size,source,claimed,expires_at,created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(agent_id,name,sha256) DO UPDATE SET claimed=MAX(files.claimed,excluded.claimed), expires_at=excluded.expires_at`,
+		ON CONFLICT(agent_id,name,sha256) DO UPDATE SET
+			claimed=MAX(files.claimed,excluded.claimed),
+			expires_at=CASE
+				WHEN files.claimed=1 AND excluded.claimed=0 THEN files.expires_at
+				ELSE excluded.expires_at
+			END`,
 		f.ID, f.AgentID, f.SHA256, f.Name, f.MIME, f.Size, f.Source, boolInt(f.Claimed), f.ExpiresAt, f.CreatedAt); err != nil {
 		return f, err
 	}
@@ -1026,6 +1144,12 @@ func (s *Store) FileByName(agentID, name string) (File, error) {
 	return scanFile(s.DB.QueryRow(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND name=? ORDER BY created_at DESC LIMIT 1`, agentID, name))
 }
 
+// FileEntry fetches one exact folder name/content pair.
+func (s *Store) FileEntry(agentID, sha, name string) (File, error) {
+	return scanFile(s.DB.QueryRow(`SELECT `+fileCols+` FROM files
+		WHERE agent_id=? AND sha256=? AND name=? LIMIT 1`, agentID, sha, safeName(name)))
+}
+
 // DeleteFile removes folder entries for a hash. It returns the removed entries;
 // the blob is reclaimed by orphan GC once nothing references it.
 func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
@@ -1057,6 +1181,26 @@ func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
 	return files[:deleted], nil
 }
 
+// DeleteFileEntry removes one exact folder entry. It is used for temporary
+// staging rows whose blob may legitimately also appear under another name;
+// unlike DeleteFile it never broadens a precise cleanup into deleting every
+// same-content entry.
+func (s *Store) DeleteFileEntry(agentID, sha, name string) (File, error) {
+	f, err := scanFile(s.DB.QueryRow(`SELECT `+fileCols+` FROM files
+		WHERE agent_id=? AND sha256=? AND name=? LIMIT 1`, agentID, sha, safeName(name)))
+	if err != nil {
+		return f, err
+	}
+	res, err := s.DB.Exec(`DELETE FROM files WHERE id=? AND agent_id=?`, f.ID, agentID)
+	if err != nil {
+		return f, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return f, ErrNotFound
+	}
+	return f, nil
+}
+
 // KeepFile claims a file. expiresAt caps its remaining lifetime: 0 makes it
 // persistent (verified owners); unverified agents pass their tier's ceiling —
 // keeping must not grant an immortality their own uploads don't get.
@@ -1071,10 +1215,17 @@ func (s *Store) KeepFile(agentID, sha string, expiresAt int64) (File, error) {
 	return s.FileBySHA(agentID, sha)
 }
 
-// StorageUsed sums the agent's folder bytes (each entry counted once).
+// StorageUsed sums distinct blobs attributable to an agent: anything in its
+// folder, plus anything it posted as a file event to a space. Space events are
+// durable blob references, so continuing to charge them after the folder row
+// is deleted closes an otherwise-unbounded upload→post→delete quota bypass.
+// A blob present in both places (or posted repeatedly) is counted only once.
 func (s *Store) StorageUsed(agentID string) (int64, error) {
 	var n sql.NullInt64
-	err := s.DB.QueryRow(`SELECT SUM(size) FROM files WHERE agent_id=?`, agentID).Scan(&n)
+	err := s.DB.QueryRow(`SELECT SUM(b.size) FROM blobs b WHERE
+		EXISTS (SELECT 1 FROM files f WHERE f.agent_id=? AND f.sha256=b.sha256)
+		OR EXISTS (SELECT 1 FROM space_events e JOIN agents a ON a.id=?
+			WHERE e.kind='file' AND e.actor=a.email AND e.sha256=b.sha256)`, agentID, agentID).Scan(&n)
 	return n.Int64, err
 }
 
@@ -1338,8 +1489,10 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	return m, nil
 }
 
-// ListInbox returns inbox messages, oldest first. thread filters by an
-// AgentTransfer message id (matches the message or replies to it).
+// ListInbox returns inbox messages, oldest first. thread may be either the
+// inbox row id exposed by this API or an RFC/AgentTransfer message id. When it
+// names an inbox row, its wire Message-ID, parent, and References become thread
+// needles so selecting a reply still returns ancestors and sibling replies.
 func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit int) ([]Message, error) {
 	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=0`
 	args := []any{agentID}
@@ -1347,8 +1500,27 @@ func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit 
 		q += ` AND read=0`
 	}
 	if thread != "" {
-		q += ` AND (id=? OR in_reply_to=? OR message_id LIKE ?)`
-		args = append(args, thread, thread, "%"+thread+"%")
+		needles := []string{thread}
+		var wireID, inReplyTo, refs string
+		if err := s.DB.QueryRow(`SELECT message_id,in_reply_to,refs FROM messages WHERE agent_id=? AND id=?`, agentID, thread).
+			Scan(&wireID, &inReplyTo, &refs); err == nil {
+			needles = append(needles, wireID, inReplyTo)
+			needles = append(needles, strings.Fields(refs)...)
+		}
+		seen := map[string]bool{}
+		clauses := []string{"id=?"}
+		threadArgs := []any{thread}
+		for _, needle := range needles {
+			needle = strings.TrimSpace(needle)
+			if needle == "" || len(needle) > 1024 || seen[needle] || len(seen) >= 64 {
+				continue
+			}
+			seen[needle] = true
+			clauses = append(clauses, `instr(message_id,?)>0`, `instr(in_reply_to,?)>0`, `instr(refs,?)>0`)
+			threadArgs = append(threadArgs, needle, needle, needle)
+		}
+		q += ` AND (` + strings.Join(clauses, ` OR `) + `)`
+		args = append(args, threadArgs...)
 	}
 	q += ` ORDER BY received_at, id`
 	if limit > 0 {
@@ -1520,8 +1692,44 @@ func (s *Store) PutIdempotent(agentID, key, response string) error {
 // CreateVerifyToken mints an owner-verification token.
 func (s *Store) CreateVerifyToken(agentID string) (string, error) {
 	tok := randToken(24)
-	_, err := s.DB.Exec(`INSERT INTO verify_tokens(token,agent_id,created_at) VALUES(?,?,?)`, tok, agentID, now())
+	var ownerEmail string
+	_ = s.DB.QueryRow(`SELECT owner_email FROM agents WHERE id=?`, agentID).Scan(&ownerEmail)
+	_, err := s.DB.Exec(`INSERT INTO verify_tokens(token,agent_id,created_at,owner_email) VALUES(?,?,?,?)`, tok, agentID, now(), ownerEmail)
 	return tok, err
+}
+
+// CreateOwnerVerifyToken atomically binds a challenge to the exact mailbox
+// that the caller is about to email. The explicit expected address prevents a
+// concurrent owner replacement from making a token sent to mailbox A verify
+// mailbox B. Generic Connect tokens continue to use CreateVerifyToken above.
+func (s *Store) CreateOwnerVerifyToken(agentID, expectedEmail string) (string, error) {
+	expectedEmail = strings.TrimSpace(expectedEmail)
+	if expectedEmail == "" {
+		return "", errors.New("owner email is required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var currentEmail string
+	if err := tx.QueryRow(`SELECT owner_email FROM agents WHERE id=?`, agentID).Scan(&currentEmail); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(currentEmail, expectedEmail) {
+		return "", errors.New("owner mailbox changed before challenge was created")
+	}
+	tok := randToken(24)
+	if _, err := tx.Exec(`INSERT INTO verify_tokens(token,agent_id,created_at,owner_email) VALUES(?,?,?,?)`,
+		tok, agentID, now(), currentEmail); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return tok, nil
 }
 
 // PeekVerifyToken resolves a verification token WITHOUT consuming it — the
@@ -1530,7 +1738,7 @@ func (s *Store) CreateVerifyToken(agentID string) (string, error) {
 // consumes.
 func (s *Store) PeekVerifyToken(tok string) (string, error) {
 	var agentID string
-	err := s.DB.QueryRow(`SELECT agent_id FROM verify_tokens WHERE token=?`, tok).Scan(&agentID)
+	err := s.DB.QueryRow(`SELECT agent_id FROM verify_tokens WHERE token=? AND created_at>=?`, tok, now()-48*3600).Scan(&agentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -1540,15 +1748,52 @@ func (s *Store) PeekVerifyToken(tok string) (string, error) {
 // ConsumeVerifyToken redeems a verification token for its agent id.
 func (s *Store) ConsumeVerifyToken(tok string) (string, error) {
 	var agentID string
-	err := s.DB.QueryRow(`SELECT agent_id FROM verify_tokens WHERE token=?`, tok).Scan(&agentID)
+	err := s.DB.QueryRow(`DELETE FROM verify_tokens WHERE token=? AND created_at>=? RETURNING agent_id`, tok, now()-48*3600).Scan(&agentID)
 	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return agentID, err
+}
+
+// VerifyOwnerToken atomically consumes a mailbox challenge and verifies only
+// the exact owner address captured when it was minted. If SetOwnerPending won
+// a race first, it deleted the token; if it runs afterward, it resets the
+// verified bit. Either ordering prevents an old click from blessing a new
+// mailbox nomination.
+func (s *Store) VerifyOwnerToken(tok string) (string, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var agentID, challengedEmail string
+	err = tx.QueryRow(`DELETE FROM verify_tokens WHERE token=? AND created_at>=? RETURNING agent_id,owner_email`,
+		tok, now()-48*3600).Scan(&agentID, &challengedEmail)
+	if errors.Is(err, sql.ErrNoRows) || challengedEmail == "" || strings.HasPrefix(agentID, "connect:") {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	_, err = s.DB.Exec(`DELETE FROM verify_tokens WHERE token=?`, tok)
-	return agentID, err
+	res, err := tx.Exec(`UPDATE agents SET owner_verified=1,owner_verified_at=?,owner_verification_method='email'
+		WHERE id=? AND lower(owner_email)=lower(?)`, now(), agentID, challengedEmail)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", ErrNotFound
+	}
+	if _, err := tx.Exec(`UPDATE files SET expires_at=0 WHERE agent_id=? AND claimed=1`, agentID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(`UPDATE persons SET verified_at=CASE WHEN verified_at=0 THEN ? ELSE verified_at END
+		WHERE id=(SELECT person_id FROM agents WHERE id=?)`, now(), agentID); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return agentID, nil
 }
 
 // ---- upload requests ----

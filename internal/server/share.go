@@ -25,6 +25,12 @@ import (
 //   - Range requests on burn links are answered with the full body so
 //     "complete" stays unambiguous.
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
+	// Link state (expiry, revoke, burn-after-read) is authoritative only at
+	// this process. An intermediary replaying a cached page or byte response
+	// would bypass those semantics, so public share URLs are never cacheable.
+	w.Header().Set("Cache-Control", "private, no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	token := r.PathValue("token")
 	l, err := s.st.GetLink(token)
 	if errors.Is(err, store.ErrNotFound) {
@@ -273,6 +279,10 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 	// leaves at most an unreferenced blob for the janitor.
 	sha, size, err := s.st.PutBlob(part, s.cfg.MaxFileSize)
 	if err != nil {
+		if errors.Is(err, store.ErrDiskReserve) {
+			http.Error(w, "instance storage reserve reached — the link is still valid, try later", http.StatusInsufficientStorage)
+			return
+		}
 		if errors.Is(err, store.ErrQuota) {
 			http.Error(w, "file exceeds the size limit — the link is still valid, try a smaller file", http.StatusRequestEntityTooLarge)
 			return

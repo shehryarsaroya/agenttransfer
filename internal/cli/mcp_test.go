@@ -50,7 +50,10 @@ func TestMCPHandleProtocol(t *testing.T) {
 	for _, tl := range tools {
 		names[tl["name"].(string)] = true
 	}
-	for _, want := range []string{"whoami", "upload_file", "send_file", "download_file", "check_inbox"} {
+	for _, want := range []string{
+		"whoami", "upload_file", "send_file", "download_file", "check_inbox",
+		"deploy_app", "app_status", "app_logs", "stop_app",
+	} {
 		if !names[want] {
 			t.Fatalf("tools/list missing %q", want)
 		}

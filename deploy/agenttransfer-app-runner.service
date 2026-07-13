@@ -1,0 +1,60 @@
+[Unit]
+Description=AgentTransfer isolated container app runner
+Documentation=https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md
+After=docker.service network-online.target agenttransfer.service
+Requires=docker.service
+Wants=agenttransfer.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'test -d "$APP_ROOT"'
+ExecStart=/usr/local/bin/agenttransfer app-runner
+EnvironmentFile=/etc/agenttransfer/apps.env
+Environment=APP_ROOT=/var/lib/agenttransfer/apps
+Environment=APP_RUNNER_SOCKET=/run/agenttransfer-app-runner/runner.sock
+# Buildx otherwise falls back to /root/.docker, which ProtectHome correctly
+# makes unavailable. Keep its transient client state inside RuntimeDirectory.
+Environment=DOCKER_CONFIG=/run/agenttransfer-app-runner/docker-config
+# The control plane uses systemd DynamicUser, so its numeric uid is not stable.
+# The socket carries a mandatory 256-bit bearer token and is not mounted into
+# apps; world-connectable is therefore safe while still keeping Docker itself
+# completely out of the public service.
+Environment=APP_RUNNER_SOCKET_MODE=0666
+RuntimeDirectory=agenttransfer-app-runner
+RuntimeDirectoryMode=0755
+UMask=0077
+
+NoNewPrivileges=yes
+# Root is needed only to traverse the DynamicUser-owned app root and chown the
+# per-app /data bind to uid 65532. It does not need broad host capabilities or
+# visibility into other services' process environments.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The runner needs only app contexts and persistent /data. Hide the public
+# service's environment, SQLite control plane, transfer blobs, and TLS state;
+# systemd reads apps.env before constructing this namespace.
+# If APP_ROOT moves, replace the first path here with its resolved host path;
+# environment variables are not expanded by systemd's ReadWritePaths= parser.
+ReadWritePaths=/var/lib/private/agenttransfer/apps /run/agenttransfer-app-runner /var/run/docker.sock
+InaccessiblePaths=-/etc/agenttransfer
+InaccessiblePaths=-/var/lib/private/agenttransfer/agenttransfer.db
+InaccessiblePaths=-/var/lib/private/agenttransfer/agenttransfer.db-wal
+InaccessiblePaths=-/var/lib/private/agenttransfer/agenttransfer.db-shm
+InaccessiblePaths=-/var/lib/private/agenttransfer/blobs
+InaccessiblePaths=-/var/lib/private/agenttransfer/certmagic
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

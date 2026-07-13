@@ -2,9 +2,173 @@ package store
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestConsumeVerifyTokenIsAtomic(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("verify-race", "owner@example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateVerifyToken(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	results := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.ConsumeVerifyToken(token)
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if err != ErrNotFound {
+			t.Fatalf("consume error = %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("token winners = %d, want 1", winners)
+	}
+}
+
+func TestOwnerVerifyTokenIsBoundToNominatedMailbox(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("verify-owner-race", "old@example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := s.CreateVerifyToken(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOwnerPending(a.ID, "new@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyOwnerToken(oldToken); err != ErrNotFound {
+		t.Fatalf("old mailbox token verified replacement owner: %v", err)
+	}
+	newToken, err := s.CreateVerifyToken(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyOwnerToken(newToken); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := s.AgentByID(a.ID)
+	if err != nil || verified.OwnerEmail != "new@example.com" || !verified.HumanVerified() {
+		t.Fatalf("verified agent = %+v err=%v", verified, err)
+	}
+}
+
+func TestOwnerVerifyTokenCannotBindAConcurrentReplacementMailbox(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("verify-owner-interleave", "first@example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the dangerous ordering: request A saved first@example.com,
+	// request B replaced it, then request A reached token creation. The token
+	// intended for A must not silently read and bless B from current DB state.
+	if err := s.SetOwnerPending(a.ID, "second@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateOwnerVerifyToken(a.ID, "first@example.com"); err == nil {
+		t.Fatal("challenge for the replaced mailbox was minted against the new owner")
+	}
+	token, err := s.CreateOwnerVerifyToken(a.ID, "second@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyOwnerToken(token); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := s.AgentByID(a.ID)
+	if err != nil || verified.OwnerEmail != "second@example.com" || !verified.HumanVerified() {
+		t.Fatalf("verified replacement = %+v err=%v", verified, err)
+	}
+}
+
+func TestVerifyTokenExpiryIsEnforcedAtReadTime(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("verify-expired", "owner@example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateVerifyToken(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE verify_tokens SET created_at=? WHERE token=?`, now()-48*3600-1, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PeekVerifyToken(token); err != ErrNotFound {
+		t.Fatalf("expired token peek = %v", err)
+	}
+	if _, err := s.VerifyOwnerToken(token); err != ErrNotFound {
+		t.Fatalf("expired token verify = %v", err)
+	}
+}
+
+func TestListInboxThreadResolvesRowIDToWireMessageID(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("thread-reader", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := s.AddMessage(Message{
+		AgentID: a.ID, From: "sender@example.com", To: []string{a.Email},
+		Subject: "A thread", Text: "root", MessageID: "<wire-root@example.com>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := s.AddMessage(Message{
+		AgentID: a.ID, From: "sender@example.com", To: []string{a.Email},
+		Subject: "Re: A thread", Text: "reply", MessageID: "<wire-reply@example.com>",
+		InReplyTo: "<wire-root@example.com>", References: "<wire-root@example.com>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling, err := s.AddMessage(Message{
+		AgentID: a.ID, From: "sender@example.com", To: []string{a.Email},
+		Subject: "Re: A thread", Text: "sibling", MessageID: "<wire-sibling@example.com>",
+		InReplyTo: "<wire-root@example.com>", References: "<wire-root@example.com>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddMessage(Message{
+		AgentID: a.ID, From: "other@example.com", To: []string{a.Email},
+		Subject: "Unrelated", Text: "other", MessageID: "<wire-other@example.com>",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, selected := range []string{root.ID, reply.ID, sibling.ID} {
+		thread, err := s.ListInbox(a.ID, false, selected, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := map[string]bool{}
+		for _, message := range thread {
+			found[message.ID] = true
+		}
+		if len(thread) != 3 || !found[root.ID] || !found[reply.ID] || !found[sibling.ID] {
+			t.Fatalf("thread selected by %s = %+v", selected, thread)
+		}
+	}
+}
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
@@ -23,6 +187,41 @@ func put(t *testing.T, s *Store, content string) (sha string, size int64) {
 		t.Fatal(err)
 	}
 	return sha, size
+}
+
+func TestPutBlobStopsBeforeCrossingDiskReserve(t *testing.T) {
+	s := newStore(t)
+	// Use an impossible floor rather than free-1: concurrent test/build cleanup
+	// can legitimately increase free space between those two measurements and
+	// make a boundary-value assertion flaky.
+	s.SetDiskReserve(1 << 62)
+	if _, _, err := s.PutBlob(strings.NewReader("more than one byte"), 1<<20); err != ErrDiskReserve {
+		t.Fatalf("PutBlob error = %v, want ErrDiskReserve", err)
+	}
+}
+
+func TestDeleteFileEntryDoesNotDeleteSameBlobUnderAnotherName(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("entry-cleanup", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, size := put(t, s, "same bytes")
+	if _, err := s.AddFile(a.ID, sha, "kept.txt", "text/plain", size, "upload", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddFile(a.ID, sha, ".deploy.tmp", "application/octet-stream", size, "upload", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteFileEntry(a.ID, sha, ".deploy.tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FileByName(a.ID, "kept.txt"); err != nil {
+		t.Fatalf("same-content user entry was deleted: %v", err)
+	}
+	if _, err := s.FileByName(a.ID, ".deploy.tmp"); err != ErrNotFound {
+		t.Fatalf("temporary entry still exists: %v", err)
+	}
 }
 
 // survivesGC ages every blob past the grace window, runs orphan GC, and reports

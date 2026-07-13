@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly AgentTransfer Docker cache cleanup
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

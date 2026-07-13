@@ -19,14 +19,16 @@
 </head>
 <body>
 <div class="card">
-  <h1>Approve outbound email for {{.What}}?</h1>
+  <h1>Approve {{.What}}?</h1>
   <p>Someone (probably you) named this address as the owner of <code>{{.What}}</code>. Confirming will:</p>
   <ul>
     <li>let it send real email, up to {{.Sends}} messages per day{{if gt .Circle 0}}, to at most {{.Circle}} unique outside recipients (you don't count){{end}}</li>
     <li>record this address as its accountable contact</li>
+    {{if .AgentApproval}}<li>upgrade its folder from an expiring scratchpad to the full persistent storage tier</li>
+    {{if .AppHosting}}<li>authorize it to publish and run a public app or website under <code>*.{{.AppDomain}}</code></li>{{else}}<li>authorize it to publish an app or website if hosting is enabled on this instance</li>{{end}}{{end}}
   </ul>
   <form method="post" action="{{.Action}}">
-    <button type="submit">Confirm — I own this</button>
+    <button type="submit">Confirm — approve these capabilities</button>
   </form>
   <p class="foot">Not you? Just close this page — nothing happens without the click above.</p>
 </div>

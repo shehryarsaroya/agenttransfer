@@ -1,8 +1,13 @@
 [Unit]
 Description=AgentTransfer nightly backup snapshot
 # Snapshots DATA_DIR into /var/backups/agenttransfer/<date>.tar.gz and keeps
-# the last 7. Uses sqlite3's .backup for a consistent DB copy while the server
-# runs (WAL-safe) — `apt install sqlite3`. Pull the snapshots OFF the box too:
+# the last 7. It briefly quiesces the public service while taking the SQLite
+# snapshot and a hardlink snapshot of immutable blobs, then restarts HTTP/SMTP
+# before compressing the potentially large archive. The trap still restarts it
+# if any snapshot step fails.
+# App containers keep running, so their /data copy is best-effort rather than
+# application-consistent; quiesce or back up stateful apps themselves when
+# that distinction matters. Requires `sqlite3`. Pull snapshots OFF the box too:
 # a backup that dies with the disk isn't one (see docs/self-hosting.md).
 
 [Service]
@@ -12,10 +17,29 @@ Environment=BACKUP_DIR=/var/backups/agenttransfer
 ExecStart=/bin/bash -c '\
   set -euo pipefail; \
   mkdir -p "$BACKUP_DIR"; \
-  work=$(mktemp -d); trap "rm -rf $work" EXIT; \
+  work=$(mktemp -d "$DATA_DIR/.agenttransfer-backup-XXXXXXXX"); \
+  archive=$(mktemp "$BACKUP_DIR/.agenttransfer-XXXXXXXX.tar.gz"); \
+  restart_needed=0; \
+  cleanup() { [ "$restart_needed" -eq 0 ] || systemctl start agenttransfer; rm -rf "$work"; [ -z "${archive:-}" ] || rm -f "$archive"; }; \
+  trap cleanup EXIT; \
+  systemctl is-active --quiet agenttransfer && restart_needed=1 || true; \
+  stopped_at=$(date +%%s); \
+  [ "$restart_needed" -eq 0 ] || systemctl stop agenttransfer; \
   sqlite3 "$DATA_DIR/agenttransfer.db" ".backup $work/agenttransfer.db"; \
-  tar -C "$DATA_DIR" -czf "$BACKUP_DIR/agenttransfer-$(date +%%F).tar.gz" \
-      -C "$work" agenttransfer.db -C "$DATA_DIR" blobs certmagic 2>/dev/null || \
-  tar -czf "$BACKUP_DIR/agenttransfer-$(date +%%F).tar.gz" -C "$work" agenttransfer.db -C "$DATA_DIR" blobs; \
+  cp -al "$DATA_DIR/blobs" "$work/blobs"; \
+  [ ! -e "$DATA_DIR/certmagic" ] || cp -a "$DATA_DIR/certmagic" "$work/certmagic"; \
+  if [ "$restart_needed" -eq 1 ]; then systemctl start agenttransfer; restart_needed=0; fi; \
+  echo "AgentTransfer public snapshot pause: $(($(date +%%s)-stopped_at))s"; \
+  if [ -e "$work/certmagic" ] && [ -e "$DATA_DIR/apps/data" ]; then \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs certmagic -C "$DATA_DIR" apps/data; \
+  elif [ -e "$work/certmagic" ]; then \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs certmagic; \
+  elif [ -e "$DATA_DIR/apps/data" ]; then \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs -C "$DATA_DIR" apps/data; \
+  else \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs; \
+  fi; \
+  tar -tzf "$archive" >/dev/null; \
+  mv -f "$archive" "$BACKUP_DIR/agenttransfer-$(date +%%F).tar.gz"; archive=; \
   ls -1t "$BACKUP_DIR"/agenttransfer-*.tar.gz | tail -n +8 | xargs -r rm -f; \
   ls -lh "$BACKUP_DIR" | tail -3'

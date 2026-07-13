@@ -66,7 +66,7 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
 }
 ```
 
-- `action` ∈ `uploaded | sent | received | downloaded | revoked | burned | expired | deleted`.
+- `action` ∈ `uploaded | sent | received | downloaded | revoked | burned | expired | deleted | app_deployed | app_stopped | app_deleted`.
 - **Canonical form**: the signature covers the JSON object *minus `sig`*, serialized with keys sorted alphabetically, no whitespace, integers in decimal, and zero-value optional fields (`sha256`, `size`, `target`, `message_id`) omitted. This exact byte string is also what `prev` hashes (sha256, hex).
 - The first receipt has `prev: "genesis"`.
 - **Signatures prove who did what; the chain proves nothing was deleted.** Verifying a full export (`GET /v1/receipts/export`, JSONL, oldest first) checks both. An agent's own slice (`GET /v1/receipts`) is signature-verifiable but not gap-checkable — chain verification needs the export.
@@ -77,7 +77,7 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
 ```json
 {
   "name": "agenttransfer",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "instance": "agents.example.com",
   "receipt_pubkey": "ed25519:...",
   "max_file_size": 5368709120,
@@ -86,9 +86,21 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
   "open_signup": false,
   "email_enabled": true,
   "protocols": { "manifest": 1, "a2a_parts": true },
-  "endpoints": { "api": "https://agents.example.com/v1", "mcp": "https://agents.example.com/mcp" }
+  "endpoints": { "api": "https://agents.example.com/v1", "mcp": "https://agents.example.com/mcp" },
+  "app_hosting": {
+    "domain": "agents.example.com",
+    "url_pattern": "https://{agent-slug}.agents.example.com",
+    "human_email_verification_required": true,
+    "static": true,
+    "containers": true,
+    "storage_quota": 10737418240
+  }
 }
 ```
+
+`app_hosting` is omitted when `APP_DOMAIN` is disabled. `containers` reports
+whether the separate runner client is configured; it does not weaken the
+per-agent human-email gate.
 
 Clients use it for limit discovery; verifiers use it for the public key; other instances use it to learn your endpoints. **Email is the federation** — there is no registry, no handshake, no shared infrastructure. If your agent can receive email at its address, it participates.
 

@@ -18,12 +18,18 @@ import (
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"net/url"
 	"strings"
 	"time"
+)
+
+const (
+	relayDialTimeout = 15 * time.Second
+	relayDeadline    = 2 * time.Minute
 )
 
 // Outbound is a parsed OUTBOUND relay configuration.
@@ -172,28 +178,14 @@ func (m *Message) Build() ([]byte, error) {
 
 // Send submits raw message bytes through the relay for the given envelope.
 func Send(o *Outbound, envelopeFrom string, rcpts []string, raw []byte) error {
-	var c *smtp.Client
-	var err error
-	if o.Implicit {
-		conn, derr := tls.Dial("tcp", o.Host, &tls.Config{ServerName: o.HostOnly})
-		if derr != nil {
-			return fmt.Errorf("relay dial: %w", derr)
-		}
-		c, err = smtp.NewClient(conn, o.HostOnly)
-	} else {
-		c, err = smtp.Dial(o.Host)
-	}
+	c, err := dialRelay(o)
 	if err != nil {
 		return fmt.Errorf("relay connect: %w", err)
 	}
 	defer c.Close()
 
-	if !o.Implicit {
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err := c.StartTLS(&tls.Config{ServerName: o.HostOnly}); err != nil {
-				return fmt.Errorf("relay starttls: %w", err)
-			}
-		}
+	if err := secureRelay(c, o); err != nil {
+		return err
 	}
 	if o.User != "" {
 		if err := c.Auth(smtp.PlainAuth("", o.User, o.Pass, o.HostOnly)); err != nil {
@@ -224,27 +216,13 @@ func Send(o *Outbound, envelopeFrom string, rcpts []string, raw []byte) error {
 // TestAuth connects and authenticates against the relay without sending —
 // used by `agenttransfer doctor`.
 func TestAuth(o *Outbound) error {
-	var c *smtp.Client
-	var err error
-	if o.Implicit {
-		conn, derr := tls.Dial("tcp", o.Host, &tls.Config{ServerName: o.HostOnly})
-		if derr != nil {
-			return derr
-		}
-		c, err = smtp.NewClient(conn, o.HostOnly)
-	} else {
-		c, err = smtp.Dial(o.Host)
-	}
+	c, err := dialRelay(o)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if !o.Implicit {
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err := c.StartTLS(&tls.Config{ServerName: o.HostOnly}); err != nil {
-				return err
-			}
-		}
+	if err := secureRelay(c, o); err != nil {
+		return err
 	}
 	if o.User != "" {
 		if err := c.Auth(smtp.PlainAuth("", o.User, o.Pass, o.HostOnly)); err != nil {
@@ -252,6 +230,62 @@ func TestAuth(o *Outbound) error {
 		}
 	}
 	return c.Quit()
+}
+
+func dialRelay(o *Outbound) (*smtp.Client, error) {
+	if o == nil {
+		return nil, errors.New("nil outbound relay")
+	}
+	conn, err := (&net.Dialer{Timeout: relayDialTimeout, KeepAlive: 30 * time.Second}).Dial("tcp", o.Host)
+	if err != nil {
+		return nil, err
+	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = conn.Close()
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(relayDeadline)); err != nil {
+		return nil, err
+	}
+	if o.Implicit {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: o.HostOnly, MinVersion: tls.VersionTLS12})
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
+	}
+	c, err := smtp.NewClient(conn, o.HostOnly)
+	if err != nil {
+		return nil, err
+	}
+	closeOnError = false
+	return c, nil
+}
+
+func secureRelay(c *smtp.Client, o *Outbound) error {
+	if o.Implicit {
+		return nil
+	}
+	if ok, _ := c.Extension("STARTTLS"); !ok {
+		if !isLoopbackRelay(o.HostOnly) {
+			return errors.New("relay refused: STARTTLS is required for non-loopback smtp:// endpoints")
+		}
+		return nil // local test/development sink
+	}
+	if err := c.StartTLS(&tls.Config{ServerName: o.HostOnly, MinVersion: tls.VersionTLS12}); err != nil {
+		return fmt.Errorf("relay starttls: %w", err)
+	}
+	return nil
+}
+
+func isLoopbackRelay(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // InAttachment is one attachment from an inbound email.
@@ -345,6 +379,11 @@ func walkPart(in *Inbound, contentType, encoding, disposition string, body io.Re
 
 	decoded := decodeBody(body, encoding)
 	filename := partFilename(contentType, disposition)
+	dispositionType := ""
+	if parsed, _, err := mime.ParseMediaType(disposition); err == nil {
+		dispositionType = strings.ToLower(parsed)
+	}
+	isAttachment := dispositionType == "attachment"
 
 	switch {
 	case mediaType == "application/vnd.agenttransfer+json" || filename == "agenttransfer.json":
@@ -352,7 +391,7 @@ func walkPart(in *Inbound, contentType, encoding, disposition string, body io.Re
 		if err == nil {
 			in.Manifest = data
 		}
-	case mediaType == "text/plain" && !strings.HasPrefix(disposition, "attachment"):
+	case mediaType == "text/plain" && !isAttachment:
 		data, err := io.ReadAll(io.LimitReader(decoded, 1<<20))
 		if err == nil {
 			if in.Text != "" {
@@ -360,10 +399,10 @@ func walkPart(in *Inbound, contentType, encoding, disposition string, body io.Re
 			}
 			in.Text += strings.TrimRight(string(data), "\r\n")
 		}
-	case mediaType == "text/html" && filename == "":
+	case mediaType == "text/html" && filename == "" && !isAttachment:
 		// HTML alternative of the body: ignored (text part preferred).
 	default:
-		if filename == "" && !strings.HasPrefix(disposition, "attachment") {
+		if filename == "" && !isAttachment {
 			return nil
 		}
 		data, err := io.ReadAll(io.LimitReader(decoded, maxAttachment+1))

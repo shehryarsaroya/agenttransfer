@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,12 @@ import (
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	// API responses frequently contain bearer credentials, private identity
+	// data, one-time secrets, or live capability URLs. Keep them out of shared
+	// and browser caches by default; public HTML/assets set their own policy.
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -43,6 +50,14 @@ func bearer(r *http.Request) string {
 		return strings.TrimSpace(tok)
 	}
 	return ""
+}
+
+func canonicalMailbox(raw string) (string, error) {
+	parsed, err := mail.ParseAddress(strings.TrimSpace(raw))
+	if err != nil || strings.TrimSpace(parsed.Address) == "" {
+		return "", errors.New("invalid email address")
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Address)), nil
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, agent store.Agent)
@@ -206,6 +221,14 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "pubkey must be a valid age recipient (age1...)")
 		return
 	}
+	if strings.TrimSpace(req.OwnerEmail) != "" {
+		canonical, err := canonicalMailbox(req.OwnerEmail)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "owner_email, if given, must be a valid address")
+			return
+		}
+		req.OwnerEmail = canonical
+	}
 
 	isAdmin := s.st.IsAdmin(bearer(r))
 	if !isAdmin && !s.cfg.OpenSignup {
@@ -235,10 +258,6 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		// and then it must be valid and caps how many agents it can spawn. Bulk
 		// anonymous signup is bounded by the per-IP rate limiter above.
 		if req.OwnerEmail != "" {
-			if _, err := mail.ParseAddress(req.OwnerEmail); err != nil {
-				errJSON(w, http.StatusBadRequest, "owner_email, if given, must be a valid address")
-				return
-			}
 			if max := s.cfg.MaxAgentsPerOwner; max > 0 {
 				if n, err := s.st.CountAgentsByOwner(req.OwnerEmail); err == nil && n >= max {
 					errJSON(w, http.StatusForbidden,
@@ -301,7 +320,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendVerificationEmail(agent store.Agent) error {
-	tok, err := s.st.CreateVerifyToken(agent.ID)
+	tok, err := s.st.CreateOwnerVerifyToken(agent.ID, agent.OwnerEmail)
 	if err != nil {
 		return err
 	}
@@ -314,8 +333,10 @@ func (s *Server) sendVerificationEmail(agent store.Agent) error {
 		Subject:  fmt.Sprintf("I'm set up at %s — one click to vouch for me", agent.Email),
 		Text: fmt.Sprintf("Hi — I'm your new agent.\n\n"+
 			"    me: %s\n\n"+
-			"Vouch for me with one click, and I can send outbound email (you're\n"+
-			"exempt from my recipient cap, and you can have me CC you on everything):\n\n  %s\n\n"+
+			"Vouch for me with one click. This makes you my accountable owner and\n"+
+			"unlocks outbound email, full persistent storage, and permission to\n"+
+			"publish an app or website. You're exempt from my recipient cap, and\n"+
+			"you can have me CC you on everything:\n\n  %s\n\n"+
 			"If this wasn't you, ignore this message.\n", agent.Email, link),
 		MessageID: afmail.FormatRFCMessageID(store.NewID("msg"), instance),
 	}
@@ -331,6 +352,7 @@ func (s *Server) sendVerificationEmail(agent store.Agent) error {
 // GET that verified would let an attacker sign up with a victim's address and
 // have the victim's own security tooling click the approval for them.
 func (s *Server) handleVerifyOwner(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	tok := r.URL.Query().Get("t")
 	agentID, err := s.st.PeekVerifyToken(tok)
 	if err != nil || strings.HasPrefix(agentID, "connect:") {
@@ -344,16 +366,20 @@ func (s *Server) handleVerifyOwner(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.tmpl.ExecuteTemplate(w, "verify.html", map[string]any{
-		"What":   "agent " + agent.Email,
-		"Action": "/verify?t=" + url.QueryEscape(tok),
-		"Sends":  s.cfg.SendRate,
-		"Circle": s.humanCircleMax(agent),
+		"What":          "agent " + agent.Email,
+		"Action":        "/verify?t=" + url.QueryEscape(tok),
+		"Sends":         s.cfg.SendRate,
+		"Circle":        s.humanCircleMax(agent),
+		"AgentApproval": true,
+		"AppHosting":    s.cfg.AppDomain != "",
+		"AppDomain":     s.cfg.AppDomain,
 	})
 }
 
 // handleVerifyOwnerConfirm (POST) is the explicit human click that consumes
 // the token and unlocks outbound email.
 func (s *Server) handleVerifyOwnerConfirm(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	tok := r.URL.Query().Get("t")
 	if tok == "" {
 		tok = r.FormValue("t")
@@ -364,13 +390,9 @@ func (s *Server) handleVerifyOwnerConfirm(w http.ResponseWriter, r *http.Request
 		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
 		return
 	}
-	agentID, err := s.st.ConsumeVerifyToken(tok)
+	agentID, err := s.st.VerifyOwnerToken(tok)
 	if err != nil || strings.HasPrefix(agentID, "connect:") {
 		http.Error(w, "verification link is invalid or expired", http.StatusNotFound)
-		return
-	}
-	if err := s.st.MarkOwnerVerified(agentID); err != nil {
-		http.Error(w, "verification failed", http.StatusInternalServerError)
 		return
 	}
 	agent, _ := s.st.AgentByID(agentID)
@@ -378,13 +400,90 @@ func (s *Server) handleVerifyOwnerConfirm(w http.ResponseWriter, r *http.Request
 	// the first click activates the handle along with the first agent.
 	var handle string
 	if agent.PersonID != "" {
-		_ = s.st.MarkPersonVerified(agent.PersonID)
 		if p, err := s.st.PersonByID(agent.PersonID); err == nil {
 			handle = p.Handle
 		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = s.tmpl.ExecuteTemplate(w, "verified.html", map[string]any{"Agent": agent.Email, "Handle": handle})
+	_ = s.tmpl.ExecuteTemplate(w, "verified.html", map[string]any{
+		"Agent": agent.Email, "Handle": handle, "AgentApproval": true,
+		"AppHosting": s.cfg.AppDomain != "", "AppDomain": s.cfg.AppDomain,
+	})
+}
+
+// handleSetOwner lets a keyed agent add (or re-challenge) the human mailbox
+// that unlocks external email and app hosting. The API key can nominate an
+// address, but only possession of that mailbox can complete the POST-backed
+// verification link.
+func (s *Server) handleSetOwner(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+	if !s.emailCapable() {
+		errJSON(w, http.StatusServiceUnavailable, "this instance cannot send owner verification email")
+		return
+	}
+	if err := s.checkRate(agent.ID, "owner_verify", 5); err != nil {
+		errJSON(w, http.StatusTooManyRequests, "%v", err)
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	email, err := canonicalMailbox(req.Email)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "email must be a valid address")
+		return
+	}
+	ownerMu := s.uploadLock("owner:" + agent.ID)
+	ownerMu.Lock()
+	defer ownerMu.Unlock()
+	// Authentication happened before the lifecycle lock. Re-read so a
+	// concurrent challenge cannot make decisions from stale owner provenance.
+	agent, err = s.st.AgentByID(agent.ID)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "no such agent")
+		return
+	}
+	if agent.HumanVerified() {
+		if strings.EqualFold(agent.OwnerEmail, email) {
+			writeJSON(w, http.StatusOK, map[string]any{"owner_email": agent.OwnerEmail, "owner_verified": true, "verification": "complete"})
+			return
+		}
+		errJSON(w, http.StatusConflict, "this agent already has a human-verified owner; changing it requires operator review")
+		return
+	}
+	if agent.PersonID != "" {
+		person, err := s.st.PersonByID(agent.PersonID)
+		if err != nil || !strings.EqualFold(person.Email, email) {
+			errJSON(w, http.StatusForbidden, "a fleet agent must verify the person's existing owner email")
+			return
+		}
+	}
+	if !strings.EqualFold(agent.OwnerEmail, email) && s.cfg.MaxAgentsPerOwner > 0 {
+		if n, err := s.st.CountAgentsByOwner(email); err == nil && n >= s.cfg.MaxAgentsPerOwner {
+			errJSON(w, http.StatusForbidden, "this owner email already has %d agents (max %d)", n, s.cfg.MaxAgentsPerOwner)
+			return
+		}
+	}
+	if err := s.st.SetOwnerPending(agent.ID, email); err != nil {
+		errJSON(w, http.StatusInternalServerError, "set owner: %v", err)
+		return
+	}
+	agent.OwnerEmail = email
+	agent.OwnerVerified = false
+	agent.OwnerVerifiedAt = 0
+	agent.OwnerVerificationMethod = ""
+	if err := s.sendVerificationEmail(agent); err != nil {
+		errJSON(w, http.StatusBadGateway, "owner saved, but verification email failed: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"owner_email":  email,
+		"verification": "sent",
+		"unlocks":      []string{"outbound email", "persistent full storage", "app hosting"},
+	})
 }
 
 func (s *Server) handleAdminVerify(w http.ResponseWriter, r *http.Request) {
@@ -397,8 +496,9 @@ func (s *Server) handleAdminVerify(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "no such agent")
 		return
 	}
-	// Operator approval carries the same weight as the owner's click: a
-	// person-owned agent's approval also verifies the person.
+	// Operator approval unlocks the legacy transfer/email tier, but is
+	// recorded separately from mailbox proof and therefore does not unlock
+	// app hosting. For fleets it still activates routing for that agent.
 	if a, err := s.st.AgentByID(id); err == nil && a.PersonID != "" {
 		_ = s.st.MarkPersonVerified(a.PersonID)
 	}
@@ -452,6 +552,24 @@ func (s *Server) handleDeleteSelf(w http.ResponseWriter, r *http.Request, agent 
 }
 
 func (s *Server) deleteAgent(w http.ResponseWriter, id string) {
+	appMu := s.uploadLock("app:" + id)
+	appMu.Lock()
+	defer appMu.Unlock()
+	if app, appErr := s.st.AppByAgentID(id); appErr == nil {
+		needsRunner := app.RuntimeID != "" || app.EverContainer
+		if needsRunner && s.appRunner != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			_, err := s.appRunner.Purge(ctx, app.ID)
+			cancel()
+			if err != nil {
+				errJSON(w, http.StatusServiceUnavailable, "app runtime cleanup failed; agent was not deleted: %v", err)
+				return
+			}
+		} else if needsRunner {
+			errJSON(w, http.StatusServiceUnavailable, "container runner is unavailable; refusing to orphan this agent's app")
+			return
+		}
+	}
 	a, severed, err := s.st.DeleteAgent(id)
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no such agent")
@@ -641,11 +759,17 @@ func (s *Server) handleDirectory(w http.ResponseWriter, r *http.Request, _ store
 
 // decideInbound applies the recipient's accept policy to an incoming sender,
 // returning whether to deliver at all and whether it lands in quarantine.
-func (s *Server) decideInbound(recipient store.Agent, senderAddr string) (deliver, quarantined bool) {
+func (s *Server) decideInbound(recipient store.Agent, senderAddr string, senderAuthenticated bool) (deliver, quarantined bool) {
 	switch recipient.AcceptPolicy {
 	case "known", "closed":
-		if known, _ := s.st.SenderKnown(recipient.ID, senderAddr); known {
-			return true, false
+		// A claimed From address is not an identity. Local sends are
+		// authenticated by their bearer key; inbound email is authenticated
+		// only when aligned DKIM passed. Without that signal, a remote sender
+		// could spoof a same-instance space member and bypass known/closed.
+		if senderAuthenticated {
+			if known, _ := s.st.SenderKnown(recipient.ID, senderAddr); known {
+				return true, false
+			}
 		}
 		// closed → refuse unknown; known → accept but quarantine.
 		return recipient.AcceptPolicy != "closed", true
@@ -727,6 +851,20 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, agent stor
 		},
 		"email_enabled": s.emailCapable(),
 	}
+	hostingEligible, hostingReason := s.appEligibility(agent)
+	hosting := map[string]any{
+		"enabled":  s.cfg.AppDomain != "",
+		"eligible": hostingEligible,
+		"domain":   s.cfg.AppDomain,
+		"quota":    s.cfg.AppStorageQuota,
+	}
+	if hostingReason != "" {
+		hosting["reason"] = hostingReason
+	}
+	if app, err := s.st.AppByAgentID(agent.ID); err == nil {
+		hosting["app"] = s.appView(r.Context(), agent, app)
+	}
+	who["hosting"] = hosting
 	if agent.PersonID != "" {
 		if p, err := s.st.PersonByID(agent.PersonID); err == nil {
 			who["person"] = p.Handle
@@ -781,6 +919,9 @@ func (s *Server) performUpload(agent store.Agent, name, contentType string, body
 	}
 	sha, size, err := s.st.PutBlob(body, s.cfg.MaxFileSize)
 	if err != nil {
+		if errors.Is(err, store.ErrDiskReserve) {
+			return nil, http.StatusInsufficientStorage, errors.New("instance storage reserve reached during upload")
+		}
 		if errors.Is(err, store.ErrQuota) {
 			return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("upload exceeds MAX_FILE_SIZE (%d bytes)", s.cfg.MaxFileSize)
 		}
@@ -902,6 +1043,20 @@ func shaParam(r *http.Request) string {
 
 func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	sha := shaParam(r)
+	if entry := strings.TrimSpace(r.URL.Query().Get("entry")); entry != "" {
+		f, err := s.st.DeleteFileEntry(agent.ID, sha, entry)
+		if errors.Is(err, store.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "no such file entry in your folder")
+			return
+		}
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionDeleted, f.SHA256, f.Size, "file:"+f.Name, "")
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": 1, "links_revoked": 0})
+		return
+	}
 	files, err := s.st.DeleteFile(agent.ID, sha)
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no such file in your folder")
@@ -1090,6 +1245,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, agent store.
 			if prev, err := s.st.GetIdempotent(agent.ID, idemKey); err == nil && prev != "" {
 				w.Header().Set("Idempotent-Replay", "true")
 				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(prev))
 				return
@@ -1174,13 +1330,26 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	instance := s.st.Instance()
 	var localAgents []store.Agent
 	var remote []string
+	var canonicalTo []string
 	seen := map[string]bool{}
 	for _, to := range req.To {
-		addr := strings.ToLower(strings.TrimSpace(to))
+		raw := strings.TrimSpace(to)
+		if raw == "" {
+			continue
+		}
+		parsed, err := mail.ParseAddress(raw)
+		if err != nil {
+			if !strings.Contains(raw, "@") {
+				return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not an address — for an agent on this instance use %q, or give a full email for a remote recipient", raw, strings.ToLower(raw)+"@"+instance)
+			}
+			return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not a valid email address", raw)
+		}
+		addr := strings.ToLower(strings.TrimSpace(parsed.Address))
 		if addr == "" || seen[addr] {
 			continue
 		}
 		seen[addr] = true
+		canonicalTo = append(canonicalTo, addr)
 		localpart, domain, ok := strings.Cut(addr, "@")
 		if ok && domain == instance {
 			resolved := s.resolveLocalRecipient(localpart)
@@ -1200,16 +1369,6 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 				}
 			}
 			continue
-		}
-		// Anything else is treated as a remote email recipient — so it must be a
-		// syntactically valid address. Validate here, before the relay, so a bad
-		// value is a clean 400 (not a 502 leaking relay internals) and a bare
-		// agent name gets an agent-first hint toward the local address form.
-		if _, err := mail.ParseAddress(addr); err != nil {
-			if !strings.Contains(addr, "@") {
-				return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not an address — for an agent on this instance use %q, or give a full email for a remote recipient", addr, addr+"@"+instance)
-			}
-			return nil, http.StatusBadRequest, fmt.Errorf("recipient %q is not a valid email address", addr)
 		}
 		remote = append(remote, addr)
 	}
@@ -1335,13 +1494,13 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	// recipient's accept policy decides whether the message lands in the main
 	// inbox, is held in quarantine, or (for "closed") is refused outright.
 	for _, la := range localAgents {
-		deliver, quarantined := s.decideInbound(la, agent.Email)
+		deliver, quarantined := s.decideInbound(la, agent.Email, true)
 		if !deliver {
 			res.Delivered = append(res.Delivered, map[string]any{"to": la.Email, "via": "rejected", "reason": "recipient only accepts known senders"})
 			continue
 		}
 		lm, err := s.st.AddMessage(store.Message{
-			AgentID: la.ID, From: agent.Email, To: req.To, Subject: subject,
+			AgentID: la.ID, From: agent.Email, To: canonicalTo, Subject: subject,
 			Text: strings.TrimSpace(req.Note), MessageID: rfcMsgID,
 			InReplyTo: inReplyTo, References: references,
 			Manifest: string(manifestJSON), DKIM: "local", SPF: "local",
@@ -1381,7 +1540,18 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 			// mail to an arbitrary owner_email via local-only sends.
 			res.CCOwner = "skipped (owner not verified)"
 		default:
-			cc = append(cc, agent.OwnerEmail)
+			alreadyIncluded := false
+			for _, recipient := range sendable {
+				if strings.EqualFold(recipient, agent.OwnerEmail) {
+					alreadyIncluded = true
+					break
+				}
+			}
+			if alreadyIncluded {
+				res.CCOwner = "already included as recipient"
+			} else {
+				cc = append(cc, agent.OwnerEmail)
+			}
 		}
 	}
 	if len(sendable) > 0 || len(cc) > 0 {
@@ -1496,6 +1666,7 @@ func (s *Server) unsubscribeURL(addr string) string {
 // consumes nothing so link prefetchers can't unsubscribe (or DoS-suppress) an
 // address; only the explicit POST does.
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	addr := strings.TrimSpace(r.URL.Query().Get("e"))
 	tok := strings.TrimSpace(r.URL.Query().Get("t"))
 	if addr == "" || !s.st.CheckUnsubscribeToken(addr, tok) {
@@ -1515,6 +1686,7 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 
 // handleUnsubscribeConfirm (POST) suppresses the address for good.
 func (s *Server) handleUnsubscribeConfirm(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	addr := strings.TrimSpace(r.URL.Query().Get("e"))
 	tok := strings.TrimSpace(r.URL.Query().Get("t"))
 	if addr == "" || !s.st.CheckUnsubscribeToken(addr, tok) {
@@ -1736,6 +1908,7 @@ func (s *Server) handleReceiptsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Receipt-Pubkey", receipt.FormatPublicKey(s.st.PublicKey()))
 	enc := json.NewEncoder(w)
 	for _, rec := range rs {
@@ -1758,6 +1931,33 @@ func (s *Server) handleAdminStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stored, _ := s.st.StoredBytes()
+	apps, _ := s.st.TopAppStorageConsumers(limit)
+	appStorage := map[string]any{"domain": s.cfg.AppDomain, "source_agents": apps}
+	if appRootBytes, walkErr := directoryBytes(s.cfg.AppRoot); walkErr == nil {
+		appStorage["app_root_bytes"] = appRootBytes
+	} else {
+		appStorage["app_root_observation_error"] = walkErr.Error()
+	}
+	if s.appRunner != nil {
+		var persistentBytes int64
+		observationErrors := 0
+		if histories, historyErr := s.st.AppsWithContainerHistory(); historyErr == nil {
+			for _, app := range histories {
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				status, statusErr := s.appRunner.Status(ctx, app.ID)
+				cancel()
+				if statusErr != nil {
+					observationErrors++
+					continue
+				}
+				persistentBytes += status.DataBytes
+			}
+		} else {
+			observationErrors++
+		}
+		appStorage["persistent_data_bytes"] = persistentBytes
+		appStorage["persistent_data_observation_errors"] = observationErrors
+	}
 	free, total, reserve := s.st.DiskStats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"volume": map[string]any{
@@ -1769,6 +1969,7 @@ func (s *Server) handleAdminStorage(w http.ResponseWriter, r *http.Request) {
 		},
 		"stored_bytes": stored, // physical (deduplicated) blob bytes
 		"agents":       agents, // folder bytes per agent, biggest first
+		"apps":         appStorage,
 	})
 }
 
@@ -1787,6 +1988,16 @@ func (s *Server) handleWellKnown(w http.ResponseWriter, r *http.Request) {
 		"email_enabled":  s.emailCapable(),
 		"protocols":      map[string]any{"manifest": proto.Version, "a2a_parts": true},
 		"endpoints":      map[string]string{"api": s.BaseURL() + "/v1", "mcp": s.BaseURL() + "/mcp"},
+	}
+	if s.cfg.AppDomain != "" {
+		out["app_hosting"] = map[string]any{
+			"domain":                            s.cfg.AppDomain,
+			"url_pattern":                       "https://{agent-slug}." + s.cfg.AppDomain,
+			"human_email_verification_required": true,
+			"static":                            true,
+			"containers":                        s.appRunner != nil,
+			"storage_quota":                     s.cfg.AppStorageQuota,
+		}
 	}
 	// Advertise the abuse contact when the operator has stood one up (an
 	// agent named "abuse" — the name is reserved from open signup).
@@ -1807,11 +2018,48 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.tmpl.ExecuteTemplate(w, "index.html", map[string]any{
-		"Instance":   s.st.Instance(),
-		"OpenSignup": s.cfg.OpenSignup,
-		"Base":       s.BaseURL(),
+		"Instance":         s.st.Instance(),
+		"OpenSignup":       s.cfg.OpenSignup,
+		"Base":             s.BaseURL(),
+		"AppDomain":        s.cfg.AppDomain,
+		"ContainerHosting": s.appRunner != nil,
 	})
 }
 
+func (s *Server) handleLaunch(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.AppDomain == "" {
+		http.Error(w, "app hosting is not enabled on this instance", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_ = s.tmpl.ExecuteTemplate(w, "launch.html", map[string]any{
+		"Instance":         s.st.Instance(),
+		"Base":             s.BaseURL(),
+		"AppDomain":        s.cfg.AppDomain,
+		"ContainerHosting": s.appRunner != nil,
+	})
+}
+
+func (s *Server) handleLaunchAsset(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name != "agent-hosting-hero.webp" && name != "agent-hosting-detail.webp" && name != "agent-hosting-hero.jpg" {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := templateFS.ReadFile("static/launch/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	contentType := "image/webp"
+	if strings.HasSuffix(name, ".jpg") {
+		contentType = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Write(data)
+}
+
 // Version is stamped at build time via -ldflags; keep a sane default.
-var Version = "0.1.0-dev"
+var Version = "0.6.0-dev"

@@ -116,6 +116,36 @@ func (e *env) upload(key, name string, data []byte, query string) map[string]any
 	return out
 }
 
+func TestLaunchPageServesEmbeddedArtwork(t *testing.T) {
+	e := newEnvCfg(t, Config{AppDomain: testAppDomain, BehindProxy: true})
+	resp, body := e.do(http.MethodGet, "/launch", "", nil, "")
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("agent-hosting-hero.webp")) {
+		t.Fatalf("launch page: HTTP %d body=%q", resp.StatusCode, body)
+	}
+	for _, name := range []string{"agent-hosting-hero.webp", "agent-hosting-detail.webp"} {
+		resp, body = e.do(http.MethodGet, "/static/launch/"+name, "", nil, "")
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/webp" || len(body) < 1024 || !bytes.HasPrefix(body, []byte("RIFF")) {
+			t.Fatalf("launch asset %s: HTTP %d type=%q bytes=%d", name, resp.StatusCode, resp.Header.Get("Content-Type"), len(body))
+		}
+		if got := resp.Header.Get("Cache-Control"); got != "public, max-age=3600" {
+			t.Fatalf("launch asset %s cache=%q", name, got)
+		}
+	}
+	resp, body = e.do(http.MethodGet, "/static/launch/agent-hosting-hero.jpg", "", nil, "")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/jpeg" || len(body) < 1024 || !bytes.HasPrefix(body, []byte{0xff, 0xd8}) {
+		t.Fatalf("launch social image: HTTP %d type=%q bytes=%d", resp.StatusCode, resp.Header.Get("Content-Type"), len(body))
+	}
+	resp, _ = e.do(http.MethodGet, "/static/launch/not-embedded.webp", "", nil, "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown launch asset: HTTP %d", resp.StatusCode)
+	}
+	disabled := newEnv(t)
+	resp, _ = disabled.do(http.MethodGet, "/launch", "", nil, "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("static-only launch page: HTTP %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestFullHandoffFlow(t *testing.T) {
 	e := newEnv(t)
 	_, aliceKey := e.createAgent("alice")
@@ -152,6 +182,12 @@ func TestFullHandoffFlow(t *testing.T) {
 	code = e.doJSON("POST", "/v1/send", aliceKey, send, &replay, "Idempotency-Key", "k1")
 	if code != 200 || replay.MessageID != sent.MessageID {
 		t.Fatalf("idempotent replay failed: HTTP %d %q vs %q", code, replay.MessageID, sent.MessageID)
+	}
+	replayRequest, _ := json.Marshal(send)
+	replayResp, replayRaw := e.do("POST", "/v1/send", aliceKey, bytes.NewReader(replayRequest), "application/json", "Idempotency-Key", "k1")
+	if replayResp.StatusCode != http.StatusOK || replayResp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("idempotent replay headers/status: HTTP %d Cache-Control=%q body=%s",
+			replayResp.StatusCode, replayResp.Header.Get("Cache-Control"), replayRaw)
 	}
 
 	// Bob's inbox has exactly one message with a trusted offer.
@@ -217,6 +253,9 @@ func TestFullHandoffFlow(t *testing.T) {
 	resp, data = e.do("GET", "/v1/receipts/export", e.admin, nil, "")
 	if resp.StatusCode != 200 {
 		t.Fatalf("export: HTTP %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("receipt export Cache-Control = %q, want no-store", got)
 	}
 	rs, err := receipt.ReadJSONL(bytes.NewReader(data))
 	if err != nil {

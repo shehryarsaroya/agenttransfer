@@ -513,6 +513,7 @@ func (h *connectHost) handleVerifyMail(w http.ResponseWriter, r *http.Request, n
 // the agent flow, the GET consumes nothing — mail-scanner prefetches must not
 // be able to verify an instance; only the explicit confirm POST does.
 func (h *connectHost) handleVerify(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	tok := r.URL.Query().Get("t")
 	slot, err := h.s.st.PeekVerifyToken(tok)
 	if err != nil {
@@ -537,6 +538,7 @@ func (h *connectHost) handleVerify(w http.ResponseWriter, r *http.Request) {
 // handleVerifyConfirm (POST) consumes the token and unlocks outbound email
 // for the tunneled instance.
 func (h *connectHost) handleVerifyConfirm(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	tok := r.URL.Query().Get("t")
 	if tok == "" {
 		tok = r.FormValue("t")

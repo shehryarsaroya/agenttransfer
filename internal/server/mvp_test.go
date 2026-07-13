@@ -183,6 +183,14 @@ func TestVerifyConfirmFlow(t *testing.T) {
 	if resp.StatusCode != 200 || !bytes.Contains(body, []byte("Confirm")) {
 		t.Fatalf("verify page: HTTP %d %s", resp.StatusCode, body)
 	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("verify Cache-Control = %q", got)
+	}
+	for _, disclosure := range []string{"full persistent storage", "publish an app or website"} {
+		if !bytes.Contains(body, []byte(disclosure)) {
+			t.Fatalf("verification page omitted %q consent: %s", disclosure, body)
+		}
+	}
 	if verified() {
 		t.Fatal("GET /verify consumed the token — scanner-clickable verification")
 	}
@@ -222,6 +230,9 @@ func TestConnectVerifyConfirmFlow(t *testing.T) {
 	if resp.StatusCode != 200 || !bytes.Contains(body, []byte("Confirm")) {
 		t.Fatalf("connect verify page: HTTP %d %s", resp.StatusCode, body)
 	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("connect verify Cache-Control = %q", got)
+	}
 	if ci, _ := e.srv.Store().ConnectInstanceByName("misty-owl-11"); ci.Verified {
 		t.Fatal("GET /connect/verify verified the instance")
 	}
@@ -237,6 +248,26 @@ func TestConnectVerifyConfirmFlow(t *testing.T) {
 }
 
 // ---- the recipient circle ----
+
+func TestSignupCanonicalizesOwnerMailbox(t *testing.T) {
+	e := newEnv(t)
+	var out struct {
+		AgentID    string `json:"agent_id"`
+		OwnerEmail string `json:"owner_email"`
+	}
+	if code := e.doJSON(http.MethodPost, "/v1/agents", e.admin, map[string]any{
+		"name": "canonical-owner", "owner_email": "Alice Example <ALICE@EXAMPLE.COM>",
+	}, &out); code != http.StatusCreated {
+		t.Fatalf("signup: HTTP %d", code)
+	}
+	if out.OwnerEmail != "alice@example.com" {
+		t.Fatalf("owner email = %q", out.OwnerEmail)
+	}
+	agent, err := e.srv.st.AgentByID(out.AgentID)
+	if err != nil || agent.OwnerEmail != "alice@example.com" {
+		t.Fatalf("stored agent = %+v err=%v", agent, err)
+	}
+}
 
 func TestRecipientCircle(t *testing.T) {
 	sinkAddr, sink := newSMTPSink(t)
@@ -287,6 +318,11 @@ func TestRecipientCircle(t *testing.T) {
 	if code, _ := send("sam@own.test", false); code != 201 {
 		t.Fatalf("owner as recipient: %d, want 201", code)
 	}
+	// Display names are accepted at the API edge but canonicalized before the
+	// SMTP envelope, suppression keys, and recipient-circle accounting.
+	if code, _ := send("Human One <H1@X.TEST>", false); code != 201 {
+		t.Fatalf("display-name repeat recipient: %d, want 201", code)
+	}
 	if n := circleUsed(); n != 3 {
 		t.Fatalf("circle used after repeat+owner = %v, want 3", n)
 	}
@@ -294,6 +330,15 @@ func TestRecipientCircle(t *testing.T) {
 	// cc_owner rides free too.
 	if code, out := send("h2@x.test", true); code != 201 || out["cc_owner"] != "sent to sam@own.test" {
 		t.Fatalf("cc_owner send: %d %v", code, out["cc_owner"])
+	}
+	// Addressing the owner directly and requesting cc_owner is still one
+	// message, not a duplicate accountability copy.
+	beforeOwner := len(sink.all())
+	if code, out := send("SAM@OWN.TEST", true); code != 201 || out["cc_owner"] != "already included as recipient" {
+		t.Fatalf("owner recipient + cc_owner: %d %v", code, out["cc_owner"])
+	}
+	if got := len(sink.all()) - beforeOwner; got != 1 {
+		t.Fatalf("owner recipient + cc_owner relayed %d messages, want 1", got)
 	}
 
 	// The operator can widen the circle.
@@ -313,6 +358,9 @@ func TestRecipientCircle(t *testing.T) {
 	for _, m := range sink.all() {
 		if len(m.Rcpts) != 1 {
 			t.Fatalf("expected single-recipient messages, got %v", m.Rcpts)
+		}
+		if strings.ContainsAny(m.Rcpts[0], "<>") {
+			t.Fatalf("SMTP envelope retained display-name syntax: %q", m.Rcpts[0])
 		}
 		in, err := mail.ParseInbound(bytes.NewReader(m.Data), 1<<20)
 		if err != nil {
@@ -565,6 +613,9 @@ func TestUnsubscribeFlow(t *testing.T) {
 	resp, body := e.do("GET", "/unsubscribe?e="+url.QueryEscape(addr)+"&t="+good, "", nil, "")
 	if resp.StatusCode != 200 || !bytes.Contains(body, []byte("Unsubscribe")) {
 		t.Fatalf("unsubscribe page: HTTP %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("unsubscribe Cache-Control = %q", got)
 	}
 	if e.srv.Store().IsSuppressed(addr) {
 		t.Fatal("GET /unsubscribe suppressed the address")

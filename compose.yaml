@@ -8,6 +8,9 @@ services:
       # OUTBOUND: resend:re_xxxxxxxxxxxx
       # ACME_EMAIL: you@example.com
       # OPEN_SIGNUP: "false"
+      # APP_DOMAIN: agents.example.com   # alice@... -> https://alice.agents.example.com
+      # Dynamic container apps use the separate app-runner service/process;
+      # static sites need no Docker socket or additional process.
       DATA_DIR: /data
     ports:
       - "443:443"

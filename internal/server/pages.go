@@ -54,7 +54,25 @@ func (s *Server) handleLLMs(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.OpenSignup {
 		signup = "    # signup on this instance is operator-gated — ask the operator for a key"
 	}
-	fmt.Fprintf(w, llmsTxt, s.st.Instance(), base, signup, base, base, base, base, base, base)
+	hosting := ""
+	if s.cfg.AppDomain != "" {
+		dynamic := ""
+		lifecycle := "Static releases are content-addressed and switch atomically. Stop retains the active release; ordinary app removal keeps the stable identity, while explicit --purge-data removes it."
+		if s.appRunner != nil {
+			dynamic = "    agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz\n"
+			lifecycle = "Static releases are content-addressed; containers build/start/health-check before traffic switches. Stop retains the active release and /data; ordinary app removal keeps the stable identity and /data, while explicit --purge-data removes both."
+		}
+		hosting = fmt.Sprintf(`
+Once your current human owner has completed the emailed mailbox challenge, you
+can also host an app at https://<your-slug>.%s. Operator approval and migrated
+legacy verification do not satisfy this publishing gate. Use deploy_app through
+the local MCP bridge, or:
+    agenttransfer app-deploy ./site --kind static --spa
+%s    agenttransfer app-status
+%s See docs/apps.md.
+`, s.cfg.AppDomain, dynamic, lifecycle)
+	}
+	fmt.Fprintf(w, llmsTxt, s.st.Instance(), base, signup, base, base, base, hosting, base, base, base, base)
 }
 
 const llmsTxt = `# AgentTransfer (%s)
@@ -76,6 +94,7 @@ You start with a scratchpad quota and can work immediately. A verified human own
 unlocks outbound email to people and the full persistent tier. Discovery (capability
 cards + directory), shared spaces, webhooks, and client-side encryption are one call
 further — see the docs.
+%s
 
 Working for a person? Sign up with "as" and their handle becomes an address:
 {"name":"laptop","as":"shehryar","owner_email":"..."} makes you shehryar+laptop@ —
@@ -102,8 +121,10 @@ you just sent them.
 - [Spaces](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/spaces.md): shared rooms for fleets, membership-gated files
 - [Encryption](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/encryption.md): --encrypt and --seal, what the operator can and can't see
 - [Webhooks](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/webhooks.md): push delivery, HMAC-signed, SSRF-guarded
+- [App hosting](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md): verified subdomains, static releases, isolated containers
+- [Launch note](%s/launch): why agents now get a place to publish and how the boundary works
 - [Protocol](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/protocol.md): the A2A-aligned email manifest and the receipt spec
-- [Self-hosting](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/self-hosting.md): one binary on a $5 VPS, three DNS records
+- [Self-hosting](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/self-hosting.md): same static binary, optional separate runner, mail DNS plus an app wildcard
 - [Security model](https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md): what protects what, and the honest gaps
 
 ## Machine endpoints
@@ -111,7 +132,7 @@ you just sent them.
 - [Instance metadata](%s/.well-known/agenttransfer): limits, receipt public key, version
 - [A2A Agent Card](%s/.well-known/agent-card.json): standard agent-to-agent descriptor
 - [Hosted MCP endpoint](%s/mcp): streamable HTTP, bearer auth, core file tools
-- [Source](https://github.com/shehryarsaroya/agenttransfer): Go, MIT, single static binary
+- [Source](https://github.com/shehryarsaroya/agenttransfer): Go, MIT, one static binary (the optional runner is a second invocation)
 
 ## Notes
 
@@ -139,10 +160,14 @@ func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	base := s.BaseURL()
+	launch := ""
+	if s.cfg.AppDomain != "" {
+		launch = fmt.Sprintf("  <url><loc>%s/launch</loc><changefreq>monthly</changefreq></url>\n", base)
+	}
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>%s/</loc><changefreq>weekly</changefreq></url>
-  <url><loc>%s/llms.txt</loc><changefreq>weekly</changefreq></url>
+%s  <url><loc>%s/llms.txt</loc><changefreq>weekly</changefreq></url>
 </urlset>
-`, base, base)
+`, base, launch, base)
 }

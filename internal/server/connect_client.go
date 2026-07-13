@@ -351,26 +351,32 @@ func (c *connectClient) ingestRaw(rcpts []string, raw []byte) error {
 	if err != nil {
 		return nil // unparseable: drop (acked), like SMTP's 554
 	}
+	ensureInboundMessageID(in, raw)
 	dkimResult := verifyDKIM(raw, domainOfAddr(in.From))
 	instance := c.s.st.Instance()
+	delivered := map[string]bool{}
 	for _, rcpt := range rcpts {
 		localpart, domain, ok := strings.Cut(strings.ToLower(rcpt), "@")
 		if !ok || domain != instance {
 			continue
 		}
-		localpart, _, _ = strings.Cut(localpart, "+")
-		agent, err := c.s.st.AgentByName(localpart)
-		if err != nil {
-			continue // recipient agent no longer exists
-		}
-		// Drains are at-least-once (an ack can be lost across a tunnel drop);
-		// skip a message this agent already holds so re-delivery doesn't
-		// duplicate the inbox row or the signed receipt.
-		if c.s.st.HasMessageID(agent.ID, in.MessageID) {
-			continue
-		}
-		if err := c.s.ingestInbound(agent, in.From, in, dkimResult); err != nil {
-			return err
+		// Use exactly the same plus-address/person-fanout resolver as direct
+		// SMTP. Stripping '+' and looking up the base name loses specific
+		// handle+agent addresses and breaks person delivery.
+		for _, agent := range c.s.resolveLocalRecipient(localpart) {
+			if delivered[agent.ID] {
+				continue
+			}
+			delivered[agent.ID] = true
+			// Drains are at-least-once (an ack can be lost across a tunnel drop);
+			// skip a message this agent already holds so re-delivery doesn't
+			// duplicate the inbox row or the signed receipt.
+			if c.s.st.HasMessageID(agent.ID, in.MessageID) {
+				continue
+			}
+			if err := c.s.ingestInbound(agent, in.From, in, dkimResult); err != nil {
+				return err
+			}
 		}
 	}
 	c.s.metrics.inboundMail.Add(1)

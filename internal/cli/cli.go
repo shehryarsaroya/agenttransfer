@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -94,24 +95,62 @@ func readFileConfig() (clientConfig, error) {
 
 // api is a tiny authenticated HTTP client.
 type api struct {
-	base string
-	key  string
-	hc   *http.Client
+	base   string
+	key    string
+	hc     *http.Client
+	longHC *http.Client
 }
 
 func newAPI(c clientConfig) *api {
-	return &api{base: strings.TrimRight(c.URL, "/"), key: c.APIKey, hc: &http.Client{
-		// No overall Timeout: a multi-GB upload/download must stream for as
-		// long as it needs (a 10-minute cap truncated real 5 GB transfers).
-		// Bound the connect and response-header stages instead, so a dead
-		// server still fails fast without cutting off a slow-but-live stream.
-		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		},
-	}}
+	base := strings.TrimRight(c.URL, "/")
+	newClient := func(responseHeaderTimeout time.Duration) *http.Client {
+		return &http.Client{
+			// No overall Timeout: a multi-GB upload/download must stream for as
+			// long as it needs (a 10-minute cap truncated real 5 GB transfers).
+			// Bound the connect and response-header stages instead, so a dead
+			// server still fails fast without cutting off a slow-but-live stream.
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: responseHeaderTimeout,
+				IdleConnTimeout:       90 * time.Second,
+			},
+			// Go may forward Authorization to subdomains on redirects. Hosted apps
+			// deliberately live on subdomains, so an authenticated control-plane
+			// request must never follow a redirect off the exact instance origin.
+			CheckRedirect: exactOriginRedirects(base),
+		}
+	}
+	return &api{
+		base: base,
+		key:  c.APIKey,
+		hc:   newClient(60 * time.Second),
+		// App deployment is synchronous: a source build may consume the full
+		// default 15-minute runner deadline before its health check. Keep the
+		// ordinary API fail-fast behavior while giving this one operation enough
+		// time to return response headers. Bodies remain untimed and streamed.
+		longHC: newClient(30 * time.Minute),
+	}
+}
+
+// exactOriginRedirects rejects a redirect away from base when the original
+// request carried credentials. Unauthenticated downloads may still follow
+// redirects (for example to a CDN), but authenticated API keys can never reach
+// an agent-controlled app subdomain or another origin.
+func exactOriginRedirects(base string) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if len(via) == 0 {
+			return nil
+		}
+		if via[0].Header.Get("Authorization") != "" && !sameOrigin(req.URL.String(), base) {
+			req.Header.Del("Authorization")
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
 }
 
 // sameOrigin reports whether rawURL targets the exact same scheme+host as base.
@@ -147,6 +186,10 @@ func looksEncrypted(path string) bool {
 }
 
 func (a *api) req(method, path string, body io.Reader, contentType string) (*http.Response, error) {
+	return a.reqWithClient(a.hc, method, path, body, contentType)
+}
+
+func (a *api) reqWithClient(hc *http.Client, method, path string, body io.Reader, contentType string) (*http.Response, error) {
 	req, err := http.NewRequest(method, a.base+path, body)
 	if err != nil {
 		return nil, err
@@ -155,10 +198,22 @@ func (a *api) req(method, path string, body io.Reader, contentType string) (*htt
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	return a.hc.Do(req)
+	return hc.Do(req)
 }
 
 func (a *api) json(method, path string, in any, out any) error {
+	return a.jsonWithClient(a.hc, method, path, in, out)
+}
+
+func (a *api) jsonLong(method, path string, in any, out any) error {
+	hc := a.longHC
+	if hc == nil {
+		hc = a.hc
+	}
+	return a.jsonWithClient(hc, method, path, in, out)
+}
+
+func (a *api) jsonWithClient(hc *http.Client, method, path string, in any, out any) error {
 	var body io.Reader
 	if in != nil {
 		buf, err := json.Marshal(in)
@@ -167,7 +222,7 @@ func (a *api) json(method, path string, in any, out any) error {
 		}
 		body = strings.NewReader(string(buf))
 	}
-	resp, err := a.req(method, path, body, "application/json")
+	resp, err := a.reqWithClient(hc, method, path, body, "application/json")
 	if err != nil {
 		return err
 	}
@@ -177,6 +232,9 @@ func (a *api) json(method, path string, in any, out any) error {
 		return apiError(resp.StatusCode, data)
 	}
 	if out != nil {
+		if len(bytes.TrimSpace(data)) == 0 {
+			return nil
+		}
 		return json.Unmarshal(data, out)
 	}
 	return nil
@@ -296,6 +354,16 @@ func Run(args []string) int {
 		err = cmdSpacePull(rest)
 	case "space-watch":
 		err = cmdSpaceWatch(rest)
+	case "app-deploy":
+		err = cmdAppDeploy(rest)
+	case "app-status":
+		err = cmdAppStatus(rest)
+	case "app-logs":
+		err = cmdAppLogs(rest)
+	case "app-stop":
+		err = cmdAppStop(rest)
+	case "app-rm":
+		err = cmdAppRemove(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
 		usage()
@@ -353,6 +421,15 @@ discovery & spaces (agent-to-agent coordination):
   agenttransfer space-pull <id> <sha> <outfile>                download a file shared in the space (verifies sha256)
   agenttransfer space-watch <id> [--since N]                   long-poll the event stream (Ctrl-C to stop)
 
+app hosting (verified agents):
+  agenttransfer app-deploy <dir|archive> [--kind static] [--spa]
+  agenttransfer app-deploy <dir|archive> --kind container [--port 8080] [--health-path /healthz] [--env KEY=VALUE] [--command ARG]
+  agenttransfer app-deploy --image IMAGE [--port 8080] [--health-path /healthz] [--env KEY=VALUE] [--command ARG]
+  agenttransfer app-status
+  agenttransfer app-logs [--tail 200]
+  agenttransfer app-stop
+  agenttransfer app-rm [--purge-data]
+
 Flags may go before or after positional arguments.
 env: AGENTTRANSFER_URL + AGENTTRANSFER_KEY override the config file;
      AGENTTRANSFER_ADMIN_TOKEN for "agents create" / "verify <url>";
@@ -398,7 +475,8 @@ func cmdSignup(args []string) error {
 	}
 	base := strings.TrimRight(pos[0], "/")
 
-	a := &api{base: base, hc: &http.Client{Timeout: 30 * time.Second}}
+	a := newAPI(clientConfig{URL: base})
+	a.hc.Timeout = 30 * time.Second
 	var out struct {
 		Name          string `json:"name"`
 		Email         string `json:"email"`
@@ -562,7 +640,7 @@ func cmdPut(args []string) error {
 	if *once {
 		q.Set("once", "1")
 	}
-	path := "/v1/files/" + name
+	path := "/v1/files/" + url.PathEscape(name)
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
@@ -655,7 +733,7 @@ func cmdSend(args []string) error {
 	}
 	defer body.Close()
 
-	resp, err := a.req("PUT", "/v1/files/"+name, body, "application/octet-stream")
+	resp, err := a.req("PUT", "/v1/files/"+url.PathEscape(name), body, "application/octet-stream")
 	if err != nil {
 		return err
 	}
@@ -1265,9 +1343,19 @@ func cmdVerify(args []string) error {
 
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		base := strings.TrimRight(src, "/")
-		resp, err := http.Get(base + "/.well-known/agenttransfer")
+		verifyAPI := newAPI(clientConfig{URL: base})
+		req, err := http.NewRequest("GET", base+"/.well-known/agenttransfer", nil)
 		if err != nil {
 			return err
+		}
+		resp, err := verifyAPI.hc.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode >= 300 {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return apiError(resp.StatusCode, data)
 		}
 		var wk struct {
 			ReceiptPubkey string `json:"receipt_pubkey"`
@@ -1282,9 +1370,8 @@ func cmdVerify(args []string) error {
 		if tok == "" {
 			return errors.New("set AGENTTRANSFER_ADMIN_TOKEN to fetch the full export from an instance")
 		}
-		req, _ := http.NewRequest("GET", base+"/v1/receipts/export", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		resp2, err := http.DefaultClient.Do(req)
+		verifyAPI.key = tok
+		resp2, err := verifyAPI.req("GET", "/v1/receipts/export", nil, "")
 		if err != nil {
 			return err
 		}
@@ -1350,7 +1437,9 @@ func cmdRotateKey(args []string) error {
 	return nil
 }
 
-// cmdDeleteSelf removes the logged-in agent and clears the local config.
+// cmdDeleteSelf removes the logged-in agent. It clears the saved login only
+// when that file supplied the credentials; env-auth may intentionally point at
+// a different temporary agent and must never erase an unrelated saved login.
 func cmdDeleteSelf(args []string) error {
 	a, err := client()
 	if err != nil {
@@ -1361,8 +1450,11 @@ func cmdDeleteSelf(args []string) error {
 		return err
 	}
 	fmt.Printf("✓ deleted %v — your key is dead; receipts are kept on the instance\n", out["deleted"])
-	if p, err := configPath(); err == nil {
-		_ = os.Remove(p)
+	envAuth := strings.TrimSpace(os.Getenv("AGENTTRANSFER_URL")) != "" && strings.TrimSpace(os.Getenv("AGENTTRANSFER_KEY")) != ""
+	if !envAuth {
+		if p, err := configPath(); err == nil {
+			_ = os.Remove(p)
+		}
 	}
 	return nil
 }
@@ -1394,7 +1486,8 @@ func cmdAgents(args []string) error {
 	if *adminToken == "" {
 		return errors.New("--admin-token (or AGENTTRANSFER_ADMIN_TOKEN) is required")
 	}
-	a := &api{base: strings.TrimRight(base, "/"), key: *adminToken, hc: &http.Client{Timeout: 30 * time.Second}}
+	a := newAPI(clientConfig{URL: strings.TrimRight(base, "/"), APIKey: *adminToken})
+	a.hc.Timeout = 30 * time.Second
 
 	if sub == "rm" {
 		if len(pos) < 1 {

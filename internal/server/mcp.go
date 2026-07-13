@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -94,7 +95,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			s.rpcReply(w, req.ID, nil, &rpcError{-32602, "invalid params"})
 			return
 		}
-		out, callErr := s.mcpCall(agent, p.Name, p.Arguments)
+		out, callErr := s.mcpCall(r.Context(), agent, p.Name, p.Arguments)
 		if callErr != nil {
 			// Tool-level failures are results with isError, not RPC errors.
 			s.rpcReply(w, req.ID, map[string]any{
@@ -223,9 +224,35 @@ var mcpTools = []map[string]any{
 		"description": "Your signed receipt trail (uploads, sends, downloads, expiries).",
 		"inputSchema": obj(map[string]any{"limit": intp("max receipts")}),
 	},
+	{
+		"name":        "app_status",
+		"description": "Get this agent's hosted app eligibility, public URL, status, active deployment, and storage usage.",
+		"inputSchema": obj(map[string]any{}),
+	},
+	{
+		"name":        "deploy_app_image",
+		"description": "Deploy an OCI image as this verified agent's hosted app. Hosted HTTP MCP cannot read local paths or upload source/static bundles; for those, run the local stdio bridge and call deploy_app with a local path.",
+		"inputSchema": obj(map[string]any{
+			"image":       str("OCI image reference (required)"),
+			"port":        intp("container HTTP port (default 8080)"),
+			"env":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "container environment variables; values are never returned"},
+			"command":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "container argv override"},
+			"health_path": str("HTTP health-check path inside the app (default /)"),
+		}, "image"),
+	},
+	{
+		"name":        "app_logs",
+		"description": "Read a bounded tail of this verified agent's container app logs.",
+		"inputSchema": obj(map[string]any{"tail": intp("recent lines, 1-2000 (default 200)")}),
+	},
+	{
+		"name":        "stop_app",
+		"description": "Stop this verified agent's running app without deleting its configuration or data.",
+		"inputSchema": obj(map[string]any{}),
+	},
 }
 
-func (s *Server) mcpCall(agent store.Agent, name string, args json.RawMessage) (any, error) {
+func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, args json.RawMessage) (any, error) {
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
 	}
@@ -494,6 +521,124 @@ func (s *Server) mcpCall(agent store.Agent, name string, args json.RawMessage) (
 			"receipt_pubkey": receipt.FormatPublicKey(s.st.PublicKey()),
 			"receipts":       rs,
 		}, nil
+
+	case "app_status":
+		eligible, reason := s.appEligibility(agent)
+		app, err := s.st.AppByAgentID(agent.ID)
+		if errors.Is(err, store.ErrNotFound) && eligible {
+			app, err = s.st.EnsureApp(agent.ID, agent.Name)
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			return map[string]any{"eligible": false, "reason": reason, "domain": s.cfg.AppDomain}, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("app identity: %w", err)
+		}
+		out := map[string]any{"eligible": eligible, "domain": s.cfg.AppDomain, "app": s.appView(ctx, agent, app)}
+		if reason != "" {
+			out["reason"] = reason
+		}
+		return out, nil
+
+	case "deploy_app":
+		// The local stdio bridge owns path-based deployment because only it can
+		// read the caller's filesystem and stream a bundle without putting bytes
+		// in model context. Keep this alias as a useful error for clients that use
+		// the local tool name against hosted MCP.
+		return nil, errors.New("hosted MCP cannot access local paths or deploy source/static bundles; run the local stdio bridge and call deploy_app there, or use deploy_app_image with an OCI image")
+
+	case "deploy_app_image":
+		if len(args) > 1<<20 {
+			return nil, errors.New("deployment configuration exceeds 1MiB")
+		}
+		var p struct {
+			Image      string            `json:"image"`
+			Port       int               `json:"port"`
+			Env        map[string]string `json:"env"`
+			Command    []string          `json:"command"`
+			HealthPath string            `json:"health_path"`
+			// Give path/source callers the intended local-bridge explanation,
+			// even though these fields are deliberately absent from tools/list.
+			Path   string `json:"path"`
+			Source string `json:"source"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(p.Path) != "" || strings.TrimSpace(p.Source) != "" {
+			return nil, errors.New("hosted MCP cannot upload local source; run the local stdio bridge and call deploy_app with that path")
+		}
+		p.Image = strings.TrimSpace(p.Image)
+		if p.Image == "" {
+			return nil, errors.New("image is required; source/static deployment is available through the local stdio bridge's deploy_app tool")
+		}
+		if p.Port == 0 {
+			p.Port = 8080
+		}
+		if p.Port < 1 || p.Port > 65535 {
+			return nil, errors.New("port must be between 1 and 65535")
+		}
+		if len(p.Env) > 64 {
+			return nil, errors.New("at most 64 environment variables are allowed")
+		}
+		if len(p.Command) > 64 {
+			return nil, errors.New("command has too many arguments (max 64)")
+		}
+		if p.HealthPath == "" {
+			p.HealthPath = "/"
+		}
+		if err := validateAppHealthPath(p.HealthPath); err != nil {
+			return nil, err
+		}
+		app, deployment, err := s.deployAgentApp(ctx, agent, appDeployRequest{
+			Kind: store.AppKindContainer, Image: p.Image, Port: p.Port,
+			Env: p.Env, Command: p.Command, HealthPath: p.HealthPath,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"app": s.appView(ctx, agent, app),
+			// Do not return deployment.Config here. It currently contains only
+			// env keys, but omitting it makes secret non-disclosure structural if
+			// the stored config grows in the future.
+			"deployment": map[string]any{
+				"id": deployment.ID, "kind": deployment.Kind,
+				"status": deployment.Status, "created_at": deployment.CreatedAt,
+				"activated_at": deployment.ActivatedAt,
+			},
+		}, nil
+
+	case "app_logs":
+		var p struct {
+			Tail int `json:"tail"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		if p.Tail == 0 {
+			p.Tail = 200
+		}
+		if p.Tail < 1 || p.Tail > 2000 {
+			return nil, errors.New("tail must be between 1 and 2000")
+		}
+		logs, status, err := s.appRuntimeLogs(ctx, agent.ID, p.Tail)
+		if err != nil {
+			return nil, fmt.Errorf("logs failed: %w", err)
+		}
+		const maxMCPLogBytes = 256 << 10
+		truncated := len(logs) > maxMCPLogBytes
+		if truncated {
+			logs = "[older output truncated]\n" + logs[len(logs)-maxMCPLogBytes:]
+		}
+		return map[string]any{"logs": logs, "status": status, "truncated": truncated}, nil
+
+	case "stop_app":
+		app, err := s.stopAgentApp(ctx, agent)
+		if err != nil {
+			return nil, fmt.Errorf("stop failed: %w", err)
+		}
+		return map[string]any{"app": s.appView(ctx, agent, app)}, nil
 	}
 	return nil, fmt.Errorf("unknown tool %q", name)
 }

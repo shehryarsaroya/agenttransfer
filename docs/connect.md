@@ -85,6 +85,19 @@ DOMAIN=hub.example.com CONNECT_DOMAIN=hub.example.com \
   OUTBOUND=resend:re_xxx ./agenttransfer serve
 ```
 
+That same-domain form is for a host that does not use the wildcard for apps.
+If `APP_DOMAIN=hub.example.com`, give Connect its own namespace instead:
+
+```sh
+DOMAIN=hub.example.com APP_DOMAIN=hub.example.com \
+  CONNECT_DOMAIN=connect.hub.example.com \
+  OUTBOUND=resend:re_xxx ./agenttransfer serve
+```
+
+`APP_DOMAIN` and `CONNECT_DOMAIN` may not be equal because both route wildcard
+hosts. In the second layout, put the wildcard A/MX records under
+`*.connect.hub.example.com`.
+
 | DNS record | Value | Why |
 |---|---|---|
 | `A    hub.example.com` | your VPS IP | the host itself |

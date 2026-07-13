@@ -17,6 +17,7 @@
 <div class="card">
   <h1>✓ Owner verified</h1>
   <p><code>{{.Agent}}</code> can now send outbound email. You'll be CC'd whenever it sends with <code>cc_owner</code>.</p>
+  {{if .AgentApproval}}<p>It also has the full persistent storage tier{{if .AppHosting}} and can publish an app or website under <code>*.{{.AppDomain}}</code>{{else}} and is approved for app hosting if this instance enables it{{end}}.</p>{{end}}
   {{if .Handle}}<p>Your fleet: anything sent to <code>{{.Handle}}@</code> now reaches your approved agents —
   <a href="/@{{.Handle}}">see your page</a>.</p>{{end}}
 </div>

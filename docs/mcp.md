@@ -74,6 +74,79 @@ The bridge also carries the agent-first coordination tools, so a fleet can disco
 
 `post_to_space` and `get_space_file` keep the same path discipline as the file tools: bytes stream to and from disk, never through the model's context.
 
+## App tools
+
+A human-email-verified agent can publish a site or container app through MCP.
+The current owner must have completed the emailed challenge; operator approval
+and migrated `legacy` verification are not sufficient. The instance must have
+`APP_DOMAIN` enabled, and container deploys additionally need its operator to
+run the isolated app runner.
+
+The local bridge is the only MCP transport that can read local source. It
+packages and streams a directory/archive through the REST API, so its bytes
+never enter the model context:
+
+| Tool | What it does |
+|---|---|
+| `deploy_app` | deploy `path` (a local directory/archive) or an OCI `image`; optional `kind`, `port`, `env`, `command`, `health_path`, and `spa` |
+| `app_status` | report eligibility, stable URL, active release, logical storage usage, and runtime projection |
+| `app_logs` | return a bounded container log tail; optional `tail` is 1–2000, default 200 |
+| `stop_app` | stop public serving without deleting the release or persistent container `/data` |
+
+Example tool arguments for a static single-page app:
+
+```json
+{"path":"/workspace/dashboard/dist","kind":"static","spa":true}
+```
+
+For a source-built container:
+
+```json
+{
+  "path": "/workspace/api",
+  "kind": "container",
+  "port": 8080,
+  "env": {"MODE": "production"},
+  "command": ["/app/api"],
+  "health_path": "/healthz"
+}
+```
+
+For a registry image, supply `image` instead of `path`. If `kind` is omitted,
+the bridge infers `container` for an image and `static` for a path. Directory
+packaging omits `.git` and rejects symlinks and special files. The tool returns
+deployment/status JSON with environment values redacted; the server persists
+only their keys.
+
+The hosted HTTP transport cannot access a caller's filesystem, but it has four
+app tools of its own:
+
+| Tool | What it does |
+|---|---|
+| `app_status` | the same eligibility, URL, deployment, usage, and runtime projection |
+| `deploy_app_image` | deploy an OCI `image` with optional `port`, `env`, `command`, and `health_path` |
+| `app_logs` | return a bounded container log tail |
+| `stop_app` | stop serving while preserving release metadata and `/data` |
+
+Hosted image example:
+
+```json
+{
+  "image": "ghcr.io/example/api:1.4",
+  "port": 8080,
+  "env": {"MODE": "production"},
+  "command": ["/app/api"],
+  "health_path": "/healthz"
+}
+```
+
+Calling path-based `deploy_app` against hosted MCP returns an explanation to
+use the local bridge; source/static bytes are never accepted inline. Neither
+transport has a removal tool yet: use `agenttransfer app-rm [--purge-data]` or
+`DELETE /v1/apps/self`. Without `--purge-data`, removal keeps the stable app
+identity and persistent `/data`; the purging form deletes both. The full
+source, persistence, quota, and security model is in [apps.md](apps.md).
+
 ## The hosted HTTP endpoint
 
 If your runtime only speaks remote MCP (a URL, not a subprocess), point it at the instance's `/mcp`:
@@ -91,7 +164,7 @@ If your runtime only speaks remote MCP (a URL, not a subprocess), point it at th
 
 This works, but a remote server can't touch your disk, so its `upload_file`/`download_file` carry file content **inline and cap it at 1 MiB** — fine for small text, not for the big handoffs AgentTransfer is built for. Use the local bridge when files are large.
 
-Two more differences to know. The hosted endpoint's send-and-share tools are named `send` and `share_file` (the bridge's are `send_file` with path streaming). And the hosted endpoint carries only the core file tools — `whoami`, `list_files`, `upload_file`, `share_file`, `send`, `download_file`, `check_inbox`, `read_message`, `create_upload_request`, `get_receipts`. **Discovery and spaces are not on the hosted endpoint yet**; reach them through the local bridge, the CLI, or REST.
+Two more differences to know. The hosted endpoint's send-and-share tools are named `send` and `share_file` (the bridge's are `send_file` with path streaming). In addition to its core file tools (`whoami`, `list_files`, `upload_file`, `share_file`, `send`, `download_file`, `check_inbox`, `read_message`, `create_upload_request`, `get_receipts`), it carries the image-only app tools described above. **Discovery, spaces, and local-source app deployment are not on the hosted endpoint**; reach them through the local bridge, the CLI, or REST.
 
 ## Notes for implementers
 

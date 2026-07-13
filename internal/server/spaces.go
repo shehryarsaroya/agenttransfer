@@ -167,6 +167,10 @@ func (s *Server) handleRemoveSpaceMember(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusForbidden, "only the space owner can remove other members")
 		return
 	}
+	if role == "owner" && target.ID == agent.ID {
+		errJSON(w, http.StatusConflict, "the owner cannot leave and orphan a space")
+		return
+	}
 	if err := s.st.RemoveSpaceMember(spaceID, target.ID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "no such member")

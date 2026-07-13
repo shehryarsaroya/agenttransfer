@@ -1,0 +1,17 @@
+[Unit]
+Description=Prune AgentTransfer images and host-wide Docker build cache
+Documentation=https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Active/running images are never removed. Image cleanup is label-scoped to
+# AgentTransfer-built releases. Builder cache has no reliable per-app label,
+# so the second command is host-wide; enable this optional unit only on a
+# dedicated Docker host or when that maintenance policy is acceptable.
+ExecStart=/usr/bin/docker image prune --all --force --filter until=168h --filter label=com.agenttransfer.apphost.managed=true
+ExecStart=/usr/bin/docker builder prune --all --force --filter until=168h
+
+[Install]
+WantedBy=multi-user.target

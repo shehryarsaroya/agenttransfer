@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,26 @@ type Config struct {
 	ACMEEmail string
 	// BehindProxy disables autocert and trusts X-Forwarded-For.
 	BehindProxy bool
+
+	// AppDomain enables per-agent application hosting. An agent with slug
+	// "alice" is served at https://alice.<AppDomain>. It may equal Domain
+	// (alice@example.com -> alice.example.com), but must not equal
+	// ConnectDomain because the two wildcard namespaces would be ambiguous.
+	AppDomain string
+	// AppStorageQuota is the logical source/release + persistent-data budget
+	// for one human-verified agent. Container image layers are shared runtime
+	// state and are reported globally rather than charged as exact bytes.
+	AppStorageQuota int64
+	// AppBundleSize caps the compressed source archive used for one deploy.
+	AppBundleSize int64
+	// AppRunnerSocket/Token point at the separate privileged container runner.
+	// Static hosting works without a runner; container deploys do not.
+	AppRunnerSocket string
+	AppRunnerToken  string
+	// AppRoot is shared with the separate runner for materialized build
+	// contexts and persistent container data. It defaults beneath DATA_DIR so
+	// normal backups capture it.
+	AppRoot string
 
 	// Connect (client side): URL of a connect host to borrow a public
 	// subdomain and email service from, e.g. "https://agenttransfer.dev".
@@ -98,7 +119,7 @@ type Config struct {
 // FromEnv builds a Config from the environment.
 func FromEnv() (Config, error) {
 	c := Config{
-		Domain:      strings.TrimSpace(os.Getenv("DOMAIN")),
+		Domain:      strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAIN")), ".")),
 		DataDir:     envOr("DATA_DIR", "./data"),
 		HTTPAddr:    os.Getenv("HTTP_ADDR"),
 		SMTPAddr:    os.Getenv("SMTP_ADDR"),
@@ -110,12 +131,23 @@ func FromEnv() (Config, error) {
 		BehindProxy: envBool("BEHIND_PROXY"),
 		Metrics:     envOr("METRICS", "localhost"),
 
+		AppDomain:       strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("APP_DOMAIN")), ".")),
+		AppRunnerSocket: strings.TrimSpace(os.Getenv("APP_RUNNER_SOCKET")),
+		AppRunnerToken:  strings.TrimSpace(os.Getenv("APP_RUNNER_TOKEN")),
+		AppRoot:         strings.TrimSpace(os.Getenv("APP_ROOT")),
+
 		Connect:       strings.TrimRight(strings.TrimSpace(os.Getenv("CONNECT")), "/"),
-		ConnectDomain: strings.ToLower(strings.TrimSpace(os.Getenv("CONNECT_DOMAIN"))),
+		ConnectDomain: strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("CONNECT_DOMAIN")), ".")),
 
 		DiskReserve: envOr("DISK_RESERVE", "10%"),
 	}
 	var err error
+	if c.AppStorageQuota, err = parseSizeEnv("APP_STORAGE_QUOTA", "10GB"); err != nil {
+		return c, err
+	}
+	if c.AppBundleSize, err = parseSizeEnv("APP_BUNDLE_SIZE", "500MB"); err != nil {
+		return c, err
+	}
 	if c.ConnectSendRate, err = parseIntEnv("CONNECT_SEND_RATE", 50); err != nil {
 		return c, err
 	}
@@ -159,12 +191,18 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	c.ApplyDefaults()
+	if err := c.Validate(); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
 // ApplyDefaults fills the derived defaults; safe to call on hand-built
 // configs (tests, demo).
 func (c *Config) ApplyDefaults() {
+	c.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.Domain), "."))
+	c.AppDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.AppDomain), "."))
+	c.ConnectDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.ConnectDomain), "."))
 	if c.DataDir == "" {
 		c.DataDir = "./data"
 	}
@@ -186,6 +224,15 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.StorageQuotaUnverified == 0 {
 		c.StorageQuotaUnverified = 400 << 20
+	}
+	if c.AppStorageQuota == 0 {
+		c.AppStorageQuota = 10 << 30
+	}
+	if c.AppBundleSize == 0 {
+		c.AppBundleSize = 500 << 20
+	}
+	if c.AppRoot == "" {
+		c.AppRoot = filepath.Join(c.DataDir, "apps")
 	}
 	if c.HumanRecipientsMax == 0 {
 		c.HumanRecipientsMax = 3
@@ -211,6 +258,58 @@ func (c *Config) ApplyDefaults() {
 	if c.ConnectBytesPerDay == 0 {
 		c.ConnectBytesPerDay = 5 << 30
 	}
+}
+
+// Validate rejects combinations that otherwise fail late or create an
+// ambiguous wildcard routing namespace.
+func (c *Config) Validate() error {
+	if c.Domain != "" && !validDNSName(c.Domain) {
+		return fmt.Errorf("DOMAIN must be a valid DNS name")
+	}
+	if c.AppDomain != "" {
+		if !validDNSName(c.AppDomain) {
+			return fmt.Errorf("APP_DOMAIN must be a valid DNS name")
+		}
+		if c.Domain == "" && !c.BehindProxy {
+			return fmt.Errorf("APP_DOMAIN needs DOMAIN (built-in TLS) or BEHIND_PROXY=true")
+		}
+		if c.ConnectDomain != "" && strings.EqualFold(c.AppDomain, c.ConnectDomain) {
+			return fmt.Errorf("APP_DOMAIN and CONNECT_DOMAIN must be different wildcard namespaces")
+		}
+	}
+	if (c.AppRunnerSocket == "") != (c.AppRunnerToken == "") {
+		return fmt.Errorf("APP_RUNNER_SOCKET and APP_RUNNER_TOKEN must be set together")
+	}
+	if c.Connect != "" && !strings.HasPrefix(strings.ToLower(c.Connect), "https://") &&
+		!strings.HasPrefix(strings.ToLower(c.Connect), "http://127.0.0.1:") &&
+		!strings.HasPrefix(strings.ToLower(c.Connect), "http://localhost:") &&
+		!strings.HasPrefix(strings.ToLower(c.Connect), "http://[::1]:") {
+		return fmt.Errorf("CONNECT must use https:// (plain HTTP is allowed only on loopback for development)")
+	}
+	if c.ConnectDomain != "" && (c.Domain == "" || !strings.HasSuffix(c.ConnectDomain, c.Domain)) {
+		return fmt.Errorf("CONNECT_DOMAIN must be DOMAIN or one of its subdomains")
+	}
+	if c.DefaultTTL > c.MaxTTL {
+		return fmt.Errorf("DEFAULT_TTL must be <= MAX_TTL")
+	}
+	return nil
+}
+
+func validDNSName(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Instance returns the addressing domain ("local" when none configured).

@@ -104,7 +104,8 @@ func TestPersonLifecycle(t *testing.T) {
 	// 4. Second machine joins: pending until its own click; person fan-out
 	// excludes it meanwhile.
 	var desktop signupOut
-	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "desktop", "as": "shehryar"}, &desktop); code != 201 {
+	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
+		"name": "desktop", "as": "shehryar", "owner_email": "owner@example.com"}, &desktop); code != 201 {
 		t.Fatalf("join signup: %d", code)
 	}
 	if desktop.Name != "shehryar+desktop" || desktop.OwnerVerified {
@@ -171,6 +172,10 @@ func TestPersonNamespaceAndSquatting(t *testing.T) {
 	}
 	e.approve(p.AgentID)
 	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
+		"name": "ownerless", "as": "dana"}, &out); code != 400 {
+		t.Fatalf("join without owner proof: %d, want 400", code)
+	}
+	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
 		"name": "evil", "as": "dana", "owner_email": "mallory@example.com"}, &out); code != 403 {
 		t.Fatalf("join with wrong owner: %d, want 403", code)
 	}
@@ -184,7 +189,7 @@ func TestPersonNamespaceAndSquatting(t *testing.T) {
 	// pending join and check.
 	var pend signupOut
 	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
-		"name": "phone", "as": "dana", "pubkey": testRecipient(t)}, &pend); code != 201 {
+		"name": "phone", "as": "dana", "owner_email": "dana@example.com", "pubkey": testRecipient(t)}, &pend); code != 201 {
 		t.Fatalf("pending join: %d", code)
 	}
 	_, key := e.createAgent("prober")

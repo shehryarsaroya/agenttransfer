@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -50,16 +51,14 @@ type smtpSession struct {
 	agents []store.Agent
 	// connectRcpts collects recipients addressed to tunneled instances
 	// (<agent>@<name>.<connectDomain>); their raw mail is queued for the
-	// client to pull and parse itself. Keyed presence, plus the full rcpt
-	// list to hand the client.
-	connectNames map[string]bool
-	connectRcpts []string
+	// client to pull and parse itself. The map partitions envelope recipients
+	// by instance so one tenant never sees another tenant's Bcc/RCPT list.
+	connectRcpts map[string][]string
 }
 
 func (ss *smtpSession) Reset() {
 	ss.from = ""
 	ss.agents = nil
-	ss.connectNames = nil
 	ss.connectRcpts = nil
 }
 
@@ -84,11 +83,13 @@ func (ss *smtpSession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 			if _, err := ss.s.st.ConnectInstanceByName(name); err != nil {
 				return &gosmtp.SMTPError{Code: 550, EnhancedCode: gosmtp.EnhancedCode{5, 1, 1}, Message: "no such instance"}
 			}
-			if ss.connectNames == nil {
-				ss.connectNames = map[string]bool{}
+			if ss.connectRcpts == nil {
+				ss.connectRcpts = map[string][]string{}
 			}
-			ss.connectNames[name] = true
-			ss.connectRcpts = append(ss.connectRcpts, addr)
+			// Partition envelope recipients by tenant. Passing the complete
+			// RCPT list to every connected instance would disclose Bcc and
+			// cross-tenant addressing metadata.
+			ss.connectRcpts[name] = append(ss.connectRcpts[name], addr)
 			return nil
 		}
 	}
@@ -120,7 +121,7 @@ func (ss *smtpSession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 }
 
 func (ss *smtpSession) Data(r io.Reader) error {
-	if len(ss.agents) == 0 && len(ss.connectNames) == 0 {
+	if len(ss.agents) == 0 && len(ss.connectRcpts) == 0 {
 		return &gosmtp.SMTPError{Code: 554, Message: "no valid recipients"}
 	}
 	raw, err := io.ReadAll(io.LimitReader(r, maxInboundBytes+1))
@@ -132,8 +133,8 @@ func (ss *smtpSession) Data(r io.Reader) error {
 	}
 
 	// Queue raw mail for each tunneled connect instance (client parses it).
-	for name := range ss.connectNames {
-		err := ss.s.connect.deliverConnectMail(name, ss.connectRcpts, raw)
+	for name, rcpts := range ss.connectRcpts {
+		err := ss.s.connect.deliverConnectMail(name, rcpts, raw)
 		switch {
 		case err == nil:
 		case errors.Is(err, store.ErrQueueFull):
@@ -149,6 +150,7 @@ func (ss *smtpSession) Data(r io.Reader) error {
 			log.Printf("smtp: unparseable message from %s: %v", ss.from, err)
 			return &gosmtp.SMTPError{Code: 554, Message: "unparseable message"}
 		}
+		ensureInboundMessageID(in, raw)
 		from := in.From
 		if from == "" {
 			from = ss.from
@@ -173,6 +175,17 @@ func (ss *smtpSession) Data(r io.Reader) error {
 	return nil
 }
 
+// ensureInboundMessageID gives header-less mail a deterministic per-message
+// identity. SMTP and Connect are both at-least-once transports; without this,
+// a retry of the same raw message would create another inbox row and receipt.
+func ensureInboundMessageID(in *mail.Inbound, raw []byte) {
+	if strings.TrimSpace(in.MessageID) != "" {
+		return
+	}
+	sum := sha256.Sum256(raw)
+	in.MessageID = fmt.Sprintf("<agenttransfer-sha256-%x@dedup.invalid>", sum)
+}
+
 // verifyDKIM reports the DKIM verdict for a raw message. "pass" requires an
 // ALIGNED valid signature (one whose signing domain matches the From domain),
 // because a valid signature from an unrelated domain (d=attacker.com on a mail
@@ -195,16 +208,17 @@ func dkimVerdict(verifs []*dkim.Verification, fromDomain string) string {
 	return "fail"
 }
 
-// dkimAligned implements relaxed alignment (as in DMARC): the signing domain
-// and the From domain must be equal, or one must be a parent domain of the
-// other on a label boundary.
+// dkimAligned deliberately requires exact domain alignment. A naïve
+// parent/subdomain suffix rule is unsafe on shared public suffixes such as
+// github.io; exact matching is conservative and sufficient for this trust
+// signal without introducing an organizational-domain policy engine.
 func dkimAligned(sigDomain, fromDomain string) bool {
 	d := strings.ToLower(strings.TrimSpace(sigDomain))
 	f := strings.ToLower(strings.TrimSpace(fromDomain))
 	if d == "" || f == "" {
 		return false
 	}
-	return d == f || strings.HasSuffix(f, "."+d) || strings.HasSuffix(d, "."+f)
+	return d == f
 }
 
 func domainOfAddr(addr string) string {
@@ -219,6 +233,37 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 	var atts []store.Attachment
 	text := in.Text
 
+	// Apply policy before writing attachment blobs. In particular, a closed
+	// inbox must not be fillable by mail that will be rejected. A remote From
+	// address counts as an identity only after aligned DKIM validation.
+	deliver, quarantined := s.decideInbound(agent, from, dkimResult == "pass")
+	if !deliver {
+		return nil // silent SMTP acceptance avoids backscatter and enumeration
+	}
+
+	// Keep the logical quota check + attachment inserts serialized with HTTP
+	// uploads for this agent. Without the same lock, parallel SMTP sessions can
+	// each observe the old usage and exceed the quota together.
+	uploadMu := s.uploadLock(agent.ID)
+	uploadMu.Lock()
+	defer uploadMu.Unlock()
+	// The caller performs a cheap precheck, but only this recheck is atomic
+	// with attachment/message insertion. Concurrent SMTP retries carrying the
+	// same Message-ID serialize here and exactly one creates inbox state.
+	if s.st.HasMessageID(agent.ID, in.MessageID) {
+		return nil
+	}
+	type addedEntry struct{ sha, name string }
+	var added []addedEntry
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for _, f := range added {
+			_, _ = s.st.DeleteFileEntry(agent.ID, f.sha, f.name)
+		}
+	}()
 	for _, a := range in.Attachments {
 		// Both storage guards degrade gracefully here: drop the attachment
 		// with a note in the body rather than 5xx-ing the SMTP transaction
@@ -233,24 +278,26 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 			continue
 		}
 		sha, size, err := s.st.PutBlob(bytes.NewReader(a.Data), s.cfg.MaxFileSize)
+		if errors.Is(err, store.ErrDiskReserve) {
+			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — instance storage reserve reached]", a.Name)
+			continue
+		}
 		if err != nil {
 			return err
 		}
 		expires := time.Now().Add(s.cfg.DefaultTTL).Unix()
+		preexisting := s.st.AgentHasFile(agent.ID, sha, a.Name)
+		// AddFile's conflict path refreshes expires_at. A repeated attachment
+		// should get a full arrival TTL even when identical bytes/name already
+		// exist; rollback still removes only rows this message created.
 		f, err := s.st.AddFile(agent.ID, sha, a.Name, a.MIME, size, "inbound", false, expires)
 		if err != nil {
 			return err
 		}
+		if !preexisting {
+			added = append(added, addedEntry{sha: sha, name: f.Name})
+		}
 		atts = append(atts, store.Attachment{SHA256: sha, Name: f.Name, MIME: a.MIME, Size: size})
-	}
-
-	// The recipient's accept policy applies to inbound email too. For an
-	// external sender only the allowlist counts as "known" (no shared spaces).
-	deliver, quarantined := s.decideInbound(agent, from)
-	if !deliver {
-		// "closed" recipient, unknown sender — drop silently (no bounce). Any
-		// attachments already ingested are unclaimed and expire on their own.
-		return nil
 	}
 
 	m := store.Message{
@@ -272,6 +319,7 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 	if err != nil {
 		return err
 	}
+	committed = true
 	if !quarantined {
 		s.hub.notify(agent.ID)
 		s.enqueueWebhooks(agent.ID, "message.received", msg.ID, from)

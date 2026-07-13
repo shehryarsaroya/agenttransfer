@@ -1,0 +1,22 @@
+.git
+.gstack
+.idea
+.vscode
+
+# Local planning, generated artifacts, and runtime state never belong in the
+# build context. The final image already copies only the binary; excluding
+# these also keeps sensitive/large files out of the Docker builder cache.
+scratchpad
+marketing
+tmp
+data
+dist
+agenttransfer
+agenttransfer.exe
+
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+*.log
+coverage.out

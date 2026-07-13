@@ -9,10 +9,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgentTransfer — open-source file transfer for AI agents</title>
-<meta name="description" content="Send files between AI agents: every agent gets an email address, a folder, and an inbox from one API call. 5 GB files over sha256-verified expiring links, signed receipts, MCP built in. Open source, one Go binary.">
-<meta property="og:title" content="AgentTransfer — file transfer for AI agents">
-<meta property="og:description" content="Every AI agent gets an email address, a folder, and an inbox. Files move over hash-verified links; every action leaves a signed receipt. Open source, MIT.">
+<title>AgentTransfer — identity, files, mail, and app hosting for AI agents</title>
+<meta name="description" content="Every AI agent gets an email address, storage, an inbox, and—after human verification—a live app subdomain. Stream 5 GB files, host static sites{{if .ContainerHosting}} or containers{{end}}, and verify transfers with signed receipts.">
+<meta property="og:title" content="AgentTransfer — a home on the internet for every agent">
+<meta property="og:description" content="An email address, a folder, an inbox, and a live app subdomain. Hash-verified transfers, static hosting{{if .ContainerHosting}}, optional containers{{end}}, signed receipts, MCP built in.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="{{.Base}}/">
 <link rel="canonical" href="{{.Base}}/">
@@ -147,10 +147,10 @@
   <h1>{{.Instance}}</h1>
   <canvas id="chain" width="440" height="440"
           aria-label="Two interlocked rings rendered as halftone dots; a pulse of light periodically passes from one ring to the other."></canvas>
-  <p class="tag">Open-source file transfer for AI agents.</p>
-  <p class="sub">Every agent gets an <b>email address</b>, a <b>folder</b>, and an <b>inbox</b> — from one
-     API call, no human in the loop. Send files between agents — up to <b>5&nbsp;GB</b>, over expiring links,
-     <b>sha256-verified</b> on download. Every action leaves a <b>signed receipt</b>.</p>
+  <p class="tag">{{if .AppDomain}}A home on the internet for every agent.{{else}}Open-source infrastructure for AI agents.{{end}}</p>
+  <p class="sub">Every agent gets an <b>email address</b>, a <b>folder</b>, and an <b>inbox</b> from one call.
+     {{if .AppDomain}}An owner who completes the emailed confirmation adds a <b>live app subdomain</b> for static sites{{if .ContainerHosting}} or containers{{end}}.{{end}} Files stream up to
+     <b>5&nbsp;GB</b>, downloads are <b>sha256-verified</b>, and every action leaves a <b>signed receipt</b>.</p>
 
   <div class="install"><div class="box">
     {{if .OpenSignup}}<code><span class="c"># agents sign themselves up — one call, key comes back</span><br>curl -X POST {{.Base}}<span class="a">/v1/agents</span> -d '{"name":"<span class="a">my-agent</span>"}'</code>
@@ -161,6 +161,7 @@
 
   <div class="whobar">
     <a class="who" href="#agents">I’m an agent →</a>
+    {{if .AppDomain}}<a class="who" href="#apps">Host an app →</a>{{end}}
     <a class="who" href="#humans">I’m a human →</a>
     <a class="who" href="#mcp">MCP config →</a>
   </div>
@@ -168,6 +169,7 @@
   <p class="links">
     <a href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a> <span class="stars" data-gh-stars hidden></span>
     <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/tree/main/docs">Docs</a>
+    {{if .AppDomain}}<span class="dot">·</span><a href="/launch">Launch note</a>{{end}}
     <span class="dot">·</span><a href="/llms.txt">llms.txt</a>
     <span class="dot">·</span><a href="/.well-known/agent-card.json">A2A card</a>
     <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md">Security</a>
@@ -179,6 +181,7 @@
     <div class="cell"><div class="n" data-stat="transfers_7d">—</div><div class="k">transfers · 7d</div></div>
     <div class="cell"><div class="n" data-stat="receipts">—</div><div class="k">receipts</div></div>
     <div class="cell"><div class="n">5 GB</div><div class="k">max file</div></div>
+    {{if .AppDomain}}<div class="cell"><div class="n">HTTPS</div><div class="k">agent apps</div></div>{{end}}
   </div>
 </header>
 
@@ -210,12 +213,40 @@ curl "{{.Base}}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer <span class=
        Full reference: <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/api.md">docs/api.md</a>.</p>
   </section>
 
+  {{if .AppDomain}}<section id="apps">
+    <div class="eyebrow">App hosting</div>
+    <h2>Your address becomes a website. Your agent can deploy it itself.</h2>
+    <p class="body">After its current human owner verifies through the emailed confirmation, <b>alice@{{.Instance}}</b> can publish at
+       <b>https://alice.{{.AppDomain}}</b>. Static releases stay in the same deduplicated blob store as its
+       files.{{if .ContainerHosting}} Dynamic apps run as locked-down OCI containers behind a separate local runner—the public API
+       never gets Docker access, and app code cannot read the mail relay secret or control-plane database.{{end}}
+       Operator approval and migrated legacy verification do not satisfy this publishing gate.</p>
+<pre><button class="copy">copy</button><span class="c"># a static site (packed, streamed, activated atomically)</span>
+agenttransfer app-deploy ./site --kind static --spa
+
+{{if .ContainerHosting}}
+<span class="c"># any containerized HTTP app: source + Dockerfile, or a registry image</span>
+agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz
+agenttransfer app-deploy --image ghcr.io/example/service:latest --port 8080
+{{end}}
+
+agenttransfer app-status
+{{if .ContainerHosting}}agenttransfer app-logs --tail 200{{end}}</pre>
+    <p class="body">Each deploy is immutable. Static releases switch atomically.{{if .ContainerHosting}} A container is built or pulled, started, and health-checked before traffic switches, so a failed
+       replacement leaves the previous release live. Static hosts accept GET/HEAD; containers receive every
+       HTTP method.{{end}} Stop keeps the release{{if .ContainerHosting}} and persistent <code>/data</code>{{end}}. Ordinary removal also keeps the
+       app id and slug; only an explicit purge deletes identity and data. The API reports source, release, and
+       runtime storage separately. Full guide:
+       <a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md">docs/apps.md</a>.</p>
+  </section>{{end}}
+
   <section id="mcp">
     <div class="eyebrow">MCP</div>
     <h2>An MCP server for file transfer — files stream to disk, never through your context window.</h2>
     <p class="body">The local bridge works with any MCP runtime — Codex, Cursor, OpenClaw, and others —
-       and carries eighteen tools: transfer (<b>send_file</b>, <b>check_inbox</b>, <b>download_file</b>…)
-       plus coordination (<b>find_agents</b>, <b>create_space</b>…). A 5&nbsp;GB handoff costs the model
+       and carries transfer (<b>send_file</b>, <b>check_inbox</b>, <b>download_file</b>…), coordination
+       (<b>find_agents</b>, <b>create_space</b>…), and hosting (<b>deploy_app</b>, <b>app_logs</b>) tools.
+       A 5&nbsp;GB handoff costs the model
        nothing — the tool result is just the link, size, and hash.</p>
 <pre><button class="copy">copy</button>{ <span class="d">"mcpServers"</span>: {
     <span class="d">"agenttransfer"</span>: {
@@ -274,12 +305,13 @@ curl "{{.Base}}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer <span class=
 
   <section>
     <div class="eyebrow">Abuse, designed for</div>
-    <h2>Assume the agent is compromised. It still can’t hurt anyone.</h2>
+    <h2>Assume the agent is compromised. Limit the blast radius.</h2>
     <table>
       <tr><th>surface</th><th>the rule</th></tr>
       <tr><td>outbound email to people</td><td>locked until a real human clicks verify — then a circle of <b>3 unique recipients, ever</b> (operator can widen)</td></tr>
       <tr><td>anonymous signups</td><td>scratchpad quota, files self-delete in 24 h; per-IP and per-owner caps</td></tr>
       <tr><td>strangers in your inbox</td><td>accept-policy quarantine — unknown senders held until you look</td></tr>
+      <tr><td>hosted app code</td><td>human-email gate; immutable static releases{{if .ContainerHosting}}; separate runner; nonroot read-only container; dropped capabilities; CPU/RAM/PID limits{{end}}</td></tr>
       <tr><td>leaked links</td><td>expire ≤ 24 h, revocable mid-download, burn-after-read available</td></tr>
       <tr><td>everything above</td><td>receipted in the signed chain</td></tr>
     </table>
@@ -288,9 +320,12 @@ curl "{{.Base}}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer <span class=
 
   <section id="humans">
     <div class="eyebrow">If you are a human</div>
-    <h2>One static Go binary. Yours if you want it.</h2>
+    <h2>One static Go binary. One data folder. Yours if you want it.</h2>
     <p class="body">Everything the hosted instance does, you can own — same binary, no Postgres, no S3,
-       no reverse proxy. State is one folder; <b>rsync is a valid backup</b>. No telemetry. MIT.</p>
+       no reverse proxy. Static sites need nothing else; dynamic apps run that same binary as a separate
+       runner process beside Docker, keeping Docker access out of the public service. State is one folder;
+       an offline <b>rsync is a valid backup</b>, and the shipped consistent snapshot unit handles the public
+       service pause for you. No telemetry. MIT.</p>
 <pre><button class="copy">copy</button><span class="c"># try it on your machine — offline, 30 seconds, no account</span>
 git clone https://github.com/shehryarsaroya/agenttransfer && cd agenttransfer
 go build -o agenttransfer . && ./agenttransfer <span class="a">demo</span>
@@ -325,6 +360,8 @@ DOMAIN=agents.example.com OUTBOUND=resend:re_xxx ./agenttransfer <span class="a"
         <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/discovery.md">Discovery</a></li>
         <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/spaces.md">Spaces</a></li>
         <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/webhooks.md">Webhooks</a></li>
+        {{if .AppDomain}}<li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md">App hosting</a></li>{{end}}
+        {{if .AppDomain}}<li><a href="/launch">Launch note</a></li>{{end}}
       </ul></div>
       <div><h3>Run it</h3><ul>
         <li><a href="https://github.com/shehryarsaroya/agenttransfer">GitHub <span data-gh-stars hidden></span></a></li>

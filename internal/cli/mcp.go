@@ -289,6 +289,25 @@ var mcpProxyTools = []map[string]any{
 			"out_path": mstr("absolute local path to write"),
 		}, "space_id", "sha256", "out_path"),
 	},
+	{
+		"name":        "deploy_app",
+		"description": "Deploy a website/app for this verified agent. Provide either path (a LOCAL directory or archive, streamed without entering context) or an OCI image. Directory deployments are safely packaged and omit .git.",
+		"inputSchema": mobj(map[string]any{
+			"path":        mstr("local directory or archive to deploy"),
+			"image":       mstr("OCI image to deploy instead of local source"),
+			"kind":        mstr("static or container; inferred when omitted"),
+			"port":        mint("container HTTP port (default 8080)"),
+			"env":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "container environment variables"},
+			"command":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "container argv override"},
+			"spa":         mbool("serve index.html for unknown static-site routes"),
+			"health_path": mstr("container path that must return 2xx before activation (default /)"),
+		}),
+	},
+	{"name": "app_status", "description": "Get this agent's app status, URL, and active deployment.", "inputSchema": mobj(map[string]any{})},
+	{"name": "app_logs", "description": "Read a bounded tail of this agent's app logs.", "inputSchema": mobj(map[string]any{
+		"tail": mint("number of recent lines, 1-2000 (default 200)"),
+	})},
+	{"name": "stop_app", "description": "Stop this agent's currently running app without deleting its configuration or persistent data.", "inputSchema": mobj(map[string]any{})},
 }
 
 // call runs one tool and returns a short text summary (never file bytes).
@@ -516,6 +535,64 @@ func (s *mcpServer) call(name string, args json.RawMessage) (string, error) {
 			return "", fmt.Errorf("space_id, sha256, and out_path are required")
 		}
 		return s.downloadSpaceFile(p.SpaceID, p.SHA256, p.OutPath)
+
+	case "deploy_app":
+		var p struct {
+			Path       string            `json:"path"`
+			Image      string            `json:"image"`
+			Kind       string            `json:"kind"`
+			Port       int               `json:"port"`
+			Env        map[string]string `json:"env"`
+			Command    []string          `json:"command"`
+			SPA        bool              `json:"spa"`
+			HealthPath string            `json:"health_path"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return "", err
+		}
+		if p.Port == 0 {
+			p.Port = 8080
+		}
+		raw, warning, err := deployApp(s.a, p.Path, appDeployOptions{
+			Kind: p.Kind, Image: p.Image, Port: p.Port, Env: p.Env, Command: p.Command, SPA: p.SPA, HealthPath: p.HealthPath,
+		})
+		if err != nil {
+			return "", err
+		}
+		result := "Deployment accepted:\n" + prettyRawJSON(raw)
+		if warning != "" {
+			result += "\nWarning: " + warning
+		}
+		return result, nil
+
+	case "app_status":
+		var raw json.RawMessage
+		if err := s.a.json("GET", "/v1/apps/self", nil, &raw); err != nil {
+			return "", err
+		}
+		return prettyRawJSON(raw), nil
+
+	case "app_logs":
+		var p struct {
+			Tail int `json:"tail"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return "", err
+		}
+		if p.Tail == 0 {
+			p.Tail = 200
+		}
+		if p.Tail < 1 || p.Tail > 2000 {
+			return "", fmt.Errorf("tail must be between 1 and 2000")
+		}
+		return s.passthrough("GET", "/v1/apps/self/logs?tail="+url.QueryEscape(fmt.Sprintf("%d", p.Tail)), nil)
+
+	case "stop_app":
+		var raw json.RawMessage
+		if err := s.a.json("POST", "/v1/apps/self/stop", map[string]any{}, &raw); err != nil {
+			return "", err
+		}
+		return prettyRawJSON(raw), nil
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }
@@ -561,7 +638,7 @@ func (s *mcpServer) upload(path string, share bool, ttl string, once, encrypt bo
 	if once {
 		q.Set("once", "1")
 	}
-	p := "/v1/files/" + name
+	p := "/v1/files/" + url.PathEscape(name)
 	if len(q) > 0 {
 		p += "?" + q.Encode()
 	}
@@ -592,10 +669,15 @@ func (s *mcpServer) upload(path string, share bool, ttl string, once, encrypt bo
 
 func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
 	var p struct {
-		To                       []string `json:"to"`
-		Path, Note, Subject, TTL string
-		Once, CCOwner, Encrypt   bool
-		Seal                     bool `json:"seal"`
+		To      []string `json:"to"`
+		Path    string   `json:"path"`
+		Note    string   `json:"note"`
+		Subject string   `json:"subject"`
+		TTL     string   `json:"ttl"`
+		Once    bool     `json:"once"`
+		CCOwner bool     `json:"cc_owner"`
+		Encrypt bool     `json:"encrypt"`
+		Seal    bool     `json:"seal"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -826,8 +908,8 @@ func (s *mcpServer) postToSpace(args json.RawMessage) (string, error) {
 // attaches) and are never encrypted by the bridge. Returns a one-line summary;
 // never the file bytes.
 func (s *mcpServer) downloadSpaceFile(spaceID, sha, outPath string) (string, error) {
-	sha = strings.TrimPrefix(sha, "sha256:")
-	fetchURL := s.a.base + "/v1/spaces/" + url.PathEscape(spaceID) + "/files/" + url.PathEscape(sha) + "/content"
+	wantSHA := strings.TrimPrefix(sha, "sha256:")
+	fetchURL := s.a.base + "/v1/spaces/" + url.PathEscape(spaceID) + "/files/" + url.PathEscape(wantSHA) + "/content"
 	req, err := http.NewRequest("GET", fetchURL, nil)
 	if err != nil {
 		return "", err
@@ -843,9 +925,7 @@ func (s *mcpServer) downloadSpaceFile(spaceID, sha, outPath string) (string, err
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", apiError(resp.StatusCode, data)
 	}
-	if hdr := strings.TrimPrefix(resp.Header.Get("X-Sha256"), "sha256:"); hdr != "" {
-		sha = hdr
-	}
+	headerSHA := strings.TrimPrefix(resp.Header.Get("X-Sha256"), "sha256:")
 
 	tmp, err := os.CreateTemp(filepath.Dir(outPath), ".agenttransfer-*")
 	if err != nil {
@@ -859,9 +939,13 @@ func (s *mcpServer) downloadSpaceFile(spaceID, sha, outPath string) (string, err
 		return "", cerr
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	if sha != "" && !strings.EqualFold(got, sha) {
+	if wantSHA != "" && !strings.EqualFold(got, wantSHA) {
 		os.Remove(tmp.Name())
-		return "", fmt.Errorf("sha256 mismatch: got %s want %s", got, sha)
+		return "", fmt.Errorf("sha256 mismatch: got %s want %s", got, wantSHA)
+	}
+	if headerSHA != "" && !strings.EqualFold(got, headerSHA) {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("sha256 mismatch vs X-Sha256 header: got %s header %s", got, headerSHA)
 	}
 	if err := os.Rename(tmp.Name(), outPath); err != nil {
 		os.Remove(tmp.Name())

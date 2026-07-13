@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,12 +23,13 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
+	"github.com/shehryarsaroya/agenttransfer/internal/apphost"
 	"github.com/shehryarsaroya/agenttransfer/internal/mail"
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
 	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
 
-//go:embed templates/*.html
+//go:embed templates/*.html static/launch/*.webp static/launch/*.jpg
 var templateFS embed.FS
 
 // Server owns all runtime state.
@@ -37,6 +40,9 @@ type Server struct {
 	metrics  *metrics
 	outbound *mail.Outbound
 	tmpl     *template.Template
+	// appRunner is the narrow Unix-socket client for dynamic OCI apps. It is
+	// nil when the instance offers static hosting only.
+	appRunner *apphost.Client
 
 	// stats backs the public landing-page counter strip (GET /v1/stats).
 	stats statsCache
@@ -93,11 +99,32 @@ func (s *Server) uploadLock(agentID string) *sync.Mutex {
 // and none exists yet, the generated one is returned once via firstBootAdmin.
 func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, "", err
+	}
 	st, firstBootAdmin, err := store.Open(cfg.DataDir, cfg.AdminToken)
 	if err != nil {
 		return nil, "", err
 	}
 	st.SetInstance(cfg.Instance())
+	// The unprivileged public service owns build-context materialization. Make
+	// APP_ROOT before the root runner starts so a DynamicUser deployment never
+	// inherits a root:root 0700 directory it cannot write. The runner is ordered
+	// after this service in the shipped units and root can still access it.
+	if cfg.AppDomain != "" || cfg.AppRunnerSocket != "" {
+		if err := os.MkdirAll(cfg.AppRoot, 0o700); err != nil {
+			st.Close()
+			return nil, "", fmt.Errorf("create APP_ROOT: %w", err)
+		}
+		// Build contexts are derived scratch copies, never durable state. A
+		// process/host crash can bypass the normal per-deploy defer, so reclaim
+		// stale contexts before accepting another deployment. Persistent app
+		// data lives under the sibling data/ directory.
+		if err := os.RemoveAll(filepath.Join(cfg.AppRoot, "contexts")); err != nil {
+			st.Close()
+			return nil, "", fmt.Errorf("clean stale app build contexts: %w", err)
+		}
+	}
 
 	var out *mail.Outbound
 	if cfg.Outbound != "" {
@@ -123,6 +150,17 @@ func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 		severed:       map[string]bool{},
 		idemFlight:    map[string]chan struct{}{},
 		signupLimiter: newIPLimiter(10, time.Hour),
+	}
+	if cfg.AppRunnerSocket != "" {
+		srv.appRunner, err = apphost.NewClient(apphost.ClientConfig{
+			SocketPath: cfg.AppRunnerSocket,
+			AuthToken:  cfg.AppRunnerToken,
+			Timeout:    20 * time.Minute,
+		})
+		if err != nil {
+			st.Close()
+			return nil, "", err
+		}
 	}
 	if cfg.IPRate > 0 {
 		srv.unauthLimiter = newIPLimiter(int(cfg.IPRate), time.Hour)
@@ -167,7 +205,12 @@ func (s *Server) BaseURL() string {
 }
 
 // Close releases the store.
-func (s *Server) Close() error { return s.st.Close() }
+func (s *Server) Close() error {
+	if s.appRunner != nil {
+		s.appRunner.Close()
+	}
+	return s.st.Close()
+}
 
 // Handler builds the full HTTP handler (REST + MCP + pages).
 func (s *Server) Handler() http.Handler {
@@ -177,6 +220,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/agents", s.handleCreateAgent)
 	mux.HandleFunc("POST /v1/agents/self/rotate_key", s.auth(s.handleRotateKey))
 	mux.HandleFunc("POST /v1/agents/self/settings", s.auth(s.handleSettings))
+	mux.HandleFunc("POST /v1/agents/self/owner", s.auth(s.handleSetOwner))
 	mux.HandleFunc("POST /v1/agents/{id}/verify", s.handleAdminVerify)
 	mux.HandleFunc("POST /v1/agents/{id}/limits", s.handleAdminLimits) // admin
 	mux.HandleFunc("DELETE /v1/agents/self", s.auth(s.handleDeleteSelf))
@@ -226,6 +270,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/webhooks", s.auth(s.handleListWebhooks))
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.auth(s.handleDeleteWebhook))
 
+	// Per-agent app hosting. Source archives are ordinary folder blobs;
+	// deployment is a small authenticated JSON control operation.
+	mux.HandleFunc("GET /v1/apps/self", s.auth(s.handleAppStatus))
+	mux.HandleFunc("POST /v1/apps/self/deploy", s.auth(s.handleAppDeploy))
+	mux.HandleFunc("POST /v1/apps/self/stop", s.auth(s.handleAppStop))
+	mux.HandleFunc("DELETE /v1/apps/self", s.auth(s.handleAppDelete))
+	mux.HandleFunc("GET /v1/apps/self/logs", s.auth(s.handleAppLogs))
+
 	// Receipts.
 	mux.HandleFunc("GET /v1/receipts", s.auth(s.handleReceipts))
 	mux.HandleFunc("GET /v1/receipts/export", s.handleReceiptsExport) // admin
@@ -260,6 +312,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /llms.txt", s.unauthLimited(s.handleLLMs))        // llms.txt convention: agent-readable overview
 	mux.HandleFunc("GET /robots.txt", s.unauthLimited(s.handleRobots))
 	mux.HandleFunc("GET /sitemap.xml", s.unauthLimited(s.handleSitemap))
+	mux.HandleFunc("GET /launch", s.unauthLimited(s.handleLaunch))
+	mux.HandleFunc("GET /static/launch/{name}", s.handleLaunchAsset)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -286,6 +340,20 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) withCommon(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		// App hosts are a disjoint wildcard namespace and never fall through to
+		// control-plane routes on the apex. Route them before installing the
+		// short JSON control-plane deadline: hosted APIs may legitimately stream
+		// large or slow JSON bodies under their own application policy.
+		if slug, ok := s.appSlugFromHost(r.Host); ok {
+			s.metrics.httpRequests.Add(1)
+			s.handleAppHost(w, r, slug)
+			return
+		}
 		// Connect host: requests to <name>.<connectDomain> are proxied down
 		// that instance's tunnel rather than served locally.
 		if s.connect != nil {
@@ -306,8 +374,15 @@ func (s *Server) withCommon(next http.Handler) http.Handler {
 				return
 			}
 		}
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
+		// Small JSON control requests should not be able to park a connection
+		// indefinitely one byte at a time. Raw file uploads have their own much
+		// longer, size-appropriate deadline in the upload handler. App and
+		// Connect proxy traffic returned above and is deliberately excluded.
+		if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now().Add(30 * time.Second))
+			defer rc.SetReadDeadline(time.Time{})
+		}
 		s.metrics.httpRequests.Add(1)
 		next.ServeHTTP(w, r)
 	})
@@ -345,21 +420,26 @@ func (s *Server) Run(ctx context.Context) error {
 		// net/http, but it breaks the HTTP-01 path and floods the log).
 		acme := certmagic.NewACMEIssuer(magic, certmagic.DefaultACME)
 		magic.Issuers = []certmagic.Issuer{acme}
-		// Connect host: mint a cert on demand for each live subdomain rather
-		// than needing a wildcard/DNS-01. The decision func gates issuance to
-		// the apex and registered instances only.
-		if s.connect != nil {
+		// Mint per-host certificates on demand for active apps and live Connect
+		// tunnels. This avoids requiring DNS-01 credentials while still keeping
+		// arbitrary wildcard names from exhausting ACME issuance limits.
+		if s.connect != nil || s.cfg.AppDomain != "" {
 			magic.OnDemand = &certmagic.OnDemandConfig{
 				DecisionFunc: func(ctx context.Context, name string) error {
 					if name == s.cfg.Domain {
 						return nil
 					}
+					if s.managedAppHost(name) {
+						return nil
+					}
 					// Only mint a cert for an instance with a LIVE tunnel —
 					// merely-registered names (cheap, anonymous) must not be
 					// able to burn the domain's Let's Encrypt issuance budget.
-					if sub, ok := s.connect.isConnectSubdomain(name); ok {
-						if s.connect.online(sub) != nil {
-							return nil
+					if s.connect != nil {
+						if sub, ok := s.connect.isConnectSubdomain(name); ok {
+							if s.connect.online(sub) != nil {
+								return nil
+							}
 						}
 					}
 					return fmt.Errorf("not a managed name: %s", name)
@@ -381,7 +461,18 @@ func (s *Server) Run(ctx context.Context) error {
 		// Port 80: ACME HTTP challenges + redirect to HTTPS. Uses the bound
 		// issuer (see above), not the DefaultACME template.
 		challenge := acme.HTTPChallengeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "https://"+s.cfg.Domain+r.URL.RequestURI(), http.StatusMovedPermanently)
+			host := strings.ToLower(strings.TrimSuffix(r.Host, "."))
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			if host != s.cfg.Domain && !s.managedAppHost(host) {
+				if s.connect == nil {
+					host = s.cfg.Domain
+				} else if sub, ok := s.connect.isConnectSubdomain(host); !ok || s.connect.online(sub) == nil {
+					host = s.cfg.Domain
+				}
+			}
+			http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 		}))
 		redirectSrv := &http.Server{Addr: ":80", Handler: challenge, ReadHeaderTimeout: 10 * time.Second}
 		go func() { errCh <- redirectSrv.ListenAndServe() }()
@@ -495,7 +586,123 @@ func (s *Server) JanitorOnce() error {
 	// returns it to the pool.
 	_, _ = s.st.SweepStalePendingPersons(48 * 3600)
 
+	// Writable container data does not pass through PutBlob, so the runner
+	// measures it directly. Stop an app that grows beyond its combined
+	// release+data quota; its data is retained for the owner to inspect/purge.
+	if s.appRunner != nil {
+		if apps, err := s.st.AppsWithContainerHistory(); err == nil {
+			for _, candidate := range apps {
+				s.reconcileAppQuota(candidate.AgentID)
+			}
+		}
+	}
+
 	return s.st.Prune()
+}
+
+// reconcileAppQuota serializes janitor work with every user-triggered app
+// mutation. A Docker build can outlive a janitor tick; acting on the stale app
+// snapshot from AppsWithContainerHistory could otherwise stop the newly
+// healthy runtime just before deploy commits it. Re-read SQLite only after
+// acquiring the same lifecycle lock used by deploy/stop/reset/purge.
+func (s *Server) reconcileAppQuota(agentID string) {
+	appMu := s.uploadLock("app:" + agentID)
+	appMu.Lock()
+	defer appMu.Unlock()
+
+	app, err := s.st.AppByAgentID(agentID)
+	if err != nil || !app.EverContainer {
+		return
+	}
+	if app.Status != store.AppStatusRunning || app.ActiveDeploymentID == "" {
+		// Error/stopped apps are not publicly routed, but Docker may still be
+		// running after a transient stop failure. Retry every sweep until every
+		// managed runtime converges to stopped.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stopErr := s.stopAllAppRuntimes(stopCtx, app)
+		stopCancel()
+		if stopErr != nil {
+			log.Printf("apphost: stop inactive app %s runtimes: %v", app.ID, stopErr)
+		}
+		return
+	}
+	if app.Kind == store.AppKindStatic {
+		// A transient cleanup failure during container→static switching must not
+		// leave the old container writing/egressing forever. This is idempotent
+		// and preserves persistent /data.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, cleanupErr := s.appRunner.RemoveApp(cleanupCtx, app.ID)
+		cleanupCancel()
+		if cleanupErr != nil {
+			log.Printf("apphost: reconcile static app %s runtimes: %v", app.ID, cleanupErr)
+		}
+	} else if app.RuntimeID != "" {
+		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, reconcileErr := s.appRunner.ReconcileApp(reconcileCtx, app.ID, app.RuntimeID)
+		reconcileCancel()
+		if reconcileErr != nil {
+			log.Printf("apphost: reconcile container app %s runtime: %v", app.ID, reconcileErr)
+		}
+	}
+
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	var observed apphost.AppStatus
+	if app.RuntimeID != "" {
+		observed, err = s.appRunner.RuntimeStatus(checkCtx, app.RuntimeID)
+	} else {
+		observed, err = s.appRunner.Status(checkCtx, app.ID)
+	}
+	checkCancel()
+	if err != nil {
+		if appObservationMustFailClosed(err) {
+			// A missing runtime or an authoritative data-scan failure cannot be
+			// left publicly routed/unmetered. Other errors (runner restart, Docker
+			// daemon bounce, request timeout) are retried next sweep so a transient
+			// infrastructure blip does not take the whole hosted fleet offline.
+			s.stopAppForSafety(app, fmt.Sprintf("runtime/storage inspection failed: %v", err))
+		} else {
+			log.Printf("apphost: defer app %s quota check after transient inspection failure: %v", app.ID, err)
+		}
+		return
+	}
+	if !observed.Running || observed.URL == "" {
+		s.stopAppForSafety(app, "active runtime is no longer running or published")
+		return
+	}
+	if observed.URL != app.Upstream {
+		if err := s.st.RefreshAppRuntimeUpstream(app.AgentID, app.RuntimeID, observed.URL); err != nil {
+			log.Printf("apphost: refresh app %s runtime endpoint: %v", app.ID, err)
+			return
+		}
+	}
+	usage, err := s.st.ActiveAppUsage(app.AgentID)
+	if err != nil {
+		s.stopAppForSafety(app, fmt.Sprintf("release storage inspection failed: %v", err))
+		return
+	}
+	if usage.TotalBytes+observed.DataBytes <= s.cfg.AppStorageQuota {
+		return
+	}
+	s.stopAppForSafety(app, fmt.Sprintf("storage usage %d exceeds quota %d",
+		usage.TotalBytes+observed.DataBytes, s.cfg.AppStorageQuota))
+}
+
+func appObservationMustFailClosed(err error) bool {
+	var apiErr *apphost.APIError
+	return errors.As(err, &apiErr) &&
+		(apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity)
+}
+
+func (s *Server) stopAppForSafety(app store.App, reason string) {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stopErr := s.stopAllAppRuntimes(stopCtx, app)
+	stopCancel()
+	message := "app stopped: " + reason
+	if stopErr != nil {
+		message += fmt.Sprintf("; runtime stop will be retried: %v", stopErr)
+	}
+	_ = s.st.SetAppError(app.AgentID, app.ActiveDeploymentID, message)
+	log.Printf("apphost: %s", message)
 }
 
 func (s *Server) agentEmailByID(id string) string {
@@ -582,7 +789,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	default: // localhost
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
+		// A loopback reverse proxy makes every public request appear local.
+		// In BEHIND_PROXY mode, localhost policy therefore falls back to admin.
+		if s.cfg.BehindProxy || ip == nil || !ip.IsLoopback() {
 			if !s.st.IsAdmin(bearer(r)) {
 				http.Error(w, "metrics are localhost-only (or use the admin token)", http.StatusForbidden)
 				return

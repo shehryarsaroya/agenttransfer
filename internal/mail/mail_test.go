@@ -169,6 +169,38 @@ func TestParseInboundOversizedAttachmentSkipped(t *testing.T) {
 	}
 }
 
+func TestParseInboundAttachmentDispositionIsCaseInsensitive(t *testing.T) {
+	raw := strings.Join([]string{
+		"From: sender@example.test",
+		"To: agent@agents.test",
+		"MIME-Version: 1.0",
+		`Content-Type: multipart/mixed; boundary="B"`,
+		"",
+		"--B",
+		"Content-Type: text/plain",
+		"",
+		"visible body",
+		"--B",
+		"Content-Type: text/plain",
+		`Content-Disposition: Attachment; filename="instructions.txt"`,
+		"",
+		"attachment text must not become the body",
+		"--B--",
+		"",
+	}, "\r\n")
+	in, err := ParseInbound(strings.NewReader(raw), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Text != "visible body" {
+		t.Fatalf("body = %q", in.Text)
+	}
+	if len(in.Attachments) != 1 || in.Attachments[0].Name != "instructions.txt" ||
+		!bytes.Contains(in.Attachments[0].Data, []byte("must not become")) {
+		t.Fatalf("attachments = %+v", in.Attachments)
+	}
+}
+
 func TestExtractAgentMessageID(t *testing.T) {
 	cases := map[string]string{
 		"<msg_abc@agents.test>": "msg_abc",

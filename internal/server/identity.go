@@ -59,6 +59,24 @@ func senderIdentity(dkim, from string) map[string]any {
 // implement.
 func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 	base := s.BaseURL()
+	skills := []map[string]any{
+		{"id": "transfer", "name": "Transfer files", "description": "Send files up to 5GB to agents or humans; recipients download over HTTPS and verify the sha256.", "tags": []string{"files", "transfer", "sha256"},
+			"examples": []string{"send weights.tar.gz to codex-bot@" + s.st.Instance(), "share a 2GB dataset with another agent and verify the hash"}},
+		{"id": "inbox", "name": "Receive", "description": "Every agent has an inbox and email address; long-poll or webhook on arrival.", "tags": []string{"messaging", "email"},
+			"examples": []string{"wait for the next file to arrive in my inbox"}},
+		{"id": "spaces", "name": "Coordinate", "description": "Shared spaces where a fleet of agents exchanges messages and files.", "tags": []string{"coordination", "spaces"},
+			"examples": []string{"post scene.blend to the render-fleet space"}},
+		{"id": "discovery", "name": "Discover", "description": "Publish a capability card and find peers via the directory.", "tags": []string{"discovery", "directory"},
+			"examples": []string{"find an agent that can render"}},
+	}
+	if s.cfg.AppDomain != "" {
+		skills = append(skills, map[string]any{
+			"id": "hosting", "name": "Host an app",
+			"description": "Human-verified agents deploy static sites or isolated OCI apps at their own HTTPS subdomain.",
+			"tags":        []string{"hosting", "web", "containers"},
+			"examples":    []string{"deploy this site at my agent subdomain"},
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"protocolVersion":    "0.3.0",
 		"name":               "agenttransfer",
@@ -81,15 +99,6 @@ func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 			"bearer": map[string]any{"type": "http", "scheme": "bearer"},
 		},
 		"security": []map[string]any{{"bearer": []string{}}},
-		"skills": []map[string]any{
-			{"id": "transfer", "name": "Transfer files", "description": "Send files up to 5GB to agents or humans; recipients download over HTTPS and verify the sha256.", "tags": []string{"files", "transfer", "sha256"},
-				"examples": []string{"send weights.tar.gz to codex-bot@" + s.st.Instance(), "share a 2GB dataset with another agent and verify the hash"}},
-			{"id": "inbox", "name": "Receive", "description": "Every agent has an inbox and email address; long-poll or webhook on arrival.", "tags": []string{"messaging", "email"},
-				"examples": []string{"wait for the next file to arrive in my inbox"}},
-			{"id": "spaces", "name": "Coordinate", "description": "Shared spaces where a fleet of agents exchanges messages and files.", "tags": []string{"coordination", "spaces"},
-				"examples": []string{"post scene.blend to the render-fleet space"}},
-			{"id": "discovery", "name": "Discover", "description": "Publish a capability card and find peers via the directory.", "tags": []string{"discovery", "directory"},
-				"examples": []string{"find an agent that can render"}},
-		},
+		"skills":   skills,
 	})
 }

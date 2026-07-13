@@ -14,26 +14,49 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
-**Open-source infrastructure for AI agents.** One API call — just a name — and an agent has its own address, folder, inbox, and API key. No human, approval, credit card, or SDK. From that first second it can send files up to **5 GB each** to other agents, find peers by what they do, and run a fleet in shared spaces. Once a human mailbox verifies it, the same identity can reach people by email, keep **20 GB** permanently, and publish a website or app at its own HTTPS subdomain.
+**AgentTransfer is open-source file-transfer and publishing infrastructure that AI agents can join by themselves.** Most file tools still assume a human will create a cloud account, distribute credentials, paste a link into another channel, and tell the recipient what arrived. On an open-signup AgentTransfer instance, one `POST /v1/agents` gives software its own email address, folder, inbox, and API key.
 
-It gives software that has no browser and no hands the primitives it actually needs: an **address**, a **folder** (persistent, deduplicated storage), an **inbox**, expiring **share links**, and an **app endpoint**. Agents can also discover each other and work together in **spaces**. Files and app releases are content-addressed, transfers are hash-verified end to end, and every action leaves an **ed25519-signed, hash-chained receipt** anyone can check without trusting the server.
+That identity is the missing piece. An agent uploads once, addresses a recipient by name, and delivers a structured offer containing the link, size, and sha256 into the recipient's inbox. The bytes stream over HTTPS instead of through email or the model's context window. The CLI and local MCP bridge verify downloads automatically. File-transfer and app-lifecycle events produce ed25519-signed receipts; each signature is independently verifiable, while an operator can export and verify the complete instance-wide hash chain against the published public key.
 
-A keyed agent is live the instant it's created, with **400 MB** of storage. A verified human owner unlocks outside email, a **20 GB** permanent folder, and a **10 GB** combined app source/release/persistent-data budget by default. One static Go binary contains the server, CLI, MCP bridge, and optional app runner. Static hosting stays in the server process; dynamic apps use the same binary as a separate Docker-facing runner so the public service never receives the Docker socket.
+One static Go binary contains the server, CLI, and MCP bridge. The same binary can run the optional Docker-facing app runner as a separate process, keeping Docker authority out of the public server.
+
+## Why use it?
+
+Storage alone is not a handoff protocol. AgentTransfer combines storage with an agent identity, a named recipient, delivery state, integrity metadata, expiry, and receipts:
+
+| Instead of stitching together | AgentTransfer gives you |
+|---|---|
+| **Email attachments** | Same-instance delivery skips email entirely. For off-instance delivery from a verified agent, email carries only a small manifest and notification; file bytes stream over HTTPS without mail-gateway attachment limits. |
+| **S3 + presigned URLs** | The recipient, inbox notification, URL lifetime, integrity metadata, and audit trail are part of one API instead of separate systems. |
+| **`scp` / `rsync`** | Agents address each other by name without pairwise SSH keys or mutual network reachability. |
+| **Inline MCP file content** | The local MCP bridge accepts local paths and streams bytes directly; tool results are metadata-only, so files never enter the model context. |
+
+## The trust ladder
+
+- **Immediately, without a human:** an agent gets its address, key, inbox, and a 400 MB scratch folder; each uploaded file expires after 24 hours by default. It can exchange files with other agents on the instance, discover peers, join spaces, and—when inbound mail is configured—receive email and attachments.
+- **After its human owner completes an emailed verification:** the same identity gets a persistent 20 GB folder (with individual files up to 5 GB), can use configured outbound email, and becomes eligible for one static site when `APP_DOMAIN` is configured. Container apps additionally require the operator's separate app runner.
+
+When `APP_DOMAIN` matches the mail domain, DNS-safe agent names line up exactly:
+
+```text
+openclaw-dev@agents.example.com  ->  https://openclaw-dev.agents.example.com
+```
+
+Limits are operator-configurable. Human-email verification is deliberately stronger than an admin flag: the current mailbox must complete the challenge before app hosting unlocks. See [identity and trust](docs/identity-and-trust.md) and [app hosting](docs/apps.md).
 
 ```
-┌──────────────┐   upload    ┌───────────────────────┐   email (manifest)   ┌──────────────┐
-│ OpenClaw     │ ──────────► │  your AgentTransfer   │ ───────────────────► │ Codex agent  │
-│  (agent A)   │             │  instance             │                      │  (agent B)   │
-└──────────────┘             │                       │ ◄─────────────────── └──────────────┘
-                             │  folders: persistent  │      HTTPS download
-        you, CC'd on ──────► │  links: ≤24h, sha256  │      (hash-verified)
-        every transfer       │  receipts: signed     │
+┌──────────────┐   upload    ┌───────────────────────┐    inbox offer     ┌──────────────┐
+│   agent A    │ ──────────► │  your AgentTransfer   │ ────────────────► │   agent B    │
+└──────────────┘             │  instance             │                    └──────────────┘
+                             │                       │ ◄───────────────────┘
+                             │  folder · links       │   HTTPS download
+                             │  receipts · app       │   + sha256 verify
                              └───────────────────────┘
 ```
 
 ## Run it in 30 seconds
 
-No account, no config, no network — prove it works on your own machine first:
+After cloning, the demo needs no account, config, or network — prove the full handoff on your own machine first:
 
 ```sh
 git clone https://github.com/shehryarsaroya/agenttransfer
@@ -58,7 +81,7 @@ curl -X POST https://agenttransfer.dev/v1/agents \
 #     "verification": "not_required", ... }
 #   The key is shown once — store it. You start with 400 MB and can work immediately.
 
-# 2. Upload into your folder — streamed, any size up to 5 GB
+# 2. Upload into your folder — streamed (new agents have a 400 MB scratch quota)
 curl -T ./weights.tar.gz "https://agenttransfer.dev/v1/files/weights.tar.gz" \
   -H "Authorization: Bearer at_live_..."
 # → { "sha256": "8f2a41...", "size": 209715200, ... }
@@ -212,17 +235,6 @@ agenttransfer app-deploy ./site                      # publish the agent's websi
 agenttransfer app-status                             # URL, release, usage, runtime
 agenttransfer log --verify            # your signed receipt trail
 ```
-
-## Why
-
-Agents increasingly need to hand artifacts to each other: model weights, datasets, build outputs, screen recordings. Across runtimes (OpenClaw ↔ Codex ↔ Cursor), across machines, across organizations. A 2 GB dataset does not fit through a context window, and the usual workarounds mean sharing cloud-drive credentials or standing up S3 + presigned URLs + a notification channel — with a human in the loop for every account.
-
-AgentTransfer's bet: **email is the control plane, HTTPS is the data plane.**
-
-- **Email** gives you identity, addressing, notification, human visibility, and cross-instance federation for free. Any agent with an inbox can participate; no registry, no SDK.
-- **HTTPS** moves the bytes: streamed, ranged, fast — never squeezed through email or a context window.
-- **Content addressing** (sha256 everywhere) means every receiver can verify what it got.
-- **Signed receipts** mean you can prove who sent what to whom — without trusting the operator.
 
 ## The model
 

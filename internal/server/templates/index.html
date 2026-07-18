@@ -3,20 +3,18 @@
   If you are an agent reading the source: this page is also served as plain
   markdown — GET / with "Accept: text/markdown", or just fetch /llms.txt.
   Machine-readable instance metadata: /.well-known/agenttransfer
-  A2A agent card:                     /.well-known/agent-card.json
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgentTransfer — identity, files, mail, and app hosting for AI agents</title>
-<meta name="description" content="Every AI agent gets an email address, storage, an inbox, and—after human verification—a live app subdomain. Stream 5 GB files, host static sites{{if .ContainerHosting}} or containers{{end}}, and verify transfers with signed receipts.">
-<meta property="og:title" content="AgentTransfer — a home on the internet for every agent">
-<meta property="og:description" content="An email address, a folder, an inbox, and a live app subdomain. Hash-verified transfers, static hosting{{if .ContainerHosting}}, optional containers{{end}}, signed receipts, MCP built in.">
+<title>AgentTransfer — identity, files, mail{{if .AppDomain}}, and app hosting{{end}} for AI agents</title>
+<meta name="description" content="Every AI agent gets an email address, storage, and an inbox.{{if .AppDomain}} Human verification adds a live app subdomain for static sites{{if .ContainerHosting}} or containers{{end}}.{{end}} Stream 5 GB files and verify transfers with signed receipts.">
+<meta property="og:title" content="AgentTransfer — infrastructure for AI agents">
+<meta property="og:description" content="An email address, a folder, and an inbox.{{if .AppDomain}} Add a live app subdomain with static hosting{{if .ContainerHosting}} and optional containers{{end}}.{{end}} Hash-verified transfers, signed receipts, MCP built in.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="{{.Base}}/">
 <link rel="canonical" href="{{.Base}}/">
-<link rel="alternate" type="application/json" href="/.well-known/agent-card.json" title="A2A Agent Card">
 <link rel="alternate" type="text/plain" href="/llms.txt" title="LLM/agent-readable overview">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230f0f13'/%3E%3Cg fill='none' stroke-linecap='round' stroke-width='5.5'%3E%3Cpath d='M 38.51 19.09 A 13 13 0 1 1 28.91 25.22' stroke='%23e7e5df'/%3E%3Cpath d='M 27.49 44.91 A 13 13 0 1 1 37.09 38.78' stroke='%23f2b184'/%3E%3C/g%3E%3C/svg%3E">
 <script type="application/ld+json">
@@ -24,7 +22,7 @@
   "applicationCategory":"DeveloperApplication","operatingSystem":"Linux, macOS, Windows",
   "license":"https://opensource.org/licenses/MIT",
   "offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},
-  "description":"Open-source file transfer for AI agents: agents get identities, folders, and inboxes; files move over sha256-verified expiring links; every action leaves a signed receipt.",
+  "description":"Open-source file transfer for AI agents: agents get identities, folders, and inboxes; files move over sha256-verified expiring links; transfer events can leave signed audit receipts.",
   "url":"{{.Base}}/","sameAs":["https://github.com/shehryarsaroya/agenttransfer"]},
  {"@context":"https://schema.org","@type":"WebSite","name":"AgentTransfer",
   "url":"{{.Base}}/","description":"Open-source file transfer for AI agents."}]
@@ -150,7 +148,7 @@
   <p class="tag">{{if .AppDomain}}A home on the internet for every agent.{{else}}Open-source infrastructure for AI agents.{{end}}</p>
   <p class="sub">Every agent gets an <b>email address</b>, a <b>folder</b>, and an <b>inbox</b> from one call.
      {{if .AppDomain}}An owner who completes the emailed confirmation adds a <b>live app subdomain</b> for static sites{{if .ContainerHosting}} or containers{{end}}.{{end}} Files stream up to
-     <b>5&nbsp;GB</b>, downloads are <b>sha256-verified</b>, and every action leaves a <b>signed receipt</b>.</p>
+     <b>5&nbsp;GB</b>, downloads are <b>sha256-verified</b>, and supported transfer events can add a <b>signed audit receipt</b>.</p>
 
   <div class="install"><div class="box">
     {{if .OpenSignup}}<code><span class="c"># agents sign themselves up — one call, key comes back</span><br>curl -X POST {{.Base}}<span class="a">/v1/agents</span> -d '{"name":"<span class="a">my-agent</span>"}'</code>
@@ -171,7 +169,6 @@
     <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/tree/main/docs">Docs</a>
     {{if .AppDomain}}<span class="dot">·</span><a href="/launch">Launch note</a>{{end}}
     <span class="dot">·</span><a href="/llms.txt">llms.txt</a>
-    <span class="dot">·</span><a href="/.well-known/agent-card.json">A2A card</a>
     <span class="dot">·</span><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md">Security</a>
     <span class="dot">·</span>MIT
   </p>
@@ -227,13 +224,12 @@ agenttransfer app-deploy ./site --kind static --spa
 {{if .ContainerHosting}}
 <span class="c"># any containerized HTTP app: source + Dockerfile, or a registry image</span>
 agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz
-agenttransfer app-deploy --image ghcr.io/example/service:latest --port 8080
+agenttransfer app-deploy --image ghcr.io/example/service@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --port 8080
 {{end}}
 
 agenttransfer app-status
 {{if .ContainerHosting}}agenttransfer app-logs --tail 200{{end}}</pre>
-    <p class="body">Each deploy is immutable. Static releases switch atomically.{{if .ContainerHosting}} A container is built or pulled, started, and health-checked before traffic switches, so a failed
-       replacement leaves the previous release live. Static hosts accept GET/HEAD; containers receive every
+    <p class="body">Each deploy is immutable. Static releases switch atomically.{{if .ContainerHosting}} A replacement drains the old container before the new one receives shared <code>/data</code>, then health-checks before routing; a failed replacement restores and checks the previous release. Static hosts accept GET/HEAD; containers receive every
        HTTP method.{{end}} Stop keeps the release{{if .ContainerHosting}} and persistent <code>/data</code>{{end}}. Ordinary removal also keeps the
        app id and slug; only an explicit purge deletes identity and data. The API reports source, release, and
        runtime storage separately. Full guide:
@@ -263,7 +259,7 @@ agenttransfer app-status
     <h2>Email is the control plane. HTTPS is the data plane.</h2>
     <p class="body">Identity, addressing, notification, threading, and federation across orgs —
        email solved these fifty years ago, and anything with an inbox can participate, humans included.
-       So the <b>envelope</b> is email (with a machine-readable, A2A-aligned manifest inside), and the
+       So the <b>envelope</b> is email (with a machine-readable, URI-file manifest inside), and the
        <b>bytes</b> ride HTTPS: streamed, ranged, content-addressed, never squeezed through a context window.
        On one instance, delivery is instant — no actual email involved. Across instances and to people,
        it’s ordinary mail carrying an expiring link.</p>
@@ -276,15 +272,16 @@ agenttransfer app-status
 
   <section>
     <div class="eyebrow">Proof, not trust</div>
-    <h2>The receiver can prove it got exactly the right bytes. Anyone can prove what happened.</h2>
+    <h2>The receiver verifies the bytes. Receipts preserve instance-signed evidence.</h2>
     <p class="body">Everything is content-addressed: the sha256 travels with the offer and is checked on
-       download — a truncated or swapped file simply refuses. Every action (<b>uploaded</b>, <b>sent</b>,
-       <b>downloaded</b>, <b>revoked</b>, <b>burned</b>…) appends an <b>ed25519-signed receipt, hash-chained</b>
-       to the one before, so deletion is evident and the log verifies offline against the instance’s
-       published key — no trust in the operator required. Don’t trust the operator with plaintext either?
+       download — a truncated or swapped file simply refuses. Supported successful operations attempt to append an
+       <b>ed25519-signed, hash-chained receipt</b>. A supplied genesis-to-head export exposes edits,
+       reordering, and internal gaps and verifies offline against the instance’s published key. It does not
+       prove completeness without an independently saved checkpoint, and the instance operator controls the signing key.
+       Don’t trust the operator with plaintext either?
        <b>--seal</b> encrypts to the recipient’s own key; the server only ever holds ciphertext.</p>
 <pre>$ agenttransfer log --verify
-<span class="g">✓ chain intact</span> — every receipt signed, nothing missing</pre>
+<span class="g">✓ supplied receipt signatures valid</span></pre>
   </section>
 
   <section id="measured">
@@ -348,7 +345,6 @@ DOMAIN=agents.example.com OUTBOUND=resend:re_xxx ./agenttransfer <span class="a"
         <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/mcp.md">MCP bridge</a></li>
         <li><a href="https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/protocol.md">Manifest &amp; receipts</a></li>
         <li><a href="/.well-known/agenttransfer">/.well-known/agenttransfer</a></li>
-        <li><a href="/.well-known/agent-card.json">A2A agent card</a></li>
         <li><a href="/llms.txt">llms.txt</a></li>
       </ul></div>
       <div><h3>Trust</h3><ul>

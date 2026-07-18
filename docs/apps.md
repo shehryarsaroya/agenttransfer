@@ -83,7 +83,8 @@ back to the root `index.html`; missing asset paths still return 404.
 
 ### Container app
 
-A source deploy needs a `Dockerfile` at the archive root. The application must
+A source deploy needs a `Dockerfile` at the archive root and an operator who
+has explicitly enabled `APP_ALLOW_SOURCE_BUILDS=true`. The application must
 listen on all interfaces inside the container, normally on port 8080:
 
 ```sh
@@ -95,28 +96,49 @@ agenttransfer app-deploy ./app --kind container --port 8080 \
 agenttransfer app-logs --tail 200
 ```
 
-Or run an OCI image directly:
+Or run a digest-pinned OCI image directly (the default runner allows
+`docker.io` and `ghcr.io`):
 
 ```sh
-agenttransfer app-deploy --image ghcr.io/example/my-app:1.4 --port 8080
+agenttransfer app-deploy \
+  --image ghcr.io/example/my-app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --port 8080
 ```
 
-The runner serializes source builds, pulls referenced base images, and invokes
-Docker with `--pull`, `--no-cache`, and `--force-rm`. Dockerfile `RUN` steps
-have no network by default; vendor dependencies or put them in the base image,
-or let the operator set `APP_BUILD_NETWORK=bridge` when builds need to download
-dependencies. Base-image and image-only pulls still use the Docker daemon's
-registry network. Builds receive the runner's CPU, memory/swap, and process
-flags where the selected Docker builder supports them; those flags are
-best-effort, while serialization and the build deadline are always enforced.
+Arbitrary Dockerfiles are disabled by default. BuildKit can fetch remote
+frontends and sources through daemon-side paths that a `RUN --network=none`
+policy cannot fully confine, so an operator must explicitly set
+`APP_ALLOW_SOURCE_BUILDS=true` only for a trusted tenant model. Enabled source
+builds are serialized, time-bounded, no-cache, copied from the public build
+tree into separate runner-owned transient scratch, and policy-checked. Every
+external `FROM` must use a sha256 digest from `APP_ALLOWED_REGISTRIES`; remote
+syntax frontends, all `ADD` instructions, external `COPY --from` sources, and
+all `RUN` options (including cache/bind/secret/SSH mounts and network/security
+overrides) are rejected. The lexical policy fails closed on line continuations,
+custom escape directives, heredocs, `ONBUILD`, `FROM` options, quoted/escaped
+`FROM` or `COPY`, and variables in those source-bearing instructions;
+Dockerfiles are limited to 1 MiB. Plain
+Dockerfile `RUN` has no network by default; the separate
+`APP_BUILD_NETWORK=bridge` opt-in permits it. Image-only pulls use the same
+registry allowlist and digest rule. Builder CPU, memory/swap, and process flags
+are best-effort where the selected backend supports them; queue bounds,
+serialization, input snapshots, and deadlines are always enforced.
 
-In both source and image deploys the container is started, assigned a random
-loopback-only host port, and polled at the requested `health_path` (default
-`/`) until it returns 2xx. The path may be set with `--health-path`; it must be
-absolute, at most 256 bytes, and cannot contain a query, fragment, backslash,
-or control character. Routing switches only after the new release is healthy;
-a failed replacement leaves the previous healthy release serving, and the
-failed runtime is removed. The previous container is removed after the switch.
+In both source and image deploys the existing runtime is first drained so two
+releases never write the same `/data` concurrently. In the default egress-off
+mode the replacement receives a validated RFC1918 endpoint on its exclusive
+internal bridge; with `APP_RUNTIME_EGRESS=true` it receives a random
+loopback-only published port. It is polled at `health_path` (default `/`) until
+it returns 2xx. The path must be absolute, at most 256 bytes, and cannot
+contain a query, fragment, backslash, or control character. Routing switches
+only after health succeeds. On any failed or uncertain start, the runner
+reconciles unknown containers away, restarts the previous SQLite-desired
+runtime, health-checks it, and refreshes its route before returning the error.
+New containers have no automatic restart policy while this startup check is
+pending, so a bad command reaches a stable exited state and rollback can
+observe its exit code; the runner enables `unless-stopped` only after health
+succeeds.
+This gives correctness and recovery rather than claiming zero-downtime while
+two versions share writable state.
 
 Unlike static hosting, the container proxy forwards every HTTP method and its
 request body to the app. It replaces client-supplied forwarding headers with a
@@ -125,7 +147,7 @@ canonical `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` view.
 The CLI's `--command` is repeatable and represents argv, not a shell string:
 
 ```sh
-agenttransfer app-deploy --image example/api:latest \
+agenttransfer app-deploy --image example/api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --command /app/api --command --serve
 ```
 
@@ -174,6 +196,11 @@ The operator controls these instance-wide limits:
 |---|---:|---|
 | `APP_BUNDLE_SIZE` | `500MB` | maximum compressed source archive for one deploy |
 | `APP_STORAGE_QUOTA` | `10GB` | maximum active source + expanded release + observed persistent `/data` |
+| `APP_BUILD_ROOT` | `$DATA_DIR/app-builds` (server) | public-service-owned materialized contexts; runner reads only |
+| `APP_DATA_ROOT` | required by runner | runner-owned durable per-app `/data`; include in backups |
+| `APP_SNAPSHOT_ROOT` | required by runner | runner-owned transient Docker build input on disk-backed storage; keep outside backups |
+| `APP_DATA_QUOTA_ENFORCED` | `false` (server) | declare an operator-managed filesystem/project quota at least as strict as `APP_STORAGE_QUOTA` |
+| `ALLOW_UNENFORCED_APP_DATA` | `false` (server) | alternative explicit acceptance of watchdog-only `/data` enforcement |
 | `APP_CPU` | `2` | container CPU ceiling |
 | `APP_MEMORY` | `2GB` | container memory ceiling |
 | `APP_PIDS_LIMIT` | `256` | container process ceiling |
@@ -181,8 +208,20 @@ The operator controls these instance-wide limits:
 | `APP_BUILD_TIMEOUT` | `15m` | source image build timeout |
 | `APP_PULL_TIMEOUT` | `10m` | registry image pull timeout |
 | `APP_HEALTH_TIMEOUT` | `60s` | startup health-check deadline |
+| `APP_BUILD_QUEUE` | `8` | admitted builds, including the one active build |
+| `APP_MAX_BUILD_CONTEXT` | `10GB` | runner-owned snapshot byte ceiling |
 | `APP_BUILD_NETWORK` | `none` | Dockerfile `RUN` network: `none` or `bridge` |
+| `APP_ALLOWED_REGISTRIES` | `docker.io,ghcr.io` | exact registry allowlist; all external images still require sha256 digests |
+| `APP_ALLOW_SOURCE_BUILDS` | `false` | explicit trust opt-in for arbitrary Dockerfile builds |
+| `APP_RUNTIME_EGRESS` | `false` | opt into outbound networking; default runtimes use per-app internal networks |
 | `APP_MAX_LOG_LINES` | `2000` | largest container log tail the runner will return |
+| `APP_PROXY_CONCURRENCY` | `128` | total concurrent proxied requests/streams across apps |
+| `APP_PROXY_PER_APP_CONCURRENCY` | `16` | fairness ceiling for one app within the global proxy cap |
+
+During a source build, provision enough free space for the expanded context in
+both `APP_BUILD_ROOT` and `APP_SNAPSHOT_ROOT`, plus Docker's image-layer and
+build-cache usage. `APP_MAX_BUILD_CONTEXT` caps one runner snapshot; it does
+not reserve that disk space or account for Docker's storage.
 
 `app-status` reports `source_bytes`, `file_bytes`, observed `data_bytes`, total
 `used`, and `quota`. Content can be physically deduplicated even when logical
@@ -197,12 +236,22 @@ push the combined app above `APP_STORAGE_QUOTA`: deploy activation checks it,
 and the minute janitor remeasures running apps and stops one that grows over
 quota while retaining its data.
 
+This is an observational quota, not a filesystem project quota: a malicious or
+runaway process can write between measurements and can exhaust bytes or inodes
+before the janitor stops it. Keep `APP_DATA_ROOT` on a separately bounded
+volume (or use host filesystem quotas) when container tenants are not fully
+trusted. Container hosting stays disabled until the public service either sets
+`APP_DATA_QUOTA_ENFORCED=true` after configuring such a quota or explicitly
+accepts watchdog-only enforcement with `ALLOW_UNENFORCED_APP_DATA=true`.
+`ALLOW_PUBLIC_CONTAINERS` remains a second, separate false-by-default gate on
+open-signup instances.
+
 There is deliberately no agent-facing browse, export, shell, or partial-delete
 API for `/data`. Once retained data alone blocks deployment, `app-stop` and an
 ordinary `app-rm` do not reduce it. The only self-service recovery is
 `app-rm --purge-data`, which is destructive. To preserve data, an operator
 must stop the runtime, then back up or inspect the app's directory under
-`APP_ROOT/data/<app-id>` (the default root is `$DATA_DIR/apps`) and reduce it
+`APP_DATA_ROOT/<app-id>` and reduce it
 out of band before the agent deploys again; an app that needs routine recovery
 should also provide its own authenticated export/maintenance path.
 
@@ -238,9 +287,10 @@ Stopping does not delete the selected release, but there is no separate
 deployment state *inside* the stable app identity: it removes every release
 reference and runtime while retaining the same app id, slug, and `/data` for
 the next deploy. `--purge-data` removes the identity and data too. Unreferenced
-blobs are reclaimed later by the normal garbage collector. App actions add
-`app_deployed`, `app_stopped`, and `app_deleted` entries to the agent's signed
-receipt trail.
+blobs are reclaimed later by the normal garbage collector. Successful app
+actions attempt to add `app_deployed`, `app_stopped`, and `app_deleted` entries
+to the agent's signed receipt trail. A receipt failure is logged but cannot
+roll back a runtime action that already succeeded.
 
 Once an app has container history, deploy/reset/purge and agent deletion fail
 closed if the runner is unavailable; AgentTransfer will not update SQLite and
@@ -316,6 +366,13 @@ server as the control domain. With built-in TLS (`DOMAIN` set and
 an active, human-verified app. Unknown names cannot consume ACME issuance.
 Port 80 must reach AgentTransfer for HTTP-01 challenges.
 
+The service probes two unpredictable wildcard names and exposes the result at
+`/readyz` and `/.well-known/agenttransfer`. Static deploys fail with `503`
+until wildcard DNS is actually ready; container deploys additionally require
+a successful runner/Docker health probe. The landing page and machine
+discovery advertise only capabilities whose checks pass, so configuration
+alone cannot promise a broken app URL.
+
 Behind a reverse proxy, set `BEHIND_PROXY=true`; the proxy must route the
 wildcard hostnames to AgentTransfer and terminate wildcard or per-host TLS.
 `APP_DOMAIN` may equal `DOMAIN`, which gives the direct email-to-site mapping,
@@ -330,12 +387,18 @@ authenticated Unix socket. Only the runner can invoke Docker; app containers
 cannot access the socket.
 
 The runner fixes security-sensitive Docker flags rather than accepting command
-fragments: containers run as unprivileged uid/gid `65532`, with a read-only
-root, all Linux capabilities dropped, `no-new-privileges`, CPU/memory/PID
-ceilings, a bounded tmpfs, and only `/data` mounted writable. Published ports
-bind to `127.0.0.1` and the public service validates the loopback upstream
-before proxying. Uploaded builds use the operator-selected `none` or `bridge`
-network; runtime containers always have bridge-network egress.
+fragments: containers run as unprivileged uid/gid `65532` (operator-overridable
+for rootless installations), with a read-only root, all Linux capabilities
+dropped, `no-new-privileges`, CPU/memory/PID ceilings, a bounded tmpfs, and
+only `/data` mounted writable. Each app gets its own internal Docker network by
+default. The runner accepts only the exact labeled endpoint whose RFC1918
+address is inside that network's private IPAM subnet; the public service asks
+the runner to re-attest that route before each proxy request. The internal
+network has no external default route. `APP_RUNTIME_EGRESS=true` is an explicit
+instance-wide opt-in that instead uses a random loopback-published port. Docker
+Desktop cannot route its internal bridge back to the macOS host, so Desktop
+runners need that opt-in; Linux hosts use the safer direct internal route.
+Build network access and source builds are separate operator decisions.
 
 This limits accidents and narrows compromise impact; it does not turn Docker
 into a VM or make arbitrary images trustworthy. The runner and Docker daemon

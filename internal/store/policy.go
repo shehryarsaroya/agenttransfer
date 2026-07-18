@@ -96,7 +96,7 @@ func (s *Store) SenderKnown(recipientID, senderAddr string) (bool, error) {
 		return false, err
 	}
 	// A same-instance sender co-present in any of the recipient's spaces is known.
-	if localpart, domain, ok := strings.Cut(senderAddr, "@"); ok && domain == s.instance {
+	if localpart, domain, ok := strings.Cut(senderAddr, "@"); ok && domain == s.Instance() {
 		err := s.DB.QueryRow(`SELECT 1 FROM space_members a
 			JOIN space_members b ON a.space_id=b.space_id
 			JOIN agents ag ON ag.id=b.agent_id

@@ -23,6 +23,7 @@ import (
 	"net/smtp"
 	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,6 +61,9 @@ func ParseOutbound(s string) (*Outbound, error) {
 	}
 	o := &Outbound{Implicit: u.Scheme == "smtps"}
 	o.HostOnly = u.Hostname()
+	if strings.TrimSpace(o.HostOnly) == "" {
+		return nil, fmt.Errorf("OUTBOUND SMTP URL must include a host")
+	}
 	port := u.Port()
 	if port == "" {
 		if o.Implicit {
@@ -68,7 +72,11 @@ func ParseOutbound(s string) (*Outbound, error) {
 			port = "587"
 		}
 	}
-	o.Host = o.HostOnly + ":" + port
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return nil, fmt.Errorf("OUTBOUND SMTP URL has invalid port %q", port)
+	}
+	o.Host = net.JoinHostPort(o.HostOnly, port)
 	if u.User != nil {
 		o.User = u.User.Username()
 		o.Pass, _ = u.User.Password()

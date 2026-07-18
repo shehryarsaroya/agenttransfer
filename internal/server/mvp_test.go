@@ -30,6 +30,11 @@ func newEnvCfg(t *testing.T, cfg Config) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cfg.AppDomain != "" {
+		// Reserved test domains do not have real DNS. Treat their wildcard as
+		// ready unless a readiness-specific test overrides this cache.
+		srv.appReady = appHostingReadiness{WildcardDNSReady: true, CheckedAt: time.Now()}
+	}
 	t.Cleanup(func() { srv.Close() })
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -384,13 +389,26 @@ func TestCircleReleasedOnRelayFailure(t *testing.T) {
 	if code := e.doJSON("POST", "/v1/agents", e.admin, map[string]any{"name": "alice", "owner_email": "sam@own.test"}, &alice); code != 201 {
 		t.Fatalf("create alice: %d", code)
 	}
-	code := e.doJSON("POST", "/v1/send", alice.APIKey, map[string]any{"to": []string{"typo@nowhere.test"}, "note": "hi"}, nil)
-	if code != 502 {
-		t.Fatalf("dead-relay send: %d, want 502", code)
+	e.upload(alice.APIKey, "failed.bin", []byte("failed send bytes"), "")
+	payload, _ := json.Marshal(map[string]any{"to": []string{"typo@nowhere.test"}, "file": "failed.bin", "note": "hi"})
+	resp, _ := e.do("POST", "/v1/send", alice.APIKey, bytes.NewReader(payload), "application/json", "Idempotency-Key", "failed-send")
+	if resp.StatusCode != 502 {
+		t.Fatalf("dead-relay send: %d, want 502", resp.StatusCode)
+	}
+	resp, _ = e.do("POST", "/v1/send", alice.APIKey, bytes.NewReader(payload), "application/json", "Idempotency-Key", "failed-send")
+	if resp.StatusCode != 502 || resp.Header.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("failed-send replay: HTTP %d replay=%q", resp.StatusCode, resp.Header.Get("Idempotent-Replay"))
 	}
 	n, err := e.srv.Store().CountHumanRecipients(alice.AgentID)
 	if err != nil || n != 0 {
 		t.Fatalf("failed send left %d circle slots claimed (err=%v)", n, err)
+	}
+	links, err := e.srv.Store().ListLinks(alice.AgentID)
+	if err != nil || len(links) != 1 || links[0].Status != "revoked" {
+		t.Fatalf("failed send links=%+v err=%v, want one revoked audit row", links, err)
+	}
+	if sends, err := e.srv.Store().IncrCounterN(alice.AgentID, "sends", 0); err != nil || sends != 0 {
+		t.Fatalf("failed send rate counter=%d err=%v, want refunded", sends, err)
 	}
 }
 
@@ -729,23 +747,23 @@ func TestDiskGuard(t *testing.T) {
 	}
 }
 
-// One owner address can only register MAX_AGENTS_PER_OWNER agents via open
-// signup (case-insensitive); admins bypass.
-func TestAgentsPerOwnerCap(t *testing.T) {
+// Merely nominating a mailbox at signup does not consume its verified-agent
+// cap; only a successful mailbox challenge claims a slot.
+func TestPendingOwnerClaimsDoNotConsumeVerifiedCap(t *testing.T) {
 	e := newEnvCfg(t, Config{OpenSignup: true, MaxAgentsPerOwner: 2})
-	for _, name := range []string{"one-agent", "two-agent"} {
+	for _, name := range []string{"one-agent", "two-agent", "three-agent"} {
 		if code := e.doJSON("POST", "/v1/agents", "", map[string]any{"name": name, "owner_email": "Sam@x.test"}, nil); code != 201 {
 			t.Fatalf("signup %s: %d", name, code)
 		}
 	}
-	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "three-agent", "owner_email": "sam@X.TEST"}, nil); code != 403 {
-		t.Fatalf("third agent for one owner: %d, want 403", code)
+	if n, err := e.srv.st.CountAgentsByOwner("sam@x.test"); err != nil || n != 0 {
+		t.Fatalf("unproven nominations consumed %d verified slots (err=%v)", n, err)
 	}
 	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{"name": "other-agent", "owner_email": "dana@x.test"}, nil); code != 201 {
 		t.Fatalf("different owner blocked: %d", code)
 	}
 	if code := e.doJSON("POST", "/v1/agents", e.admin, map[string]any{"name": "adm-agent", "owner_email": "sam@x.test"}, nil); code != 201 {
-		t.Fatalf("admin create blocked by owner cap: %d", code)
+		t.Fatalf("admin create failed: %d", code)
 	}
 }
 

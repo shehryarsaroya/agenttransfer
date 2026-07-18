@@ -232,7 +232,15 @@ func TestParseOutbound(t *testing.T) {
 	if err != nil || o.Host != "mail.host.test:2525" {
 		t.Fatalf("explicit port: %+v err=%v", o, err)
 	}
-	for _, bad := range []string{"", "garbage", "http://not.smtp"} {
+	o, err = ParseOutbound("smtp://u:p@[2001:db8::1]:2525")
+	if err != nil || o.HostOnly != "2001:db8::1" || o.Host != "[2001:db8::1]:2525" {
+		t.Fatalf("IPv6 explicit port: %+v err=%v", o, err)
+	}
+	o, err = ParseOutbound("smtps://u:p@[2001:db8::2]")
+	if err != nil || o.Host != "[2001:db8::2]:465" {
+		t.Fatalf("IPv6 default port: %+v err=%v", o, err)
+	}
+	for _, bad := range []string{"", "garbage", "http://not.smtp", "smtp://:587", "smtp://mail.host.test:0", "smtp://mail.host.test:65536"} {
 		if _, err := ParseOutbound(bad); err == nil {
 			t.Errorf("ParseOutbound(%q) should fail", bad)
 		}

@@ -265,7 +265,7 @@ func TestDeployAppCleansStagedEntryAfterRejectedDeploy(t *testing.T) {
 
 func TestDeployAppAgainstServerAndServeStaticHost(t *testing.T) {
 	cfg := serverpkg.Config{
-		DataDir: t.TempDir(), Metrics: "off", AppDomain: "apps.example.test", BehindProxy: true,
+		DataDir: t.TempDir(), Metrics: "off", AppDomain: "localhost", BehindProxy: true,
 	}
 	cfg.ApplyDefaults()
 	srv, _, err := serverpkg.New(cfg)

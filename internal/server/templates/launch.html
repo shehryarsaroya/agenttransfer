@@ -137,7 +137,7 @@ agenttransfer app-deploy ./site</pre>
 agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz
 
 <span class="c"># or an existing image</span>
-agenttransfer app-deploy --image ghcr.io/example/service:1.4 --port 8080
+agenttransfer app-deploy --image ghcr.io/example/service@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --port 8080
 
 agenttransfer app-status
 agenttransfer app-logs --tail 200</pre>
@@ -147,11 +147,11 @@ agenttransfer app-logs --tail 200</pre>
 
   <h2>Releases switch only after they work</h2>
 
-  <p>Deployments are immutable. Static releases are unpacked into the same content-addressed blob store as ordinary AgentTransfer files, then activated with one database switch.{{if .ContainerHosting}} A container release is built or pulled, started on a random loopback port, and polled until its configurable health path returns a 2xx. Only then does traffic move. If the replacement never becomes healthy, the previous release stays live and the failed runtime is removed. The runner also reconciles interrupted switches later, keeping only the runtime named by the database.{{end}}</p>
+  <p>Deployments are immutable. Static releases are unpacked into the same content-addressed blob store as ordinary AgentTransfer files, then activated with one database switch.{{if .ContainerHosting}} To prevent two versions writing shared <code>/data</code>, the old runtime is drained first. The replacement starts at a runner-attested private or loopback endpoint and must return 2xx at its health path before routing. If it fails, the runner removes uncertain state, restarts and health-checks the previous SQLite-desired runtime, and refreshes its route. The runner also reconciles interrupted switches later.{{end}}</p>
 
   <div class="details">
     <div class="detail"><b>Static</b><span>Content-addressed files, sha256 ETags, atomic activation, optional SPA routing.</span></div>
-    {{if .ContainerHosting}}<div class="detail"><b>Containers</b><span>Every HTTP method, health-gated activation, rotating bounded logs, loopback-only upstream, persistent <code>/data</code>.</span></div>{{end}}
+    {{if .ContainerHosting}}<div class="detail"><b>Containers</b><span>Every HTTP method, health-gated activation, rotating bounded logs, runner-attested upstream, persistent <code>/data</code>.</span></div>{{end}}
     <div class="detail"><b>Storage</b><span>Source and expanded release{{if .ContainerHosting}}, plus observed persistent data, are{{else}} are{{end}} reported separately.</span></div>
     <div class="detail"><b>Lifecycle</b><span>Stop retains the release{{if .ContainerHosting}} and data{{end}}; reset also keeps id and slug; explicit purge removes the identity{{if .ContainerHosting}} and <code>/data</code>{{end}}.</span></div>
   </div>
@@ -168,7 +168,7 @@ agenttransfer app-logs --tail 200</pre>
 
   <p>The architecture decision I cared about most was not making the main service privileged just because an agent can run a container. Dynamic hosting uses a separate invocation of the same AgentTransfer binary as a narrow app runner. The public server speaks to it over a bearer-authenticated Unix socket. Only the runner can touch Docker.</p>
 
-  <p>The runner fixes the security-sensitive options instead of accepting arbitrary Docker flags. Source builds are serialized, cache-free, time-bounded, and use an operator-selected <code>none</code> or <code>bridge</code> network; builder resource flags are best-effort because Docker backend support varies. Apps run as uid 65532 with a read-only root filesystem, all Linux capabilities dropped, <code>no-new-privileges</code>, rotating local logs, and fixed runtime CPU, memory/swap, PID, and temporary-storage ceilings. Only <code>/data</code> is persistently writable; <code>/tmp</code> is an ephemeral tmpfs, and images that declare other writable volumes are refused. Published ports bind to loopback; the public server checks that upstream before proxying and replaces spoofable forwarding headers.</p>
+  <p>The runner fixes the security-sensitive options instead of accepting arbitrary Docker flags. Source builds are serialized, cache-free, time-bounded, and use an operator-selected <code>none</code> or <code>bridge</code> network; builder resource flags are best-effort because Docker backend support varies. Apps run as uid 65532 with a read-only root filesystem, all Linux capabilities dropped, <code>no-new-privileges</code>, rotating local logs, and fixed runtime CPU, memory/swap, PID, and temporary-storage ceilings. Only <code>/data</code> is persistently writable; <code>/tmp</code> is an ephemeral tmpfs, and images that declare other writable volumes are refused. Egress-off apps use an exact validated RFC1918 endpoint on their private bridge; egress-enabled apps publish only to loopback. The public server re-attests that upstream with the runner before proxying and replaces spoofable forwarding headers.</p>
 
   <div class="aside">
     <p><strong>This is a boundary, not a magic word.</strong></p>

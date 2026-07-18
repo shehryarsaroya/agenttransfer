@@ -40,19 +40,22 @@ started from an OCI image:
 
 ```sh
 agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz
-agenttransfer app-deploy --image ghcr.io/example/service:1.4 --port 8080
+agenttransfer app-deploy --image ghcr.io/example/service@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --port 8080
 agenttransfer app-logs --tail 200
 ```
 
 The agent can deploy, inspect, tail logs, and stop through the CLI, REST API,
 or MCP. Reset and destructive data purge are intentionally explicit CLI/REST
-operations. Deploys are immutable. A new container has to start and return a
-healthy 2xx before traffic switches, so a bad replacement leaves the previous
-release live. Static releases use the same content-addressed blob store as the
+operations. Deploys are immutable. Because releases share writable `/data`,
+the runner drains the old container before starting its replacement. The new
+runtime must return healthy 2xx before routing; on failure the runner removes
+uncertain state, restarts and health-checks the previous release, and restores
+its route. Static releases use the same content-addressed blob store as the
 agent's files. Container hosts forward every HTTP method. They get a persistent
 `/data` directory and run nonroot with a read-only root filesystem, dropped
 capabilities, rotating logs, and CPU, memory, PID, and temporary-storage
-limits. Source-build networking is an operator choice and is off by default.
+limits. Source builds and runtime egress are separate operator trust choices
+and are both off by default; registry and base images must be digest-pinned.
 
 The part I spent the most time on was the boundary around Docker. The public
 AgentTransfer process never gets the Docker socket. It talks over an
@@ -119,7 +122,7 @@ directory containing a `Dockerfile`, or an existing OCI image:
 
 ```sh
 agenttransfer app-deploy ./api --kind container --port 8080 --health-path /healthz
-agenttransfer app-deploy --image ghcr.io/example/api:1.4 --port 8080
+agenttransfer app-deploy --image ghcr.io/example/api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --port 8080
 ```
 
 There are REST and MCP equivalents, so the agent does not need a human to run
@@ -127,18 +130,20 @@ the command. Releases are immutable and activation is health-gated. Static
 files live in AgentTransfer's content-addressed store. Dynamic apps run behind
 a separate local runner: only that runner can access Docker; the public server
 cannot. Runtime containers are nonroot, read-only except for `/data` and
-`/tmp`, capability-dropped, resource-limited, and bound to a random loopback
-port before AgentTransfer proxies them.
+`/tmp`, capability-dropped, and resource-limited. Egress-off Linux hosts proxy
+the exact runner-attested RFC1918 endpoint on a per-app internal bridge;
+egress-enabled or Docker Desktop hosts use a random loopback-published port.
 
 The proxy forwards every HTTP method, while static hosts accept only GET/HEAD.
 Container logs rotate, and `/data` survives redeploy, stop, and ordinary app
 reset. Only an explicit purge removes that data and the stable app identity.
 
 I am not claiming this is hostile multi-tenant isolation. Docker and the
-runner are still privileged infrastructure, runtime containers have outbound
-network access, and a VM boundary is the right answer for mutually hostile
-tenants. My actual use case is one operator and their agents, so I chose a
-small, legible design and documented where it stops.
+runner are still privileged infrastructure. Runtime egress is off by default,
+but an enabled network and the shared host kernel remain security boundaries;
+a VM boundary is the right answer for mutually hostile tenants. My actual use
+case is one operator and their agents, so I chose a small, legible design and
+documented where it stops.
 
 The only human gate is email verification. Agents can self-register and use
 their inbox/storage immediately, but publishing a site requires the owner to

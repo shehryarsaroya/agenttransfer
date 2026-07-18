@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/apphost"
 	afmail "github.com/shehryarsaroya/agenttransfer/internal/mail"
@@ -85,15 +87,18 @@ func makeAppTar(t *testing.T, entries ...appTarEntry) []byte {
 
 func newAppTestEnv(t *testing.T, quota int64) *env {
 	t.Helper()
-	return newEnvCfg(t, Config{
-		AppDomain:       testAppDomain,
-		AppStorageQuota: quota,
-		AppBundleSize:   4 << 20,
-		BehindProxy:     true,
+	e := newEnvCfg(t, Config{
+		AppDomain:              testAppDomain,
+		AppStorageQuota:        quota,
+		AppBundleSize:          4 << 20,
+		BehindProxy:            true,
+		AllowUnenforcedAppData: true,
 	})
+	e.srv.appReady = appHostingReadiness{WildcardDNSReady: true, CheckedAt: time.Now()}
+	return e
 }
 
-func TestServerPrecreatesAppRootBeforeRunner(t *testing.T) {
+func TestServerPrecreatesAppBuildRootBeforeRunner(t *testing.T) {
 	appRoot := filepath.Join(t.TempDir(), "shared-app-root")
 	if err := os.MkdirAll(filepath.Join(appRoot, "contexts", "stale-build"), 0o700); err != nil {
 		t.Fatal(err)
@@ -105,14 +110,14 @@ func TestServerPrecreatesAppRootBeforeRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := newEnvCfg(t, Config{
-		AppDomain: testAppDomain, AppRoot: appRoot, BehindProxy: true,
+		AppDomain: testAppDomain, AppBuildRoot: appRoot, BehindProxy: true,
 	})
-	if e.srv.cfg.AppRoot != appRoot {
-		t.Fatalf("APP_ROOT = %q, want %q", e.srv.cfg.AppRoot, appRoot)
+	if e.srv.cfg.AppBuildRoot != appRoot {
+		t.Fatalf("APP_BUILD_ROOT = %q, want %q", e.srv.cfg.AppBuildRoot, appRoot)
 	}
 	info, err := os.Stat(appRoot)
 	if err != nil || !info.IsDir() {
-		t.Fatalf("public service did not precreate APP_ROOT: info=%v err=%v", info, err)
+		t.Fatalf("public service did not precreate APP_BUILD_ROOT: info=%v err=%v", info, err)
 	}
 	if _, err := os.Stat(filepath.Join(appRoot, "contexts")); !os.IsNotExist(err) {
 		t.Fatalf("stale build contexts survived startup: %v", err)
@@ -213,6 +218,7 @@ func TestContainerAppProxyPreservesHTTPMethodsAndCanonicalForwarding(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.srv.rememberRuntimeTarget(app.ID, app.RuntimeID, app.Upstream)
 
 	host := app.Slug + "." + testAppDomain
 	req, err := http.NewRequest(http.MethodPost, e.ts.URL+"/v1/items?dry=1", strings.NewReader(`{"name":"test"}`))
@@ -296,8 +302,11 @@ func TestAppHostingRequiresHumanEmailVerification(t *testing.T) {
 	if code := e.doJSON(http.MethodGet, "/v1/apps/self", signup.APIKey, nil, &allowed); code != http.StatusOK {
 		t.Fatalf("verified status: HTTP %d", code)
 	}
-	if !allowed.Eligible || allowed.App.Slug != "operator-vouched" || allowed.App.URL != "https://operator-vouched."+testAppDomain {
-		t.Fatalf("email verification did not unlock canonical app identity: %+v", allowed)
+	if !allowed.Eligible || allowed.App.Slug != "" || allowed.App.URL != "" {
+		t.Fatalf("verified status should report eligibility without allocating an app: %+v", allowed)
+	}
+	if _, err := e.srv.st.AppByAgentID(agent.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("eligible status call allocated an app: %v", err)
 	}
 }
 
@@ -462,6 +471,48 @@ func TestStaticAppRejectsMaliciousArchives(t *testing.T) {
 	}
 }
 
+func TestAppStatusReadDoesNotAllocateAndResetViewHasNoDeployment(t *testing.T) {
+	e := newAppTestEnv(t, 1<<20)
+	_, key := e.createAgent("status-read-only")
+	agent := humanVerifyAgent(t, e, key, "status-owner@example.com")
+
+	if code := e.doJSON(http.MethodGet, "/v1/apps/self", key, nil, nil); code != http.StatusOK {
+		t.Fatalf("empty status: HTTP %d", code)
+	}
+	if _, err := e.srv.st.AppByAgentID(agent.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("status read created app identity: %v", err)
+	}
+
+	app, err := e.srv.st.EnsureApp(agent.ID, agent.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := e.srv.appView(context.Background(), agent, app)
+	if view["deployment"] != nil {
+		t.Fatalf("empty app deployment = %#v, want null", view["deployment"])
+	}
+}
+
+func TestAppViewDoesNotUnderstateRetainedDataWithoutRunner(t *testing.T) {
+	e := newAppTestEnv(t, 1<<20)
+	_, key := e.createAgent("status-retained-data")
+	agent := humanVerifyAgent(t, e, key, "retained-owner@example.com")
+	app, err := e.srv.st.EnsureApp(agent.ID, agent.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.EverContainer = true
+	e.srv.appRunner = nil
+	view := e.srv.appView(context.Background(), agent, app)
+	storage := view["storage"].(map[string]any)
+	if storage["data_bytes"] != nil || storage["used"] != nil {
+		t.Fatalf("unobservable retained data was reported as known: %#v", storage)
+	}
+	if got, _ := storage["observation_error"].(string); !strings.Contains(got, "runner unavailable") {
+		t.Fatalf("missing runner observation error: %#v", storage)
+	}
+}
+
 func TestStaticAppRejectsExpandedReleaseOverQuota(t *testing.T) {
 	e := newAppTestEnv(t, 128)
 	_, key := e.createAgent("expansion-guard")
@@ -509,7 +560,7 @@ func TestBuildContextStopsAtDiskReserveAndCleansPartialState(t *testing.T) {
 	if !errors.Is(err, store.ErrDiskReserve) {
 		t.Fatalf("materialize error = %v, want ErrDiskReserve", err)
 	}
-	contextDir := filepath.Join(e.srv.cfg.AppRoot, "contexts", app.ID, deployment.ID)
+	contextDir := filepath.Join(e.srv.cfg.AppBuildRoot, "contexts", app.ID, deployment.ID)
 	if _, statErr := os.Stat(contextDir); !os.IsNotExist(statErr) {
 		t.Fatalf("partial context survived reserve failure: %v", statErr)
 	}
@@ -541,6 +592,10 @@ func TestAppURLSlugForUnsafeAndPersonAgentNames(t *testing.T) {
 		{name: "person-plus", key: personKey, prefix: "fleet-owner-lap-top-", agentID: personAgent.ID},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			created, err := e.srv.st.EnsureApp(tc.agentID, "")
+			if err != nil {
+				t.Fatal(err)
+			}
 			var out struct {
 				Eligible bool `json:"eligible"`
 				App      struct {
@@ -560,6 +615,9 @@ func TestAppURLSlugForUnsafeAndPersonAgentNames(t *testing.T) {
 			app, err := e.srv.st.AppByAgentID(tc.agentID)
 			if err != nil || app.Slug != out.App.Slug {
 				t.Fatalf("slug was not durable: %+v err=%v", app, err)
+			}
+			if created.Slug != out.App.Slug {
+				t.Fatalf("status changed the existing slug: before=%q after=%q", created.Slug, out.App.Slug)
 			}
 		})
 	}

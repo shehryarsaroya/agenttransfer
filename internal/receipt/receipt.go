@@ -1,11 +1,11 @@
 // Package receipt implements AgentTransfer's signed, hash-chained receipts.
 //
-// Every action (upload, send, receive, download, revoke, burn, expire) writes
-// one receipt. Receipts are ed25519-signed by the instance and chained: each
-// carries the sha256 of the previous receipt's canonical encoding. Signatures
-// prove who did what; the chain proves nothing was quietly deleted. Anyone
-// holding the instance public key (published at /.well-known/agenttransfer) can
-// verify offline.
+// Receipt records are ed25519-signed by the instance and chained: each carries
+// the sha256 of the previous receipt's canonical encoding. Signatures prove
+// that a record was produced by the holder of the instance key; a contiguous
+// export exposes edits, reordering, and internal gaps. Without an independently
+// witnessed chain head, verification cannot prove that the server supplied the
+// newest suffix or that every application action emitted a receipt.
 package receipt
 
 import (
@@ -144,6 +144,9 @@ func (r Receipt) Verify(pub ed25519.PublicKey) error {
 // equals the hash of the receipt before it, and that the chain starts at
 // genesis.
 func VerifyChain(rs []Receipt, pub ed25519.PublicKey, contiguous bool) error {
+	if contiguous && len(rs) == 0 {
+		return errors.New("empty receipt chain")
+	}
 	for i, r := range rs {
 		if err := r.Verify(pub); err != nil {
 			return err
@@ -155,7 +158,7 @@ func VerifyChain(rs []Receipt, pub ed25519.PublicKey, contiguous bool) error {
 			return fmt.Errorf("chain broken at %s: prev does not match hash of %s", r.ID, rs[i-1].ID)
 		}
 	}
-	if contiguous && len(rs) > 0 && rs[0].Prev != GenesisPrev {
+	if contiguous && rs[0].Prev != GenesisPrev {
 		return fmt.Errorf("chain does not start at genesis (first prev = %q)", rs[0].Prev)
 	}
 	return nil

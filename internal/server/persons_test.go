@@ -1,9 +1,13 @@
 package server
 
 import (
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
 
 func newOpenEnv(t *testing.T) *env {
@@ -19,6 +23,41 @@ func newOpenEnv(t *testing.T) *env {
 	t.Cleanup(ts.Close)
 	srv.SetBaseURL(ts.URL)
 	return &env{t: t, ts: ts, srv: srv, admin: admin, client: ts.Client()}
+}
+
+func TestOwnerVerificationClaimsCapOnlyAfterMailboxProof(t *testing.T) {
+	e := newEnvCfg(t, Config{MaxAgentsPerOwner: 1})
+	first, _, err := e.srv.st.CreateAgent("proof-first", "victim@example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := e.srv.st.CreateAgent("proof-second", "victim@example.com", false)
+	if err != nil {
+		t.Fatalf("second unproven nomination was blocked: %v", err)
+	}
+	firstToken, _ := e.srv.st.CreateOwnerVerifyToken(first.ID, first.OwnerEmail)
+	secondToken, _ := e.srv.st.CreateOwnerVerifyToken(second.ID, second.OwnerEmail)
+	resp, _ := e.do("POST", "/verify?t="+firstToken, "", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first mailbox proof: HTTP %d", resp.StatusCode)
+	}
+	resp, _ = e.do("POST", "/verify?t="+secondToken, "", nil, "")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second mailbox proof: HTTP %d, want 409", resp.StatusCode)
+	}
+	if _, err := e.srv.st.PeekVerifyToken(secondToken); err != nil {
+		t.Fatalf("cap failure consumed second token: %v", err)
+	}
+	secondAfter, err := e.srv.st.AgentByID(second.ID)
+	if err != nil || secondAfter.OwnerVerified {
+		t.Fatalf("second agent verified across cap: %+v err=%v", secondAfter, err)
+	}
+	if n, err := e.srv.st.CountAgentsByOwner("VICTIM@example.com"); err != nil || n != 1 {
+		t.Fatalf("verified owner count=%d err=%v", n, err)
+	}
+	if _, err := e.srv.st.VerifyOwnerTokenLimited(secondToken, 1); !errors.Is(err, store.ErrOwnerAgentLimit) {
+		t.Fatalf("store cap error=%v", err)
+	}
 }
 
 type signupOut struct {
@@ -221,5 +260,20 @@ func TestStalePendingPersonSweep(t *testing.T) {
 	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
 		"name": "laptop", "as": "ghost", "owner_email": "real@example.com"}, &p); code != 201 {
 		t.Fatalf("re-claim after sweep: %d", code)
+	}
+}
+
+func TestInvalidPersonSignupDoesNotReserveHandle(t *testing.T) {
+	e := newEnvCfg(t, Config{OpenSignup: true, MaxAgentsPerOwner: 1})
+	if code := e.doJSON("POST", "/v1/agents", "", map[string]any{
+		"name": "bad+tag", "as": "invalid-cleanup", "owner_email": "other@example.com"}, nil); code != 400 {
+		t.Fatalf("invalid tag signup: %d", code)
+	}
+	var persons int
+	if err := e.srv.st.DB.QueryRow(`SELECT COUNT(*) FROM persons WHERE handle='invalid-cleanup'`).Scan(&persons); err != nil {
+		t.Fatal(err)
+	}
+	if persons != 0 {
+		t.Fatalf("failed signups reserved %d handles", persons)
 	}
 }

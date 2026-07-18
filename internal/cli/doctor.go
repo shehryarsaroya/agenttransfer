@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/shehryarsaroya/agenttransfer/internal/apphost"
 	"github.com/shehryarsaroya/agenttransfer/internal/mail"
 	"github.com/shehryarsaroya/agenttransfer/internal/server"
 	"github.com/shehryarsaroya/agenttransfer/internal/store"
@@ -55,6 +58,50 @@ func Doctor(out io.Writer) int {
 		fix("free disk space (delete agents/blobs, grow the volume) or lower DISK_RESERVE (currently %s)", cfg.DiskReserve)
 	} else {
 		ok("disk guard: %s free of %s (uploads refuse below %s)", fmtBytes(free), fmtBytes(total), fmtBytes(reserve))
+	}
+
+	if cfg.AppDomain != "" || cfg.AppRunnerSocket != "" {
+		fmt.Fprintln(out, "\napp hosting:")
+		if cfg.AppDomain == "" {
+			skip("APP_DOMAIN is not set — hosted app routing is disabled")
+		} else {
+			serviceHost := cfg.Domain
+			if parsed, parseErr := url.Parse(cfg.BaseURL()); parseErr == nil && parsed.Hostname() != "" {
+				serviceHost = parsed.Hostname()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ips, lookupErr := server.CheckWildcardDNS(ctx, cfg.AppDomain, serviceHost)
+			cancel()
+			if lookupErr != nil || len(ips) == 0 {
+				bad("wildcard DNS: two randomized names below *.%s did not both resolve", cfg.AppDomain)
+				fix("add a wildcard A/AAAA record for *.%s pointing at the app proxy", cfg.AppDomain)
+			} else {
+				ok("wildcard DNS: two randomized names below *.%s resolve → %s", cfg.AppDomain, strings.Join(ips, ", "))
+			}
+		}
+		if cfg.AppRunnerSocket == "" {
+			skip("container runner is not configured — static app hosting only")
+		} else {
+			client, clientErr := apphost.NewClient(apphost.ClientConfig{
+				SocketPath: cfg.AppRunnerSocket,
+				AuthToken:  cfg.AppRunnerToken,
+				Timeout:    5 * time.Second,
+			})
+			if clientErr != nil {
+				bad("container runner configuration: %v", clientErr)
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				healthErr := client.ContainerReady(ctx)
+				cancel()
+				client.Close()
+				if healthErr != nil {
+					bad("container runner is unavailable or Docker is unhealthy: %v", healthErr)
+					fix("start `agenttransfer app-runner` with the same APP_RUNNER_SOCKET and APP_RUNNER_TOKEN")
+				} else {
+					ok("container runner and Docker engine are healthy")
+				}
+			}
+		}
 	}
 
 	if cfg.Domain == "" {

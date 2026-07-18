@@ -123,6 +123,13 @@ func (h *connectHost) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this instance is suspended", http.StatusForbidden)
 		return
 	}
+	// Refresh before hijacking. This closes the authenticate→reap race: either
+	// the reaper deleted the stale row first and this request is refused, or this
+	// touch commits first and the reaper's cutoff predicate no longer matches.
+	if err := h.s.st.TouchConnectInstance(ci.Name); err != nil {
+		http.Error(w, "connect registration expired; register again", http.StatusUnauthorized)
+		return
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "server does not support hijacking", http.StatusInternalServerError)
@@ -608,7 +615,23 @@ func (h *connectHost) reapLoop(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
+			h.heartbeatLiveInstances()
 			_, _ = h.s.st.ReapConnectInstances(connectGraceNew, connectGraceIdle)
 		}
+	}
+}
+
+// heartbeatLiveInstances persists activity for long-lived tunnels. Yamux
+// keepalives can keep one TCP connection healthy for months, so connection
+// open/close timestamps alone are not an idle signal.
+func (h *connectHost) heartbeatLiveInstances() {
+	h.mu.RLock()
+	names := make([]string, 0, len(h.sessions))
+	for name := range h.sessions {
+		names = append(names, name)
+	}
+	h.mu.RUnlock()
+	for _, name := range names {
+		_ = h.s.st.TouchConnectInstance(name)
 	}
 }

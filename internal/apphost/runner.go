@@ -1,6 +1,7 @@
 package apphost
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8,9 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -28,7 +33,9 @@ const (
 	appIDLabel         = "com.agenttransfer.apphost.app-id"
 	releaseIDLabel     = "com.agenttransfer.apphost.release-id"
 	containerPortLabel = "com.agenttransfer.apphost.container-port"
+	sourceImageLabel   = "com.agenttransfer.apphost.source-image"
 	containerNameBase  = "agenttransfer-app-"
+	networkNameBase    = "agenttransfer-net-"
 	containerUserID    = 65532
 	maxRequestBytes    = 64 << 10
 	maxDockerOutput    = 16 << 20
@@ -51,12 +58,20 @@ var (
 )
 
 type runner struct {
-	cfg      RunnerConfig
-	root     string
-	docker   string
-	authHash [sha256.Size]byte
-	appLocks sync.Map   // app id -> *sync.Mutex
-	buildMu  sync.Mutex // bound host pressure: only one untrusted Dockerfile build at a time
+	cfg             RunnerConfig
+	buildRoot       string
+	dataRoot        string
+	snapshotRoot    string
+	docker          string
+	authHash        [sha256.Size]byte
+	appLocks        sync.Map   // app id -> *sync.Mutex
+	externalImageMu sync.Mutex // source tags are global Docker state across apps
+	// internalNetworkState is 0 unproven, 1 proven host-routable, and -1
+	// reserved for an engine that can be identified as unsupported without
+	// conflating that platform property with one unhealthy tenant app.
+	internalNetworkState atomic.Int32
+	buildAdmission       chan struct{}
+	buildSlot            chan struct{} // only one untrusted Dockerfile build at a time
 }
 
 // RunRunner serves the authenticated runner API on cfg.SocketPath until ctx
@@ -102,27 +117,37 @@ func RunRunner(ctx context.Context, cfg RunnerConfig) error {
 }
 
 func newRunner(cfg RunnerConfig) (*runner, error) {
-	if cfg.AppRoot == "" || strings.Contains(cfg.AppRoot, ",") || hasControl(cfg.AppRoot) {
-		return nil, errors.New("apphost: APP_ROOT is required")
+	if cfg.BuildRoot == "" || strings.Contains(cfg.BuildRoot, ",") || hasControl(cfg.BuildRoot) {
+		return nil, errors.New("apphost: APP_BUILD_ROOT is required")
 	}
-	root, err := filepath.Abs(cfg.AppRoot)
+	buildRoot, err := filepath.Abs(cfg.BuildRoot)
 	if err != nil {
-		return nil, fmt.Errorf("apphost: resolve APP_ROOT: %w", err)
+		return nil, fmt.Errorf("apphost: resolve APP_BUILD_ROOT: %w", err)
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, fmt.Errorf("apphost: create APP_ROOT: %w", err)
-	}
-	root, err = filepath.EvalSymlinks(root)
+	buildRoot, err = filepath.EvalSymlinks(buildRoot)
 	if err != nil {
-		return nil, fmt.Errorf("apphost: resolve APP_ROOT symlinks: %w", err)
+		return nil, fmt.Errorf("apphost: resolve APP_BUILD_ROOT symlinks: %w", err)
 	}
-	info, err := os.Stat(root)
+	info, err := os.Stat(buildRoot)
 	if err != nil || !info.IsDir() {
-		return nil, errors.New("apphost: APP_ROOT is not a directory")
+		return nil, errors.New("apphost: APP_BUILD_ROOT is not a directory")
 	}
-
+	dataRoot, err := prepareOwnedRoot(cfg.DataRoot, "APP_DATA_ROOT")
+	if err != nil {
+		return nil, err
+	}
+	snapshotRoot, err := prepareOwnedRoot(cfg.SnapshotRoot, "APP_SNAPSHOT_ROOT")
+	if err != nil {
+		return nil, err
+	}
+	if rootsOverlap(buildRoot, dataRoot) || rootsOverlap(buildRoot, snapshotRoot) || rootsOverlap(dataRoot, snapshotRoot) {
+		return nil, errors.New("apphost: build, data, and snapshot roots must be separate, non-nested trees")
+	}
+	if err := clearOwnedRoot(snapshotRoot); err != nil {
+		return nil, fmt.Errorf("apphost: clear APP_SNAPSHOT_ROOT: %w", err)
+	}
 	if cfg.SocketPath == "" {
-		cfg.SocketPath = filepath.Join(root, "runner.sock")
+		return nil, errors.New("apphost: APP_RUNNER_SOCKET is required")
 	}
 	cfg.SocketPath, err = filepath.Abs(cfg.SocketPath)
 	if err != nil {
@@ -153,11 +178,29 @@ func newRunner(cfg RunnerConfig) (*runner, error) {
 	if !imagePrefixPattern.MatchString(cfg.ImagePrefix) {
 		return nil, errors.New("apphost: image prefix must be a lowercase local repository name")
 	}
+	if len(cfg.AllowedRegistries) == 0 {
+		cfg.AllowedRegistries = []string{"docker.io", "ghcr.io"}
+	}
+	seenRegistry := map[string]bool{}
+	for i, registry := range cfg.AllowedRegistries {
+		registry = strings.ToLower(strings.TrimSpace(registry))
+		if registry == "" || validateRegistryHost(registry) != nil || seenRegistry[registry] {
+			return nil, fmt.Errorf("apphost: invalid or duplicate allowed registry %q", registry)
+		}
+		seenRegistry[registry] = true
+		cfg.AllowedRegistries[i] = registry
+	}
 	if cfg.BuildNetwork == "" {
 		cfg.BuildNetwork = "none"
 	}
 	if cfg.BuildNetwork != "none" && cfg.BuildNetwork != "bridge" {
 		return nil, errors.New("apphost: build network must be none or bridge")
+	}
+	if cfg.MaxBuildQueue == 0 {
+		cfg.MaxBuildQueue = 8
+	}
+	if cfg.MaxBuildQueue < 1 || cfg.MaxBuildQueue > 64 {
+		return nil, errors.New("apphost: MaxBuildQueue must be between 1 and 64")
 	}
 	if cfg.CommandTimeout <= 0 {
 		cfg.CommandTimeout = 30 * time.Second
@@ -182,6 +225,18 @@ func newRunner(cfg RunnerConfig) (*runner, error) {
 	}
 	if cfg.MaxLogLines > 10000 {
 		return nil, errors.New("apphost: MaxLogLines may not exceed 10000")
+	}
+	if cfg.MaxBuildContextBytes <= 0 {
+		cfg.MaxBuildContextBytes = 10 << 30
+	}
+	if cfg.MaxBuildContextBytes > 100<<30 {
+		return nil, errors.New("apphost: MaxBuildContextBytes may not exceed 100GB")
+	}
+	if cfg.MaxImageBytes <= 0 {
+		cfg.MaxImageBytes = 10 << 30
+	}
+	if cfg.MaxImageBytes > 100<<30 {
+		return nil, errors.New("apphost: MaxImageBytes may not exceed 100GB")
 	}
 	if cfg.CPUCount <= 0 {
 		cfg.CPUCount = 1
@@ -212,9 +267,75 @@ func newRunner(cfg RunnerConfig) (*runner, error) {
 	}
 
 	return &runner{
-		cfg: cfg, root: root, docker: docker,
-		authHash: sha256.Sum256([]byte(cfg.AuthToken)),
+		cfg: cfg, buildRoot: buildRoot, dataRoot: dataRoot, snapshotRoot: snapshotRoot, docker: docker,
+		authHash:       sha256.Sum256([]byte(cfg.AuthToken)),
+		buildAdmission: make(chan struct{}, cfg.MaxBuildQueue),
+		buildSlot:      make(chan struct{}, 1),
 	}, nil
+}
+
+func prepareOwnedRoot(path, envName string) (string, error) {
+	if path == "" || strings.Contains(path, ",") || hasControl(path) {
+		return "", fmt.Errorf("apphost: %s is required", envName)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("apphost: resolve %s: %w", envName, err)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", fmt.Errorf("apphost: resolve %s parent: %w", envName, err)
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil || !parentInfo.IsDir() || parentInfo.Mode().Perm()&0o022 != 0 || fileOwnerUID(parentInfo) != uint32(os.Geteuid()) {
+		return "", fmt.Errorf("apphost: %s parent must be runner-owned and not group/world writable", envName)
+	}
+	canonical := filepath.Join(parent, filepath.Base(abs))
+	if err := os.Mkdir(canonical, 0o700); err != nil && !os.IsExist(err) {
+		return "", fmt.Errorf("apphost: create %s: %w", envName, err)
+	}
+	lstat, err := os.Lstat(canonical)
+	if err != nil || lstat.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("apphost: %s must not be a symlink", envName)
+	}
+	real, err := filepath.EvalSymlinks(canonical)
+	if err != nil || filepath.Clean(real) != filepath.Clean(canonical) {
+		return "", fmt.Errorf("apphost: resolve %s", envName)
+	}
+	info, err := os.Stat(real)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || fileOwnerUID(info) != uint32(os.Geteuid()) {
+		return "", fmt.Errorf("apphost: %s must be runner-owned and not group/world writable", envName)
+	}
+	return real, nil
+}
+
+func rootsOverlap(a, b string) bool {
+	return pathWithin(a, b) || pathWithin(b, a)
+}
+
+func clearOwnedRoot(path string) error {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fileOwnerUID(info os.FileInfo) uint32 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return stat.Uid
+	}
+	return ^uint32(0)
 }
 
 func listenUnix(path string, mode os.FileMode, gid int) (net.Listener, error) {
@@ -262,11 +383,14 @@ func (r *runner) handler() http.Handler {
 	mux.HandleFunc(apiPrefix+"/apps/{id}/logs", r.handleLogs)
 	mux.HandleFunc(apiPrefix+"/apps/{id}/stop", r.handleStop)
 	mux.HandleFunc(apiPrefix+"/apps/{id}/remove", r.handleRemoveApp)
+	mux.HandleFunc(apiPrefix+"/apps/{id}/images/{release}/remove", r.handleRemoveImage)
 	mux.HandleFunc(apiPrefix+"/apps/{id}/reconcile", r.handleReconcileApp)
 	mux.HandleFunc(apiPrefix+"/apps/{id}/purge", r.handlePurge)
 	mux.HandleFunc(apiPrefix+"/runtimes/{id}/status", r.handleRuntimeStatus)
+	mux.HandleFunc(apiPrefix+"/runtimes/{id}/route", r.handleRuntimeRoute)
 	mux.HandleFunc(apiPrefix+"/runtimes/{id}/logs", r.handleRuntimeLogs)
 	mux.HandleFunc(apiPrefix+"/runtimes/{id}/stop", r.handleRuntimeStop)
+	mux.HandleFunc(apiPrefix+"/runtimes/{id}/start", r.handleRuntimeStart)
 	mux.HandleFunc(apiPrefix+"/runtimes/{id}/remove", r.handleRuntimeRemove)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeRunnerError(w, http.StatusNotFound, "runner endpoint not found")
@@ -305,11 +429,85 @@ func (r *runner) handleHealth(w http.ResponseWriter, req *http.Request) {
 	if !requireMethod(w, req, http.MethodGet) {
 		return
 	}
-	writeRunnerJSON(w, http.StatusOK, healthResult{OK: true})
+	result, err := r.runDocker(req.Context(), minDuration(r.cfg.CommandTimeout, 5*time.Second),
+		"version", "--format", "{{.Server.Version}}")
+	if err != nil || result.Truncated || strings.TrimSpace(result.Output) == "" {
+		writeRunnerError(w, http.StatusServiceUnavailable, "Docker engine is unavailable")
+		return
+	}
+	if !r.cfg.RuntimeEgress && r.internalNetworkState.Load() == 0 {
+		probeCtx, cancel := context.WithTimeout(req.Context(), 750*time.Millisecond)
+		r.probeExistingInternalNetwork(probeCtx)
+		cancel()
+	}
+	state := "unknown"
+	ready := r.cfg.RuntimeEgress
+	if ready || r.internalNetworkState.Load() == 1 {
+		state, ready = "ready", true
+	} else if r.internalNetworkState.Load() == -1 {
+		state = "unsupported"
+	}
+	writeRunnerJSON(w, http.StatusOK, healthResult{OK: true, ContainerReady: ready, ContainerState: state})
+}
+
+// probeExistingInternalNetwork restores an in-memory capability observation
+// after a normal runner restart. It inspects only running, runner-labeled
+// containers and trusts an endpoint only after the same network/IPAM checks
+// used during deployment.
+func (r *runner) probeExistingInternalNetwork(ctx context.Context) {
+	result, err := r.runDocker(ctx, minDuration(r.cfg.CommandTimeout, 500*time.Millisecond),
+		"ps", "--quiet", "--no-trunc", "--filter", "label="+managedLabel+"=true")
+	if err != nil || result.Truncated {
+		return
+	}
+	checked := 0
+	for _, line := range strings.Split(result.Output, "\n") {
+		id := strings.TrimSpace(line)
+		if id == "" || validateRuntimeID(id) != nil {
+			continue
+		}
+		checked++
+		if checked > 8 || ctx.Err() != nil {
+			return
+		}
+		status, err := r.inspectRuntimeMetadata(ctx, id, "")
+		if err != nil || !status.Running || status.URL == "" {
+			continue
+		}
+		routed, _ := probeDirectPort(ctx, status.URL, 250*time.Millisecond)
+		if routed {
+			r.internalNetworkState.Store(1)
+			return
+		}
+	}
+}
+
+var errBuildQueueFull = errors.New("build queue is full")
+
+func (r *runner) acquireBuild(ctx context.Context) (func(), error) {
+	select {
+	case r.buildAdmission <- struct{}{}:
+	default:
+		return nil, errBuildQueueFull
+	}
+	select {
+	case r.buildSlot <- struct{}{}:
+		return func() {
+			<-r.buildSlot
+			<-r.buildAdmission
+		}, nil
+	case <-ctx.Done():
+		<-r.buildAdmission
+		return nil, ctx.Err()
+	}
 }
 
 func (r *runner) handleBuild(w http.ResponseWriter, req *http.Request) {
 	if !requireMethod(w, req, http.MethodPost) {
+		return
+	}
+	if !r.cfg.AllowSourceBuilds {
+		writeRunnerError(w, http.StatusForbidden, "source container builds are disabled; deploy a digest-pinned image or explicitly trust Dockerfile builds")
 		return
 	}
 	var in BuildRequest
@@ -330,11 +528,30 @@ func (r *runner) handleBuild(w http.ResponseWriter, req *http.Request) {
 		writeRunnerError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	releaseBuild, err := r.acquireBuild(req.Context())
+	if errors.Is(err, errBuildQueueFull) {
+		w.Header().Set("Retry-After", "5")
+		writeRunnerError(w, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	if err != nil {
+		writeRunnerError(w, http.StatusRequestTimeout, "build request was cancelled while queued")
+		return
+	}
+	defer releaseBuild()
 	mu := r.appLock(in.AppID)
 	mu.Lock()
 	defer mu.Unlock()
-	r.buildMu.Lock()
-	defer r.buildMu.Unlock()
+	buildContext, err := r.snapshotBuildContext(contextDir, in.AppID, in.ReleaseID)
+	if err != nil {
+		writeRunnerError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer os.RemoveAll(buildContext)
+	if err := r.validateDockerfileSources(filepath.Join(buildContext, "Dockerfile")); err != nil {
+		writeRunnerError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	image := r.managedImage(in.AppID, in.ReleaseID)
 	buildNetwork := r.cfg.BuildNetwork
 	if buildNetwork == "bridge" {
@@ -357,7 +574,7 @@ func (r *runner) handleBuild(w http.ResponseWriter, req *http.Request) {
 		"--label", managedLabel+"=true",
 		"--label", appIDLabel+"="+in.AppID,
 		"--label", releaseIDLabel+"="+in.ReleaseID,
-		"--tag", image, contextDir)
+		"--tag", image, buildContext)
 	if err != nil {
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "image", "rm", image)
 		writeRunnerError(w, http.StatusBadGateway, err.Error())
@@ -397,6 +614,56 @@ func (r *runner) handleDeploy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeRunnerJSON(w, http.StatusOK, result)
+}
+
+func (r *runner) handleRemoveImage(w http.ResponseWriter, req *http.Request) {
+	if !requireMethod(w, req, http.MethodPost) {
+		return
+	}
+	appID, releaseID := req.PathValue("id"), req.PathValue("release")
+	if err := validateAppID(appID); err != nil {
+		writeRunnerError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !releaseIDPattern.MatchString(releaseID) {
+		writeRunnerError(w, http.StatusBadRequest, "invalid release_id")
+		return
+	}
+	mu := r.appLock(appID)
+	mu.Lock()
+	defer mu.Unlock()
+	image := r.managedImage(appID, releaseID)
+	result, err := r.runDocker(req.Context(), r.cfg.CommandTimeout,
+		"image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference="+image)
+	if err != nil {
+		writeRunnerError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if result.Truncated {
+		writeRunnerError(w, http.StatusBadGateway, "docker returned too many image references")
+		return
+	}
+	found := false
+	for _, line := range strings.Split(result.Output, "\n") {
+		candidate := strings.TrimSpace(line)
+		if candidate == "" {
+			continue
+		}
+		if candidate != image {
+			writeRunnerError(w, http.StatusBadGateway, "docker returned an unexpected image reference")
+			return
+		}
+		found = true
+	}
+	if found {
+		if _, err := r.runDocker(req.Context(), r.cfg.CommandTimeout, "image", "rm", image); err != nil {
+			writeRunnerError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	writeRunnerJSON(w, http.StatusOK, RemoveImageResult{
+		AppID: appID, ReleaseID: releaseID, Image: image, Removed: found,
+	})
 }
 
 func (r *runner) handleStatus(w http.ResponseWriter, req *http.Request) {
@@ -629,6 +896,30 @@ func (r *runner) handleRuntimeStatus(w http.ResponseWriter, req *http.Request) {
 	writeRunnerJSON(w, http.StatusOK, status)
 }
 
+// handleRuntimeRoute is the cheap routing attestation path. Unlike status it
+// does not traverse the writable /data tree, so a public proxy cache refresh
+// cannot turn into attacker-triggered filesystem accounting work.
+func (r *runner) handleRuntimeRoute(w http.ResponseWriter, req *http.Request) {
+	if !requireMethod(w, req, http.MethodGet) {
+		return
+	}
+	id := req.PathValue("id")
+	if err := validateRuntimeID(id); err != nil {
+		writeRunnerError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status, err := r.inspectRuntimeMetadata(req.Context(), id, "")
+	if errors.Is(err, errRuntimeNotFound) {
+		writeRunnerError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	if err != nil {
+		writeRunnerError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeRunnerJSON(w, http.StatusOK, status)
+}
+
 func (r *runner) handleRuntimeLogs(w http.ResponseWriter, req *http.Request) {
 	if !requireMethod(w, req, http.MethodGet) {
 		return
@@ -692,6 +983,63 @@ func (r *runner) handleRuntimeStop(w http.ResponseWriter, req *http.Request) {
 	writeRunnerJSON(w, http.StatusOK, StopResult{AppID: status.AppID, RuntimeID: id, Stopped: true})
 }
 
+func (r *runner) handleRuntimeStart(w http.ResponseWriter, req *http.Request) {
+	if !requireMethod(w, req, http.MethodPost) {
+		return
+	}
+	id := req.PathValue("id")
+	if err := validateRuntimeID(id); err != nil {
+		writeRunnerError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status, err := r.inspectRuntimeMetadata(req.Context(), id, "")
+	if errors.Is(err, errRuntimeNotFound) {
+		writeRunnerError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	if err != nil {
+		writeRunnerError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	mu := r.appLock(status.AppID)
+	mu.Lock()
+	defer mu.Unlock()
+	status, err = r.inspectRuntimeMetadata(req.Context(), id, status.AppID)
+	if err != nil {
+		writeRunnerError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !status.Running {
+		if _, err := r.runDocker(req.Context(), r.cfg.CommandTimeout, "start", id); err != nil {
+			writeRunnerError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	routeCtx, routeCancel := context.WithTimeout(req.Context(), r.cfg.CommandTimeout)
+	status, err = r.waitForStartedRuntimeRoute(routeCtx, id, status.AppID)
+	routeCancel()
+	if err != nil || !status.Running || status.URL == "" {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "stop", "--time", "10", id)
+		if err != nil {
+			writeRunnerError(w, http.StatusBadGateway, err.Error())
+		} else if !status.Running {
+			writeRunnerError(w, http.StatusBadGateway,
+				fmt.Sprintf("restarted runtime exited before routing (exit code %d)", status.ExitCode))
+		} else {
+			writeRunnerError(w, http.StatusBadGateway, "restarted runtime is not routable")
+		}
+		return
+	}
+	status.DataBytes, err = r.dataBytes(req.Context(), status.AppID)
+	if err != nil {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "stop", "--time", "10", id)
+		measureErr := fmt.Errorf("%w: %v", errDataMeasurement, err)
+		writeRunnerError(w, runtimeStatusHTTPCode(measureErr), measureErr.Error())
+		return
+	}
+	writeRunnerJSON(w, http.StatusOK, status)
+}
+
 func (r *runner) handleRuntimeRemove(w http.ResponseWriter, req *http.Request) {
 	if !requireMethod(w, req, http.MethodPost) {
 		return
@@ -728,11 +1076,15 @@ func (r *runner) removeRuntimeResource(ctx context.Context, runtimeID string, st
 	if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID); err != nil {
 		return err
 	}
-	// Built images are release-scoped. Once their exact runtime is gone, try
-	// to reclaim the image as well; Docker safely refuses while another
-	// container still references it. External registry images stay cached.
+	// Once the exact runtime is gone, reclaim only its runner-owned reference.
+	// Never remove by immutable ID: one ID may also carry another app release or
+	// an unrelated tag, and ID deletion can either fail or remove that reference.
 	if status.Image == r.managedImage(status.AppID, status.ReleaseID) {
 		_, _ = r.runDocker(ctx, r.cfg.CommandTimeout, "image", "rm", status.Image)
+	} else {
+		r.externalImageMu.Lock()
+		defer r.externalImageMu.Unlock()
+		_, _ = r.runDocker(ctx, r.cfg.CommandTimeout, "image", "rm", r.externalImage(status.AppID, status.ReleaseID))
 	}
 	return nil
 }
@@ -789,13 +1141,21 @@ func (r *runner) containerName(appID, releaseID string) string {
 	return containerNameBase + appID + "-" + releaseID
 }
 
+func (r *runner) networkName(appID string) string {
+	return networkNameBase + appID
+}
+
+func (r *runner) externalImage(appID, releaseID string) string {
+	return r.cfg.ImagePrefix + "-external/" + appID + ":" + releaseID
+}
+
 func (r *runner) confinedBuildContext(path string) (string, error) {
 	if strings.TrimSpace(path) == "" || strings.IndexByte(path, 0) >= 0 {
 		return "", errors.New("context_dir is required")
 	}
 	candidate := path
 	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(r.root, candidate)
+		candidate = filepath.Join(r.buildRoot, candidate)
 	}
 	abs, err := filepath.Abs(candidate)
 	if err != nil {
@@ -805,8 +1165,8 @@ func (r *runner) confinedBuildContext(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("context_dir is unavailable: %w", err)
 	}
-	if !pathWithin(r.root, real) || filepath.Clean(real) == filepath.Clean(r.root) {
-		return "", errors.New("context_dir must resolve beneath APP_ROOT")
+	if !pathWithin(r.buildRoot, real) || filepath.Clean(real) == filepath.Clean(r.buildRoot) {
+		return "", errors.New("context_dir must resolve beneath APP_BUILD_ROOT")
 	}
 	info, err := os.Stat(real)
 	if err != nil || !info.IsDir() {
@@ -821,6 +1181,135 @@ func (r *runner) confinedBuildContext(path string) (string, error) {
 		return "", errors.New("Dockerfile exceeds 1 MiB")
 	}
 	return real, nil
+}
+
+// snapshotBuildContext copies a public-service-owned context into the
+// runner-owned data tree through descriptor-anchored os.Root handles. Docker
+// never reads the mutable public tree directly, closing both symlink and
+// rename races between validation and build.
+func (r *runner) snapshotBuildContext(contextDir, appID, releaseID string) (string, error) {
+	rel, err := filepath.Rel(r.buildRoot, contextDir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("build context escaped APP_BUILD_ROOT")
+	}
+	buildRoot, err := os.OpenRoot(r.buildRoot)
+	if err != nil {
+		return "", fmt.Errorf("open build root: %w", err)
+	}
+	defer buildRoot.Close()
+	source, err := buildRoot.OpenRoot(filepath.ToSlash(rel))
+	if err != nil {
+		return "", fmt.Errorf("open confined build context: %w", err)
+	}
+	defer source.Close()
+	sourceInfo, err := source.Stat(".")
+	if err != nil || !sourceInfo.IsDir() {
+		return "", errors.New("build context is not a directory")
+	}
+	sourceDevice := fileDevice(sourceInfo)
+
+	snapshotRoot, err := os.OpenRoot(r.snapshotRoot)
+	if err != nil {
+		return "", fmt.Errorf("open snapshot root: %w", err)
+	}
+	defer snapshotRoot.Close()
+	stageRel := filepath.ToSlash(filepath.Join(appID, releaseID))
+	if err := snapshotRoot.RemoveAll(stageRel); err != nil {
+		return "", fmt.Errorf("clear build snapshot: %w", err)
+	}
+	if err := snapshotRoot.MkdirAll(stageRel, 0o700); err != nil {
+		return "", fmt.Errorf("create build snapshot: %w", err)
+	}
+	cleanup := func(err error) (string, error) {
+		_ = snapshotRoot.RemoveAll(stageRel)
+		return "", err
+	}
+	destination, err := snapshotRoot.OpenRoot(stageRel)
+	if err != nil {
+		return cleanup(fmt.Errorf("open build snapshot: %w", err))
+	}
+	defer destination.Close()
+
+	const maxEntries = 100000
+	entries := 0
+	var total int64
+	err = fs.WalkDir(source.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." {
+			return nil
+		}
+		entries++
+		if entries > maxEntries {
+			return fmt.Errorf("build context exceeds %d entries", maxEntries)
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("build context contains symlink %q", name)
+		}
+		info, err := source.Lstat(name)
+		if err != nil {
+			return err
+		}
+		if fileDevice(info) != sourceDevice {
+			return fmt.Errorf("build context crosses a filesystem boundary at %q", name)
+		}
+		if info.IsDir() {
+			return destination.Mkdir(name, 0o755)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("build context contains non-regular file %q", name)
+		}
+		if info.Size() < 0 || total > r.cfg.MaxBuildContextBytes-info.Size() {
+			return fmt.Errorf("build context exceeds %d bytes", r.cfg.MaxBuildContextBytes)
+		}
+		src, err := source.Open(name)
+		if err != nil {
+			return err
+		}
+		openedInfo, err := src.Stat()
+		if err != nil || !openedInfo.Mode().IsRegular() || fileDevice(openedInfo) != sourceDevice {
+			src.Close()
+			return fmt.Errorf("build context file changed during snapshot: %q", name)
+		}
+		mode := os.FileMode(0o644)
+		if openedInfo.Mode().Perm()&0o111 != 0 {
+			mode = 0o755
+		}
+		dst, err := destination.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+		if err != nil {
+			return err
+		}
+		n, copyErr := io.Copy(dst, io.LimitReader(src, r.cfg.MaxBuildContextBytes-total+1))
+		closeErr := dst.Close()
+		src.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if n != openedInfo.Size() || total > r.cfg.MaxBuildContextBytes-n {
+			return fmt.Errorf("build context file changed size during snapshot: %q", name)
+		}
+		total += n
+		return nil
+	})
+	if err != nil {
+		return cleanup(fmt.Errorf("snapshot build context: %w", err))
+	}
+	dockerfile, err := destination.Lstat("Dockerfile")
+	if err != nil || !dockerfile.Mode().IsRegular() || dockerfile.Size() > 1<<20 {
+		return cleanup(errors.New("build snapshot must contain a regular Dockerfile up to 1 MiB"))
+	}
+	return filepath.Join(r.snapshotRoot, filepath.FromSlash(stageRel)), nil
+}
+
+func fileDevice(info os.FileInfo) uint64 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Dev)
+	}
+	return ^uint64(0)
 }
 
 func pathWithin(root, candidate string) bool {
@@ -839,7 +1328,7 @@ func (r *runner) validateDeploy(in DeployRequest) error {
 		if strings.HasPrefix(in.Image, r.cfg.ImagePrefix+"/") {
 			return errors.New("managed image name does not match app_id and release_id")
 		}
-		if err := validateRegistryImage(in.Image); err != nil {
+		if err := r.validateExternalImage(in.Image); err != nil {
 			return err
 		}
 	}
@@ -908,6 +1397,173 @@ func validateRegistryImage(image string) error {
 		if !repositoryComponentPattern.MatchString(component) {
 			return errors.New("invalid registry repository component")
 		}
+	}
+	return nil
+}
+
+func registryForImage(image string) string {
+	name := image
+	if before, _, ok := strings.Cut(name, "@"); ok {
+		name = before
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) > 1 && (strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
+		return strings.ToLower(parts[0])
+	}
+	return "docker.io"
+}
+
+func (r *runner) validateExternalImage(image string) error {
+	if err := validateRegistryImage(image); err != nil {
+		return err
+	}
+	if _, digest, ok := strings.Cut(image, "@"); !ok || !strings.HasPrefix(digest, "sha256:") {
+		return errors.New("external images must be pinned by sha256 digest")
+	}
+	registry := registryForImage(image)
+	for _, allowed := range r.cfg.AllowedRegistries {
+		if registry == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("registry %q is not in APP_ALLOWED_REGISTRIES", registry)
+}
+
+func (r *runner) validateDockerfileSources(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open Dockerfile policy input: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat Dockerfile policy input: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return errors.New("Dockerfile policy input must be a regular file up to 1 MiB")
+	}
+	scanner := bufio.NewScanner(io.LimitReader(f, (1<<20)+1))
+	scanner.Buffer(make([]byte, 64<<10), (1<<20)+1)
+	stages := map[string]bool{}
+	found := false
+	firstLine := true
+	for scanner.Scan() {
+		rawLine := scanner.Text()
+		if firstLine && strings.HasPrefix(rawLine, "\ufeff") {
+			return errors.New("Dockerfile byte-order marks are not allowed")
+		}
+		firstLine = false
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "#") {
+			directive := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "#")))
+			key, _, hasValue := strings.Cut(directive, "=")
+			switch strings.TrimSpace(key) {
+			case "syntax":
+				return errors.New("remote Dockerfile syntax frontends are not allowed")
+			case "escape":
+				if hasValue {
+					return errors.New("Dockerfile escape directives are not allowed")
+				}
+			}
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Source-bearing instructions are deliberately parsed as one physical
+		// line. Reject continuations globally rather than letting Docker join a
+		// URL, image, flag, or variable reference that this policy saw only in
+		// fragments. Custom escape characters are rejected above for the same
+		// reason.
+		if strings.HasSuffix(line, "\\") {
+			return errors.New("Dockerfile line continuations are not allowed")
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		// Dockerfile heredocs make subsequent physical lines data rather than
+		// instructions. A lexical scanner could otherwise mistake a FROM inside
+		// that data for a real stage and then allow an external COPY --from under
+		// the forged alias. Strip Docker's ordinary quoting/escaping only for
+		// conservative feature detection, then reject heredocs fail-closed.
+		normalizedLine := strings.NewReplacer("\\", "", "\"", "", "'", "").Replace(line)
+		if strings.Contains(normalizedLine, "<<") {
+			return errors.New("Dockerfile heredocs are not allowed")
+		}
+		switch strings.ToUpper(fields[0]) {
+		case "ADD":
+			// ADD has remote URL and Git semantics, and Docker's lexer can hide
+			// those sources behind quotes or intra-line escapes. COPY provides the
+			// local-file behavior without that ambiguity.
+			return errors.New("Dockerfile ADD instructions are not allowed; use COPY for local files")
+		case "COPY":
+			if strings.Contains(line, "$") {
+				return errors.New("Dockerfile COPY variables are not allowed")
+			}
+			if strings.ContainsAny(line, "\\\"'") {
+				return errors.New("Dockerfile COPY quoting and escaping are not allowed")
+			}
+			for _, field := range fields[1:] {
+				lower := strings.ToLower(field)
+				if !strings.HasPrefix(lower, "--from") {
+					continue
+				}
+				from, ok := strings.CutPrefix(lower, "--from=")
+				if !ok || from == "" || !stages[from] {
+					return errors.New("Dockerfile COPY --from may reference only an earlier local stage")
+				}
+			}
+		case "RUN":
+			rest := strings.TrimSpace(strings.TrimPrefix(normalizedLine, fields[0]))
+			if strings.HasPrefix(rest, "--") {
+				// All RUN options are denied. Besides external bind sources, cache,
+				// secret, and SSH mounts can persist or share data across builds, and
+				// network/security/device options can weaken the build boundary.
+				return errors.New("Dockerfile RUN options, including mounts, are not allowed")
+			}
+		case "ONBUILD":
+			return errors.New("Dockerfile ONBUILD instructions are not allowed")
+		case "FROM":
+			if strings.ContainsAny(line, "\\\"'") {
+				return errors.New("Dockerfile FROM quoting and escaping are not allowed")
+			}
+			rest := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+			if strings.HasPrefix(rest, "--") {
+				return errors.New("Dockerfile FROM options are not allowed")
+			}
+		}
+		if !strings.EqualFold(fields[0], "FROM") {
+			continue
+		}
+		found = true
+		i := 1
+		if i >= len(fields) {
+			return errors.New("Dockerfile FROM is missing an image")
+		}
+		image := fields[i]
+		if strings.Contains(image, "$") {
+			return errors.New("Dockerfile FROM variables are not allowed")
+		}
+		if image != "scratch" && !stages[strings.ToLower(image)] {
+			if err := r.validateExternalImage(image); err != nil {
+				return fmt.Errorf("Dockerfile FROM %q: %w", image, err)
+			}
+		}
+		if i+2 < len(fields) && strings.EqualFold(fields[i+1], "AS") {
+			alias := strings.ToLower(fields[i+2])
+			if !repositoryComponentPattern.MatchString(alias) {
+				return errors.New("Dockerfile has an invalid stage alias")
+			}
+			stages[alias] = true
+		} else if i+1 != len(fields) {
+			return errors.New("Dockerfile FROM has unsupported syntax")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read Dockerfile: %w", err)
+	}
+	if !found {
+		return errors.New("Dockerfile has no FROM instruction")
 	}
 	return nil
 }
@@ -1006,31 +1662,65 @@ func hasControl(s string) bool {
 }
 
 func (r *runner) deploy(ctx context.Context, in DeployRequest) (DeployResponse, error) {
+	var imageRow dockerImageInspect
+	runtimeImage := in.Image
+	externalLocked := false
+	if !r.isManagedDeploy(in) {
+		r.externalImageMu.Lock()
+		externalLocked = true
+		defer func() {
+			if externalLocked {
+				r.externalImageMu.Unlock()
+			}
+		}()
+	}
 	if r.isManagedDeploy(in) {
-		if err := r.inspectManagedImage(ctx, in.AppID, in.ReleaseID, in.Image); err != nil {
+		var err error
+		imageRow, err = r.inspectManagedImage(ctx, in.AppID, in.ReleaseID, in.Image)
+		if err != nil {
 			// Source builds use a unique, release-scoped tag. Reclaim it when
 			// post-build policy validation fails (for example, an unsupported
 			// Dockerfile VOLUME) just as we do after a failed container start.
-			r.removeFailedManagedImage(in)
+			r.removeFailedImage(in)
 			return DeployResponse{}, err
 		}
 	} else {
 		if _, err := r.runDocker(ctx, r.cfg.PullTimeout, "pull", in.Image); err != nil {
 			return DeployResponse{}, fmt.Errorf("pull image: %w", err)
 		}
-		if err := r.inspectImageRuntimePolicy(ctx, in.Image); err != nil {
+		var err error
+		imageRow, err = r.inspectImageRuntimePolicy(ctx, in.Image)
+		if err != nil {
+			r.removeFailedImage(in)
 			return DeployResponse{}, err
+		}
+		runtimeImage = r.externalImage(in.AppID, in.ReleaseID)
+		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "image", "tag", imageRow.ID, runtimeImage); err != nil {
+			r.removeFailedImage(in)
+			return DeployResponse{}, fmt.Errorf("pin external image: %w", err)
 		}
 	}
 	dataDir, err := r.dataDir(in.AppID)
 	if err != nil {
+		r.removeFailedImage(in)
 		return DeployResponse{}, err
 	}
-	dataBytes, err := r.dataBytes(ctx, in.AppID)
-	if err != nil {
+	if _, err := r.dataBytes(ctx, in.AppID); err != nil {
+		r.removeFailedImage(in)
 		return DeployResponse{}, fmt.Errorf("measure app data: %w", err)
 	}
 	name := r.containerName(in.AppID, in.ReleaseID)
+	networkCreated, err := r.ensureAppNetwork(ctx, in.AppID)
+	if err != nil {
+		r.removeFailedImage(in)
+		return DeployResponse{}, fmt.Errorf("prepare app network: %w", err)
+	}
+	keepNetwork := false
+	defer func() {
+		if networkCreated && !keepNetwork {
+			_ = r.removeAppNetwork(context.Background(), in.AppID)
+		}
+	}()
 
 	user := strconv.Itoa(r.cfg.ContainerUID) + ":" + strconv.Itoa(r.cfg.ContainerGID)
 	tmpfs := fmt.Sprintf("rw,noexec,nosuid,nodev,size=%d,uid=%d,gid=%d,mode=1777",
@@ -1042,11 +1732,11 @@ func (r *runner) deploy(ctx context.Context, in DeployRequest) (DeployResponse, 
 		"--label", appIDLabel + "=" + in.AppID,
 		"--label", releaseIDLabel + "=" + in.ReleaseID,
 		"--label", containerPortLabel + "=" + strconv.Itoa(in.ContainerPort),
-		"--restart", "unless-stopped",
+		"--label", sourceImageLabel + "=" + in.Image,
 		"--log-driver", "local",
 		"--log-opt", "max-size=10m",
 		"--log-opt", "max-file=3",
-		"--network", "bridge",
+		"--network", r.networkName(in.AppID),
 		"--read-only",
 		"--user", user,
 		"--cap-drop", "ALL",
@@ -1059,7 +1749,9 @@ func (r *runner) deploy(ctx context.Context, in DeployRequest) (DeployResponse, 
 		"--memory", strconv.FormatInt(r.cfg.MemoryBytes, 10),
 		"--memory-swap", strconv.FormatInt(r.cfg.MemoryBytes, 10),
 		"--pids-limit", strconv.FormatInt(r.cfg.PIDsLimit, 10),
-		"--publish", fmt.Sprintf("127.0.0.1::%d/tcp", in.ContainerPort),
+	}
+	if r.cfg.RuntimeEgress {
+		args = append(args, "--publish", fmt.Sprintf("127.0.0.1::%d/tcp", in.ContainerPort))
 	}
 	keys := make([]string, 0, len(in.Env))
 	for key := range in.Env {
@@ -1069,56 +1761,109 @@ func (r *runner) deploy(ctx context.Context, in DeployRequest) (DeployResponse, 
 	for _, key := range keys {
 		args = append(args, "--env", key+"="+in.Env[key])
 	}
-	args = append(args, in.Image)
+	args = append(args, runtimeImage)
 	args = append(args, in.Command...)
 	_, err = r.runDocker(ctx, r.cfg.CommandTimeout, args...)
 	if err != nil {
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", name)
-		r.removeFailedManagedImage(in)
+		r.removeFailedImage(in)
 		return DeployResponse{}, fmt.Errorf("start runtime: %w", err)
 	}
-	startedStatus, err := r.inspectRuntimeMetadata(ctx, name, in.AppID)
-	if err != nil || startedStatus.ContainerID == "" || len(startedStatus.ContainerID) > 128 || hasControl(startedStatus.ContainerID) {
+	startedStatus, err := r.inspectStartedRuntimeMetadata(ctx, name, in.AppID)
+	if err != nil || startedStatus.ContainerID == "" || len(startedStatus.ContainerID) > 128 || hasControl(startedStatus.ContainerID) ||
+		startedStatus.ImageID != imageRow.ID || startedStatus.Image != in.Image {
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", name)
-		r.removeFailedManagedImage(in)
+		r.removeFailedImage(in)
 		if err != nil {
 			return DeployResponse{}, fmt.Errorf("inspect started runtime: %w", err)
 		}
 		return DeployResponse{}, errors.New("docker returned an invalid runtime id")
 	}
 	runtimeID := startedStatus.ContainerID
+	if !startedStatus.Running {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
+		r.removeFailedImage(in)
+		return DeployResponse{}, fmt.Errorf("container exited before health check (exit code %d)", startedStatus.ExitCode)
+	}
+	if !r.isManagedDeploy(in) {
+		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "image", "rm", in.Image); err != nil {
+			_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
+			r.removeFailedImage(in)
+			return DeployResponse{}, fmt.Errorf("release external image source tag: %w", err)
+		}
+	}
 
 	healthCtx, cancel := context.WithTimeout(ctx, r.cfg.HealthTimeout)
 	defer cancel()
-	upstream, err := r.waitForPort(healthCtx, name, in.ContainerPort)
+	routedStatus, err := r.waitForStartedRuntimeRoute(healthCtx, runtimeID, in.AppID)
+	if err == nil && !routedStatus.Running {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
+		r.removeFailedImage(in)
+		return DeployResponse{}, fmt.Errorf("container exited before health check (exit code %d)", routedStatus.ExitCode)
+	}
+	upstream := routedStatus.URL
+	if err == nil && !r.cfg.RuntimeEgress {
+		var routed bool
+		routed, err = waitForDirectPort(healthCtx, upstream)
+		if routed {
+			// A successful connection or an explicit refusal proves that the
+			// runner host can route to this private bridge address. Keep this
+			// capability separate from whether this tenant app is healthy.
+			r.internalNetworkState.Store(1)
+		}
+		if err != nil {
+			err = fmt.Errorf("internal app network address is not accepting connections; verify the app listens on port %d and, when the Docker bridge is not host-routable (including Docker Desktop), set APP_RUNTIME_EGRESS=true: %w", in.ContainerPort, err)
+		}
+	}
 	if err == nil {
 		err = waitHTTPHealthy(healthCtx, upstream+in.HealthPath)
 	}
 	if err != nil {
+		// A process may exit after Docker assigned its route but before either
+		// the TCP or HTTP probe succeeds. Prefer its concrete exit status over a
+		// generic timeout while the exact managed container still exists.
+		inspectCtx, inspectCancel := context.WithTimeout(context.Background(), r.cfg.CommandTimeout)
+		exitStatus, inspectErr := r.inspectStartedRuntimeMetadata(inspectCtx, runtimeID, in.AppID)
+		inspectCancel()
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
-		r.removeFailedManagedImage(in)
+		r.removeFailedImage(in)
+		if inspectErr == nil && !exitStatus.Running {
+			return DeployResponse{}, fmt.Errorf("container exited before health check (exit code %d)", exitStatus.ExitCode)
+		}
 		return DeployResponse{}, fmt.Errorf("health check failed: %w", err)
 	}
-	dataBytes, err = r.dataBytes(ctx, in.AppID)
+	// Do not give an unproven process an automatic restart loop: a bad command
+	// must settle in exited state so the runner can observe its code and roll
+	// back promptly. Enable restart persistence only after health succeeds.
+	if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "update", "--restart", "unless-stopped", runtimeID); err != nil {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
+		r.removeFailedImage(in)
+		return DeployResponse{}, fmt.Errorf("enable runtime restart policy: %w", err)
+	}
+	dataBytes, err := r.dataBytes(ctx, in.AppID)
 	if err != nil {
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID)
-		r.removeFailedManagedImage(in)
+		r.removeFailedImage(in)
 		return DeployResponse{}, fmt.Errorf("measure app data after start: %w", err)
 	}
+	keepNetwork = true
 	return DeployResponse{
 		AppID: in.AppID, ReleaseID: in.ReleaseID, RuntimeID: runtimeID, ContainerName: name,
 		Upstream: upstream, Image: in.Image, Healthy: true, DataBytes: dataBytes,
 	}, nil
 }
 
-func (r *runner) removeFailedManagedImage(in DeployRequest) {
+func (r *runner) removeFailedImage(in DeployRequest) {
 	if r.isManagedDeploy(in) {
 		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "image", "rm", in.Image)
+	} else {
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "image", "rm", in.Image)
+		_, _ = r.runDocker(context.Background(), r.cfg.CommandTimeout, "image", "rm", r.externalImage(in.AppID, in.ReleaseID))
 	}
 }
 
 func (r *runner) dataDir(appID string) (string, error) {
-	dir, err := secureSubdir(r.root, "data", appID)
+	dir, err := secureSubdir(r.dataRoot, appID)
 	if err != nil {
 		return "", fmt.Errorf("prepare app data: %w", err)
 	}
@@ -1155,36 +1900,76 @@ func secureSubdir(root string, components ...string) (string, error) {
 	return current, nil
 }
 
-func (r *runner) waitForPort(ctx context.Context, name string, containerPort int) (string, error) {
+// waitForStartedRuntimeRoute covers the small Docker race between `run -d`
+// returning and inspect publishing the container's loopback/private endpoint.
+// It also observes a short-lived process exit during that window, so callers
+// can report its exit code rather than an empty-IP parsing error.
+func (r *runner) waitForStartedRuntimeRoute(ctx context.Context, runtimeID, appID string) (AppStatus, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		result, err := r.runDocker(ctx, minDuration(r.cfg.CommandTimeout, 5*time.Second),
-			"port", name, strconv.Itoa(containerPort)+"/tcp")
-		if err == nil {
-			if upstream, parseErr := parseLoopbackPort(result.Output); parseErr == nil {
-				return upstream, nil
-			}
+		status, err := r.inspectStartedRuntimeMetadata(ctx, runtimeID, appID)
+		if err != nil {
+			return AppStatus{}, err
+		}
+		if !status.Running || status.URL != "" {
+			return status, nil
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return AppStatus{}, ctx.Err()
 		case <-ticker.C:
 		}
 	}
 }
 
-func parseLoopbackPort(output string) (string, error) {
-	line := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
-	host, portText, err := net.SplitHostPort(line)
-	if err != nil || host != "127.0.0.1" {
-		return "", errors.New("docker did not publish a loopback port")
+// waitForDirectPort distinguishes host routing from application readiness.
+// ECONNREFUSED still proves that the private bridge address is reachable; the
+// caller may safely remember that engine capability even though this app did
+// not start listening before its deadline.
+func waitForDirectPort(ctx context.Context, upstream string) (bool, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	routed := false
+	var last error
+	for {
+		observed, dialErr := probeDirectPort(ctx, upstream, 500*time.Millisecond)
+		routed = routed || observed
+		if dialErr == nil {
+			return routed, nil
+		}
+		last = dialErr
+		select {
+		case <-ctx.Done():
+			if last == nil {
+				last = ctx.Err()
+			}
+			return routed, last
+		case <-ticker.C:
+		}
 	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return "", errors.New("docker returned an invalid host port")
+}
+
+func probeDirectPort(ctx context.Context, upstream string, timeout time.Duration) (bool, error) {
+	target, err := urlHostPort(upstream)
+	if err != nil {
+		return false, err
 	}
-	return "http://127.0.0.1:" + strconv.Itoa(port), nil
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", target)
+	if err == nil {
+		_ = conn.Close()
+		return true, nil
+	}
+	return errors.Is(err, syscall.ECONNREFUSED), err
+}
+
+func urlHostPort(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" || u.Port() == "" {
+		return "", errors.New("invalid internal runtime address")
+	}
+	return net.JoinHostPort(u.Hostname(), u.Port()), nil
 }
 
 func waitHTTPHealthy(ctx context.Context, url string) error {
@@ -1226,8 +2011,9 @@ func waitHTTPHealthy(ctx context.Context, url string) error {
 }
 
 var (
-	errRuntimeNotFound = errors.New("runtime not found")
-	errDataMeasurement = errors.New("persistent data measurement failed")
+	errRuntimeNotFound     = errors.New("runtime not found")
+	errRuntimeRoutePending = errors.New("runtime route is not ready")
+	errDataMeasurement     = errors.New("persistent data measurement failed")
 )
 
 func runtimeStatusHTTPCode(err error) int {
@@ -1240,19 +2026,24 @@ func runtimeStatusHTTPCode(err error) int {
 	return http.StatusBadGateway
 }
 
-func (r *runner) inspectManagedImage(ctx context.Context, appID, releaseID, image string) error {
+func (r *runner) inspectManagedImage(ctx context.Context, appID, releaseID, image string) (dockerImageInspect, error) {
 	row, err := r.inspectImage(ctx, image)
 	if err != nil {
-		return err
+		return row, err
 	}
 	labels := row.Config.Labels
 	if labels[managedLabel] != "true" || labels[appIDLabel] != appID || labels[releaseIDLabel] != releaseID {
-		return errors.New("refusing to deploy an image not built for this app")
+		return row, errors.New("refusing to deploy an image not built for this app")
 	}
-	return validateImageVolumes(row.Config.Volumes)
+	if err := validateImageVolumes(row.Config.Volumes); err != nil {
+		return row, err
+	}
+	return row, nil
 }
 
 type dockerImageInspect struct {
+	ID     string `json:"Id"`
+	Size   int64  `json:"Size"`
 	Config struct {
 		Labels  map[string]string          `json:"Labels"`
 		Volumes map[string]json.RawMessage `json:"Volumes"`
@@ -1268,15 +2059,176 @@ func (r *runner) inspectImage(ctx context.Context, image string) (dockerImageIns
 	if err := json.Unmarshal([]byte(result.Output), &rows); err != nil || len(rows) != 1 {
 		return dockerImageInspect{}, errors.New("docker image inspect returned invalid JSON")
 	}
+	if !validImageID(rows[0].ID) {
+		return dockerImageInspect{}, errors.New("docker image inspect returned an invalid image id")
+	}
+	if rows[0].Size < 0 || rows[0].Size > r.cfg.MaxImageBytes {
+		return rows[0], fmt.Errorf("image size %d exceeds runner limit %d", rows[0].Size, r.cfg.MaxImageBytes)
+	}
 	return rows[0], nil
 }
 
-func (r *runner) inspectImageRuntimePolicy(ctx context.Context, image string) error {
+func (r *runner) inspectImageRuntimePolicy(ctx context.Context, image string) (dockerImageInspect, error) {
 	row, err := r.inspectImage(ctx, image)
 	if err != nil {
+		return row, err
+	}
+	if err := validateImageVolumes(row.Config.Volumes); err != nil {
+		return row, err
+	}
+	return row, nil
+}
+
+func validImageID(id string) bool {
+	hexID, ok := strings.CutPrefix(id, "sha256:")
+	return ok && len(hexID) == 64 && runtimeIDPattern.MatchString(hexID)
+}
+
+type dockerNetworkInspect struct {
+	ID       string            `json:"Id"`
+	Name     string            `json:"Name"`
+	Driver   string            `json:"Driver"`
+	Internal bool              `json:"Internal"`
+	Labels   map[string]string `json:"Labels"`
+	Options  map[string]string `json:"Options"`
+	IPAM     struct {
+		Driver string `json:"Driver"`
+		Config []struct {
+			Subnet string `json:"Subnet"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+}
+
+func (r *runner) ensureAppNetwork(ctx context.Context, appID string) (bool, error) {
+	name := r.networkName(appID)
+	created := false
+	result, err := r.runDocker(ctx, r.cfg.CommandTimeout, "network", "inspect", name)
+	if err != nil {
+		if !dockerNotFound(result.Output) {
+			return false, err
+		}
+		args := []string{"network", "create", "--driver", "bridge"}
+		if !r.cfg.RuntimeEgress {
+			args = append(args, "--internal")
+		}
+		args = append(args,
+			"--label", managedLabel+"=true",
+			"--label", appIDLabel+"="+appID,
+			"--opt", "com.docker.network.bridge.enable_icc=false", name)
+		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, args...); err != nil {
+			return false, err
+		}
+		created = true
+		result, err = r.runDocker(ctx, r.cfg.CommandTimeout, "network", "inspect", name)
+		if err != nil {
+			_ = r.removeAppNetwork(context.Background(), appID)
+			return false, err
+		}
+	}
+	var rows []dockerNetworkInspect
+	if err := json.Unmarshal([]byte(result.Output), &rows); err != nil || len(rows) != 1 {
+		if created {
+			_ = r.removeAppNetwork(context.Background(), appID)
+		}
+		return false, errors.New("docker network inspect returned invalid JSON")
+	}
+	row := rows[0]
+	if row.Name != name || row.Driver != "bridge" || row.Internal == r.cfg.RuntimeEgress || row.Labels[managedLabel] != "true" ||
+		row.Labels[appIDLabel] != appID || row.Options["com.docker.network.bridge.enable_icc"] != "false" {
+		if created {
+			_ = r.removeAppNetwork(context.Background(), appID)
+		}
+		return false, errors.New("refusing to use an unlabeled or unsafe app network")
+	}
+	return created, nil
+}
+
+var privateIPv4Prefixes = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+}
+
+// internalRuntimeUpstream accepts only the endpoint Docker attached to the
+// exact runner-owned app network. The IP must be RFC1918 and contained by an
+// RFC1918 IPAM subnet on that same network; labels or database values cannot
+// steer the server proxy toward another host-local service.
+func (r *runner) internalRuntimeUpstream(ctx context.Context, appID string, port int, running bool, endpoints map[string]dockerEndpointInspect) (string, string, error) {
+	name := r.networkName(appID)
+	endpoint, ok := endpoints[name]
+	if !ok || len(endpoints) != 1 {
+		if running && len(endpoints) == 0 {
+			return "", "", errRuntimeRoutePending
+		}
+		return "", "", errors.New("container is not attached exclusively to its app network")
+	}
+	if running && endpoint.IPAddress == "" {
+		return "", "", errRuntimeRoutePending
+	}
+	result, err := r.runDocker(ctx, r.cfg.CommandTimeout, "network", "inspect", name)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect app network endpoint: %w", err)
+	}
+	var rows []dockerNetworkInspect
+	if err := json.Unmarshal([]byte(result.Output), &rows); err != nil || len(rows) != 1 {
+		return "", "", errors.New("docker network inspect returned invalid JSON")
+	}
+	network := rows[0]
+	if network.ID == "" || hasControl(network.ID) || endpoint.NetworkID != network.ID ||
+		network.Name != name || network.Driver != "bridge" || !network.Internal ||
+		network.Labels[managedLabel] != "true" || network.Labels[appIDLabel] != appID ||
+		network.Options["com.docker.network.bridge.enable_icc"] != "false" {
+		return "", "", errors.New("container has an unsafe or mismatched app network endpoint")
+	}
+	if endpoint.IPAddress == "" && !running {
+		return "", "", nil
+	}
+	addr, err := netip.ParseAddr(endpoint.IPAddress)
+	if err != nil {
+		return "", "", errors.New("container app network returned an invalid IPv4 address")
+	}
+	addr = addr.Unmap()
+	if !addr.Is4() || !addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return "", "", errors.New("container app network address is not a private IPv4 address")
+	}
+	contained := false
+	for _, config := range network.IPAM.Config {
+		subnet, parseErr := netip.ParsePrefix(config.Subnet)
+		if parseErr != nil {
+			continue
+		}
+		subnet = subnet.Masked()
+		if privateIPv4Prefix(subnet) && subnet.Contains(addr) {
+			contained = true
+			break
+		}
+	}
+	if !contained {
+		return "", "", errors.New("container app network address is outside its private IPAM subnet")
+	}
+	host := addr.String()
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port)), host, nil
+}
+
+func privateIPv4Prefix(prefix netip.Prefix) bool {
+	if !prefix.IsValid() || !prefix.Addr().Is4() {
+		return false
+	}
+	for _, allowed := range privateIPv4Prefixes {
+		if prefix.Bits() >= allowed.Bits() && allowed.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *runner) removeAppNetwork(ctx context.Context, appID string) error {
+	name := r.networkName(appID)
+	result, err := r.runDocker(ctx, r.cfg.CommandTimeout, "network", "rm", name)
+	if err != nil && !dockerNotFound(result.Output) {
 		return err
 	}
-	return validateImageVolumes(row.Config.Volumes)
+	return nil
 }
 
 // Explicit mounts override image VOLUME metadata only at /data and /tmp.
@@ -1294,10 +2246,16 @@ func validateImageVolumes(volumes map[string]json.RawMessage) error {
 	return nil
 }
 
+type dockerEndpointInspect struct {
+	NetworkID string `json:"NetworkID"`
+	IPAddress string `json:"IPAddress"`
+}
+
 type dockerInspect struct {
-	ID     string `json:"Id"`
-	Name   string `json:"Name"`
-	Config struct {
+	ID      string `json:"Id"`
+	ImageID string `json:"Image"`
+	Name    string `json:"Name"`
+	Config  struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
@@ -1313,6 +2271,7 @@ type dockerInspect struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
+		Networks map[string]dockerEndpointInspect `json:"Networks"`
 	} `json:"NetworkSettings"`
 }
 
@@ -1329,6 +2288,18 @@ func (r *runner) inspectRuntime(ctx context.Context, target, expectedAppID strin
 }
 
 func (r *runner) inspectRuntimeMetadata(ctx context.Context, target, expectedAppID string) (AppStatus, error) {
+	return r.inspectRuntimeMetadataMode(ctx, target, expectedAppID, false)
+}
+
+// inspectStartedRuntimeMetadata permits a just-created container whose route
+// is not published yet (or which already exited) to return its authoritative
+// identity/state before route validation. Deployment then waits for either a
+// validated route or an exit instead of parsing transient empty metadata.
+func (r *runner) inspectStartedRuntimeMetadata(ctx context.Context, target, expectedAppID string) (AppStatus, error) {
+	return r.inspectRuntimeMetadataMode(ctx, target, expectedAppID, true)
+}
+
+func (r *runner) inspectRuntimeMetadataMode(ctx context.Context, target, expectedAppID string, allowStartedWithoutRoute bool) (AppStatus, error) {
 	result, err := r.runDocker(ctx, r.cfg.CommandTimeout, "inspect", target)
 	if err != nil {
 		if dockerNotFound(result.Output) {
@@ -1343,31 +2314,60 @@ func (r *runner) inspectRuntimeMetadata(ctx context.Context, target, expectedApp
 	d := rows[0]
 	appID := d.Config.Labels[appIDLabel]
 	releaseID := d.Config.Labels[releaseIDLabel]
+	sourceImage := d.Config.Labels[sourceImageLabel]
 	if d.Config.Labels[managedLabel] != "true" || validateAppID(appID) != nil || !releaseIDPattern.MatchString(releaseID) ||
 		(expectedAppID != "" && appID != expectedAppID) || strings.TrimPrefix(d.Name, "/") != r.containerName(appID, releaseID) {
 		return AppStatus{}, errors.New("refusing to manage an unlabeled or mismatched container")
 	}
+	if sourceImage == r.managedImage(appID, releaseID) {
+		if d.Config.Image != sourceImage {
+			return AppStatus{}, errors.New("managed container image reference is inconsistent")
+		}
+	} else if r.validateExternalImage(sourceImage) != nil || d.Config.Image != r.externalImage(appID, releaseID) {
+		return AppStatus{}, errors.New("external container image reference is inconsistent")
+	}
 	if !runtimeIDPattern.MatchString(d.ID) {
 		return AppStatus{}, errors.New("docker inspect returned an invalid runtime id")
 	}
+	if !validImageID(d.ImageID) {
+		return AppStatus{}, errors.New("docker inspect returned an invalid image id")
+	}
 	port, _ := strconv.Atoi(d.Config.Labels[containerPortLabel])
+	if port < 1 || port > 65535 {
+		return AppStatus{}, errors.New("container has an invalid port label")
+	}
 	status := AppStatus{
-		AppID: appID, ReleaseID: releaseID, Image: d.Config.Image, ContainerID: d.ID,
+		AppID: appID, ReleaseID: releaseID, Image: sourceImage, ImageID: d.ImageID, ContainerID: d.ID,
 		ContainerName: strings.TrimPrefix(d.Name, "/"), State: d.State.Status,
 		Running: d.State.Running, ExitCode: d.State.ExitCode,
 		StartedAt: d.State.StartedAt, FinishedAt: d.State.FinishedAt,
 	}
-	if bindings := d.NetworkSettings.Ports[strconv.Itoa(port)+"/tcp"]; len(bindings) > 0 && bindings[0].HostIP == "127.0.0.1" {
-		if hostPort, err := strconv.Atoi(bindings[0].HostPort); err == nil && hostPort > 0 && hostPort <= 65535 {
-			status.Host, status.Port = "127.0.0.1", hostPort
-			status.URL = "http://127.0.0.1:" + strconv.Itoa(hostPort)
-		}
+	if allowStartedWithoutRoute && !status.Running {
+		return status, nil
 	}
+	if r.cfg.RuntimeEgress {
+		bindings := d.NetworkSettings.Ports[strconv.Itoa(port)+"/tcp"]
+		if len(bindings) == 1 && bindings[0].HostIP == "127.0.0.1" {
+			if hostPort, err := strconv.Atoi(bindings[0].HostPort); err == nil && hostPort > 0 && hostPort <= 65535 {
+				status.Host, status.Port = "127.0.0.1", hostPort
+				status.URL = "http://127.0.0.1:" + strconv.Itoa(hostPort)
+			}
+		}
+		return status, nil
+	}
+	upstream, host, err := r.internalRuntimeUpstream(ctx, appID, port, d.State.Running, d.NetworkSettings.Networks)
+	if err != nil {
+		if allowStartedWithoutRoute && errors.Is(err, errRuntimeRoutePending) {
+			return status, nil
+		}
+		return AppStatus{}, err
+	}
+	status.Host, status.Port, status.URL = host, port, upstream
 	return status, nil
 }
 
 func (r *runner) dataBytes(ctx context.Context, appID string) (int64, error) {
-	dataRoot := filepath.Join(r.root, "data")
+	dataRoot := r.dataRoot
 	info, err := os.Lstat(dataRoot)
 	if os.IsNotExist(err) {
 		return 0, nil
@@ -1459,65 +2459,75 @@ func (r *runner) removeAppResources(ctx context.Context, appID string) (int, err
 	// Validate every target before the first destructive action. A forged or
 	// stale Docker listing must never trick the runner into removing a
 	// container that lacks the exact managed/app labels.
+	statuses := make(map[string]AppStatus, len(ids))
 	for _, runtimeID := range ids {
-		if _, err := r.inspectRuntimeMetadata(ctx, runtimeID, appID); err != nil {
+		status, err := r.inspectRuntimeMetadata(ctx, runtimeID, appID)
+		if err != nil {
 			return 0, err
 		}
+		statuses[runtimeID] = status
 	}
 	removed := 0
 	for _, runtimeID := range ids {
-		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "rm", "--force", "--volumes", runtimeID); err != nil {
+		if err := r.removeRuntimeResource(ctx, runtimeID, statuses[runtimeID]); err != nil {
 			return removed, fmt.Errorf("remove runtime %s: %w", runtimeID, err)
 		}
 		removed++
 	}
-	// Image discovery is label-based rather than inferred from the runtimes.
-	// That makes retries clean up an image left behind by a prior partial call,
-	// even when all containers are already gone.
-	images, err := r.listManagedImageIDs(ctx, appID)
+	// Image discovery uses runner-reserved managed/external reference namespaces
+	// rather than image-supplied labels. That makes retries clean up aliases left
+	// by a partial call without trusting labels on an untrusted external image.
+	images, err := r.listAppImageReferences(ctx, appID)
 	if err != nil {
 		return removed, err
 	}
-	for _, imageID := range images {
-		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "image", "rm", imageID); err != nil {
-			return removed, fmt.Errorf("remove managed image %s: %w", imageID, err)
+	for _, image := range images {
+		if _, err := r.runDocker(ctx, r.cfg.CommandTimeout, "image", "rm", image); err != nil {
+			return removed, fmt.Errorf("remove managed image %s: %w", image, err)
 		}
+	}
+	if err := r.removeAppNetwork(ctx, appID); err != nil {
+		return removed, fmt.Errorf("remove app network: %w", err)
 	}
 	return removed, nil
 }
 
-func (r *runner) listManagedImageIDs(ctx context.Context, appID string) ([]string, error) {
-	result, err := r.runDocker(ctx, r.cfg.CommandTimeout,
-		"image", "ls", "--quiet", "--no-trunc",
-		"--filter", "label="+managedLabel+"=true",
-		"--filter", "label="+appIDLabel+"="+appID)
-	if err != nil {
-		return nil, err
+func (r *runner) listAppImageReferences(ctx context.Context, appID string) ([]string, error) {
+	prefixes := []string{
+		r.cfg.ImagePrefix + "/" + appID + ":",
+		r.cfg.ImagePrefix + "-external/" + appID + ":",
 	}
-	if result.Truncated {
-		return nil, errors.New("docker returned too many managed images")
-	}
-	var ids []string
+	var images []string
 	seen := map[string]bool{}
-	for _, line := range strings.Split(result.Output, "\n") {
-		id := strings.TrimSpace(line)
-		if id == "" {
-			continue
+	for _, prefix := range prefixes {
+		result, err := r.runDocker(ctx, r.cfg.CommandTimeout,
+			"image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference="+prefix+"*")
+		if err != nil {
+			return nil, err
 		}
-		hexID := strings.TrimPrefix(id, "sha256:")
-		if !runtimeIDPattern.MatchString(hexID) {
-			return nil, errors.New("docker image ls returned an invalid image id")
+		if result.Truncated {
+			return nil, errors.New("docker returned too many app images")
 		}
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
+		for _, line := range strings.Split(result.Output, "\n") {
+			image := strings.TrimSpace(line)
+			if image == "" {
+				continue
+			}
+			releaseID, ok := strings.CutPrefix(image, prefix)
+			if !ok || !releaseIDPattern.MatchString(releaseID) {
+				return nil, errors.New("docker image ls returned an invalid app image reference")
+			}
+			if !seen[image] {
+				seen[image] = true
+				images = append(images, image)
+			}
 		}
 	}
-	return ids, nil
+	return images, nil
 }
 
 func (r *runner) purgeData(appID string) (bool, error) {
-	dataRoot := filepath.Join(r.root, "data")
+	dataRoot := r.dataRoot
 	info, err := os.Lstat(dataRoot)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -1541,7 +2551,9 @@ func (r *runner) purgeData(appID string) (bool, error) {
 
 func dockerNotFound(output string) bool {
 	s := strings.ToLower(output)
-	return strings.Contains(s, "no such object") || strings.Contains(s, "no such container")
+	return strings.Contains(s, "no such object") || strings.Contains(s, "no such container") ||
+		strings.Contains(s, "no such network") ||
+		(strings.Contains(s, "network") && strings.Contains(s, "not found"))
 }
 
 type commandResult struct {
@@ -1595,7 +2607,7 @@ func dockerOperation(args []string) string {
 		return "command"
 	}
 	switch args[0] {
-	case "build", "pull", "run", "ps", "inspect", "logs", "stop", "rm", "port", "image":
+	case "build", "pull", "run", "ps", "inspect", "logs", "start", "stop", "rm", "port", "image", "network", "version":
 		return args[0]
 	default:
 		return "command"

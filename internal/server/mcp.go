@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -33,7 +34,53 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+const (
+	maxMCPRequestBytes         = 4 << 20
+	latestMCPProtocolVersion   = "2025-11-25"
+	previousMCPProtocolVersion = "2025-06-18"
+)
+
+func negotiateMCPProtocolVersion(requested string) string {
+	switch requested {
+	case latestMCPProtocolVersion, previousMCPProtocolVersion:
+		return requested
+	default:
+		return latestMCPProtocolVersion
+	}
+}
+
+// validMCPOrigin enforces the Streamable HTTP DNS-rebinding defense. The
+// Origin header is an origin serialization, not a general URL: a path, query,
+// fragment, credentials, multiple values, or the special value "null" is
+// invalid. Requests from non-browser clients commonly omit Origin and remain
+// valid.
+func (s *Server) validMCPOrigin(r *http.Request) bool {
+	values := r.Header.Values("Origin")
+	if len(values) == 0 {
+		return true
+	}
+	if len(values) != 1 {
+		return false
+	}
+	origin, err := url.Parse(values[0])
+	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host == "" || origin.User != nil ||
+		origin.Opaque != "" || origin.Path != "" || origin.RawPath != "" ||
+		origin.RawQuery != "" || origin.ForceQuery || origin.Fragment != "" {
+		return false
+	}
+	base, err := url.Parse(s.BaseURL())
+	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil || base.Opaque != "" {
+		return false
+	}
+	return strings.EqualFold(origin.Scheme, base.Scheme) && strings.EqualFold(origin.Host, base.Host)
+}
+
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if !s.validMCPOrigin(r) {
+		errJSON(w, http.StatusForbidden, "Origin must match the configured AgentTransfer origin")
+		return
+	}
+
 	// JSON responses only — no server push stream, no sessions to delete.
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -47,9 +94,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxMCPRequestBytes+1))
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "read failed")
+		return
+	}
+	if len(body) > maxMCPRequestBytes {
+		errJSON(w, http.StatusRequestEntityTooLarge, "MCP request body exceeds 4 MiB")
 		return
 	}
 	var req rpcRequest
@@ -70,17 +121,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		_ = json.Unmarshal(req.Params, &p)
-		version := p.ProtocolVersion
-		if version == "" {
-			version = "2025-03-26"
-		}
 		s.rpcReply(w, req.ID, map[string]any{
-			"protocolVersion": version,
+			"protocolVersion": negotiateMCPProtocolVersion(p.ProtocolVersion),
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"serverInfo":      map[string]any{"name": "agenttransfer", "version": Version},
 			"instructions": "AgentTransfer: file transfer for AI agents. Upload files to your folder, " +
 				"mint expiring share links, send them to other agents (or humans) by email, " +
-				"and poll your inbox. Every action leaves a signed receipt.",
+				"and poll your inbox. Supported transfer and app-lifecycle events emit best-effort signed receipts.",
 		}, nil)
 	case "ping":
 		s.rpcReply(w, req.ID, map[string]any{}, nil)
@@ -143,7 +190,7 @@ func intp(desc string) map[string]any  { return map[string]any{"type": "integer"
 var mcpTools = []map[string]any{
 	{
 		"name":        "whoami",
-		"description": "Your agent identity: email address, storage usage and quota, owner verification, and remote-recipient circle.",
+		"description": "Your authenticated identity/provenance, public contact, encryption recipient, storage/limits, remote-recipient circle, and app-hosting readiness/status.",
 		"inputSchema": obj(map[string]any{}),
 	},
 	{
@@ -177,7 +224,7 @@ var mcpTools = []map[string]any{
 		"name": "send",
 		"description": "Send a message and/or a file to other agents or humans by email. Same-instance " +
 			"agents receive it instantly in their inbox; everyone else gets a normal email with a " +
-			"download link and a machine-readable manifest.",
+			"download link and a machine-readable manifest. A stable idempotency_key is required so uncertain retries cannot deliver twice.",
 		"inputSchema": obj(map[string]any{
 			"to":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "recipient email addresses"},
 			"file":     str("optional: \"sha256:...\" or folder filename to attach as a link"),
@@ -187,7 +234,12 @@ var mcpTools = []map[string]any{
 			"once":     boolp("burn-after-read link"),
 			"reply_to": str("inbox message id (msg_...) this replies to"),
 			"cc_owner": boolp("CC your human owner"),
-		}, "to"),
+			"enc_mode": str("optional client-encryption marker: symmetric or sealed"),
+			"idempotency_key": map[string]any{
+				"type": "string", "minLength": 1, "maxLength": store.MaxIdempotencyKeyBytes,
+				"pattern": "^[!-~]+$", "description": "required stable visible-ASCII key; reuse only for an uncertain retry of this exact send",
+			},
+		}, "to", "idempotency_key"),
 	},
 	{
 		"name":        "check_inbox",
@@ -252,28 +304,62 @@ var mcpTools = []map[string]any{
 	},
 }
 
+func validateMCPIdempotencyKey(key string) error {
+	if key == "" || len(key) > store.MaxIdempotencyKeyBytes {
+		return fmt.Errorf("idempotency_key must be 1-%d visible ASCII characters without spaces", store.MaxIdempotencyKeyBytes)
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x21 || key[i] > 0x7e {
+			return errors.New("idempotency_key must contain only visible ASCII characters without spaces")
+		}
+	}
+	return nil
+}
+
+// replayMCPSend converts the durable REST-shaped send response into the same
+// hosted tool success/error that originally produced it. Sharing this storage
+// shape also makes one key safe across REST and hosted MCP transports.
+func replayMCPSend(record store.IdempotencyRecord) (any, error) {
+	if record.Status >= http.StatusBadRequest {
+		var body struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(record.Response, &body); err != nil || body.Error == "" {
+			return nil, errors.New("stored idempotent send failure is corrupt")
+		}
+		return nil, errors.New(body.Error)
+	}
+	if !json.Valid(record.Response) {
+		return nil, errors.New("stored idempotent send result is corrupt")
+	}
+	return json.RawMessage(append([]byte(nil), record.Response...)), nil
+}
+
+func (s *Server) mcpWhoami(ctx context.Context, agent store.Agent) (map[string]any, error) {
+	out, err := s.whoamiProjection(ctx, agent)
+	if err != nil {
+		return nil, err
+	}
+	out["api"] = s.BaseURL() + "/v1"
+	// Retain the original hosted-MCP aliases while exposing the full REST
+	// projection above. Existing clients need not migrate atomically.
+	if storage, ok := out["storage"].(map[string]any); ok {
+		out["storage_used"] = storage["used"]
+		out["storage_quota"] = storage["quota"]
+		if expiry, exists := storage["files_expire_after"]; exists {
+			out["files_expire_after"] = expiry
+		}
+	}
+	return out, nil
+}
+
 func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, args json.RawMessage) (any, error) {
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
 	}
 	switch name {
 	case "whoami":
-		used, _ := s.st.StorageUsed(agent.ID)
-		circleUsed, _ := s.st.CountHumanRecipients(agent.ID)
-		out := map[string]any{
-			"agent_id": agent.ID, "name": agent.Name, "email": agent.Email,
-			"instance": s.st.Instance(), "owner_verified": agent.OwnerVerified,
-			// Tier-aware, matching REST whoami: unverified agents see the
-			// reduced quota that's actually enforced, not the full one.
-			"storage_used": used, "storage_quota": s.quotaFor(agent),
-			"remote_recipients": map[string]any{"used": circleUsed, "max": s.humanCircleMax(agent)},
-			"email_enabled":     s.emailCapable(),
-			"api":               s.BaseURL() + "/v1",
-		}
-		if exp := s.fileExpiry(agent); exp > 0 {
-			out["files_expire_after"] = s.cfg.UnverifiedFileTTL.String()
-		}
-		return out, nil
+		return s.mcpWhoami(ctx, agent)
 
 	case "list_files":
 		files, err := s.st.ListFiles(agent.ID)
@@ -344,15 +430,62 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		return s.linkJSON(l), nil
 
 	case "send":
-		var p sendRequest
+		var p struct {
+			To             []string `json:"to"`
+			File           string   `json:"file"`
+			Note           string   `json:"note"`
+			Subject        string   `json:"subject"`
+			TTL            string   `json:"ttl"`
+			Once           bool     `json:"once"`
+			ReplyTo        string   `json:"reply_to"`
+			CCOwner        bool     `json:"cc_owner"`
+			EncMode        string   `json:"enc_mode"`
+			IdempotencyKey string   `json:"idempotency_key"`
+		}
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		res, _, err := s.performSend(agent, p)
-		if err != nil {
+		if err := validateMCPIdempotencyKey(p.IdempotencyKey); err != nil {
 			return nil, err
 		}
-		return res, nil
+		req := normalizeSendRequest(sendRequest{
+			To: p.To, File: p.File, Note: p.Note, Subject: p.Subject, TTL: p.TTL,
+			Once: p.Once, ReplyTo: p.ReplyTo, CCOwner: p.CCOwner, EncMode: p.EncMode,
+		})
+		requestHash, err := sendRequestHash(req)
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint send request: %w", err)
+		}
+		record, created, err := s.st.BeginIdempotent(agent.ID, p.IdempotencyKey, requestHash)
+		switch {
+		case errors.Is(err, store.ErrIdempotencyConflict):
+			return nil, errors.New("idempotency_key is already bound to a different send request")
+		case errors.Is(err, store.ErrLimit):
+			return nil, err
+		case err != nil:
+			return nil, fmt.Errorf("reserve idempotency_key: %w", err)
+		case !created && record.Status == 0:
+			return nil, errors.New("this idempotency_key has an unfinished prior request; its outcome cannot be replayed")
+		case !created:
+			return replayMCPSend(record)
+		}
+
+		res, status, sendErr := s.performSend(agent, req)
+		var response any = res
+		if sendErr != nil {
+			response = map[string]string{"error": sendErr.Error()}
+		}
+		body, err := sendJSONBody(response)
+		if err != nil {
+			return nil, fmt.Errorf("encode send result: %w", err)
+		}
+		if err := s.st.CompleteIdempotent(agent.ID, p.IdempotencyKey, requestHash, status, body); err != nil {
+			return nil, fmt.Errorf("send finished but its idempotent result could not be persisted; retry only with the same key: %w", err)
+		}
+		if sendErr != nil {
+			return nil, sendErr
+		}
+		return json.RawMessage(body), nil
 
 	case "check_inbox":
 		var p struct {
@@ -405,7 +538,10 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		if err != nil {
 			return nil, errors.New("no such message")
 		}
-		_ = s.st.MarkRead(agent.ID, p.ID)
+		if err := s.st.MarkRead(agent.ID, p.ID); err != nil {
+			return nil, err
+		}
+		m.Read = true
 		return s.messageJSON(m), nil
 
 	case "download_file":
@@ -417,6 +553,7 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 			return nil, err
 		}
 		var sha, viaLink string
+		downloadActor := agent.Email
 		switch {
 		case p.SHA256 != "":
 			f, err := s.st.FileBySHA(agent.ID, strings.TrimPrefix(strings.ToLower(p.SHA256), "sha256:"))
@@ -451,6 +588,7 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 			}
 			sha = l.SHA256
 			viaLink = token
+			downloadActor = s.agentEmailByID(l.AgentID)
 		default:
 			return nil, errors.New("pass sha256 or url")
 		}
@@ -464,25 +602,50 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 			return nil, err
 		}
 		if info.Size() > 1<<20 {
+			downloadURL := s.BaseURL() + "/v1/files/" + sha + "/content"
+			note := "file exceeds the 1MiB inline cap; fetch it over HTTPS with your key"
+			if viaLink != "" {
+				// A capability-link downloader need not own the sender's folder row.
+				// Return the capability URL, not the owner-only folder endpoint.
+				downloadURL = s.linkURL(viaLink) + "?dl=1"
+				note = "file exceeds the 1MiB inline cap; fetch it from the share URL and verify the sha256"
+			}
 			return map[string]any{
-				"note":   "file exceeds the 1MiB inline cap; fetch it over HTTPS with your key",
+				"note":   note,
 				"sha256": sha,
 				"size":   info.Size(),
-				"url":    s.BaseURL() + "/v1/files/" + sha + "/content",
+				"url":    downloadURL,
 			}, nil
 		}
-		data, err := io.ReadAll(blob)
+		var reader io.Reader = blob
+		var guarded *severReader
+		if viaLink != "" {
+			guarded = &severReader{ReadSeeker: blob, s: s, token: viaLink}
+			reader = guarded
+		}
+		data, err := io.ReadAll(reader)
 		if err != nil {
+			if guarded != nil && guarded.severed {
+				return nil, errors.New("link was revoked during download")
+			}
 			return nil, err
 		}
 		// A link-served download counts on the link, exactly like GET /f/.
 		target := "mcp"
 		if viaLink != "" {
-			_ = s.st.CountDownload(viaLink)
+			if s.isSevered(viaLink) {
+				return nil, errors.New("link was revoked during download")
+			}
+			if err := s.st.CountActiveDownload(viaLink); err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					return nil, errors.New("link was revoked or expired during download")
+				}
+				return nil, fmt.Errorf("account link download: %w", err)
+			}
 			s.metrics.downloads.Add(1)
 			target = "link:" + viaLink
 		}
-		_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionDownloaded, sha, int64(len(data)), target, "")
+		s.appendReceipt(downloadActor, receipt.ActionDownloaded, sha, int64(len(data)), target, "")
 		return map[string]any{"sha256": sha, "size": len(data), "content_base64": base64.StdEncoding.EncodeToString(data)}, nil
 
 	case "create_upload_request":
@@ -525,11 +688,12 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 	case "app_status":
 		eligible, reason := s.appEligibility(agent)
 		app, err := s.st.AppByAgentID(agent.ID)
-		if errors.Is(err, store.ErrNotFound) && eligible {
-			app, err = s.st.EnsureApp(agent.ID, agent.Name)
-		}
 		if errors.Is(err, store.ErrNotFound) {
-			return map[string]any{"eligible": false, "reason": reason, "domain": s.cfg.AppDomain}, nil
+			out := map[string]any{"eligible": eligible, "domain": s.cfg.AppDomain, "app": nil}
+			if reason != "" {
+				out["reason"] = reason
+			}
+			return out, nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("app identity: %w", err)
@@ -622,12 +786,13 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		if p.Tail < 1 || p.Tail > 2000 {
 			return nil, errors.New("tail must be between 1 and 2000")
 		}
-		logs, status, err := s.appRuntimeLogs(ctx, agent.ID, p.Tail)
+		logResult, status, err := s.appRuntimeLogResult(ctx, agent.ID, p.Tail)
 		if err != nil {
 			return nil, fmt.Errorf("logs failed: %w", err)
 		}
+		logs := logResult.Output
 		const maxMCPLogBytes = 256 << 10
-		truncated := len(logs) > maxMCPLogBytes
+		truncated := logResult.Truncated || len(logs) > maxMCPLogBytes
 		if truncated {
 			logs = "[older output truncated]\n" + logs[len(logs)-maxMCPLogBytes:]
 		}

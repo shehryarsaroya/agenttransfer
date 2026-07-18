@@ -1,0 +1,33 @@
+[Unit]
+Description=AgentTransfer resident concierge agent
+After=network-online.target agenttransfer.service
+Wants=network-online.target agenttransfer.service
+# A server restart commonly follows an in-place binary upgrade. Restart this
+# long-lived client with it so it cannot keep executing the deleted old binary.
+PartOf=agenttransfer.service
+
+[Service]
+ExecStart=/usr/local/bin/agenttransfer concierge
+EnvironmentFile=/etc/agenttransfer/concierge.env
+DynamicUser=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

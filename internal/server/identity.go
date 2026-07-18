@@ -1,39 +1,38 @@
 package server
 
 import (
-	"net/http"
 	"strings"
 )
 
 // identityFor computes an agent's visible identity tier from signals we already
-// hold. It is the single source of truth for the `verified` object exposed on
+// hold. It is the single source of truth for the `identity` object exposed on
 // cards, the directory, pubkey lookups, and whoami — so those surfaces can't
 // drift apart.
 //
 // Tiers:
 //
-//	"domain" — a dedicated (non-open-signup) instance on its own attested domain
-//	           vouches for its agents by the domain alone: every agent there
-//	           belongs to that operator (e.g. bot@doordash.com on doordash.com).
-//	"owner"  — a human owner has been verified for this specific agent.
-//	"keyed"  — neither; the agent is just a key.
+//	"instance" — a closed-signup instance asserts the agent under its domain.
+//	"owner"    — an owner record has been verified for this specific agent.
+//	"keyed"    — neither; the agent is just an API-key identity.
 //
-// An open-signup domain is a shared public platform, so being hosted on it is
-// not an org signal — those agents top out at "owner". The `domain` is always
-// shown so a verifier can judge for itself; we never assert a checkmark.
+// An open-signup domain is a shared public platform, so merely being hosted on
+// it is not an organization signal. The basis is explicit and deliberately
+// avoids claiming independent TLS, DNS, DKIM, or legal-organization proof.
 func (s *Server) identityFor(ownerVerified bool) map[string]any {
-	domainAttested := s.cfg.EmailEnabled()
 	tier := "keyed"
+	basis := "api_key"
 	if ownerVerified {
 		tier = "owner"
+		basis = "owner_record"
 	}
-	if domainAttested && !s.cfg.OpenSignup {
-		tier = "domain"
+	if s.cfg.EmailEnabled() && !s.cfg.OpenSignup {
+		tier = "instance"
+		basis = "closed_instance"
 	}
 	return map[string]any{
-		"tier":            tier,
-		"domain":          s.st.Instance(),
-		"domain_attested": domainAttested,
+		"tier":     tier,
+		"instance": s.st.Instance(),
+		"basis":    basis,
 	}
 }
 
@@ -50,55 +49,4 @@ func senderIdentity(dkim, from string) map[string]any {
 		"domain":          domain,
 		"domain_verified": dkim == "pass" || dkim == "local",
 	}
-}
-
-// handleAgentCard serves an A2A-style Agent Card at /.well-known/agent-card.json
-// — a discovery/identity descriptor for the instance, using the A2A schema so
-// A2A tooling can read our capabilities and endpoints. It describes our real
-// transports (REST + MCP) and does not claim A2A task-protocol support we don't
-// implement.
-func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
-	base := s.BaseURL()
-	skills := []map[string]any{
-		{"id": "transfer", "name": "Transfer files", "description": "Send files up to 5GB to agents or humans; recipients download over HTTPS and verify the sha256.", "tags": []string{"files", "transfer", "sha256"},
-			"examples": []string{"send weights.tar.gz to codex-bot@" + s.st.Instance(), "share a 2GB dataset with another agent and verify the hash"}},
-		{"id": "inbox", "name": "Receive", "description": "Every agent has an inbox and email address; long-poll or webhook on arrival.", "tags": []string{"messaging", "email"},
-			"examples": []string{"wait for the next file to arrive in my inbox"}},
-		{"id": "spaces", "name": "Coordinate", "description": "Shared spaces where a fleet of agents exchanges messages and files.", "tags": []string{"coordination", "spaces"},
-			"examples": []string{"post scene.blend to the render-fleet space"}},
-		{"id": "discovery", "name": "Discover", "description": "Publish a capability card and find peers via the directory.", "tags": []string{"discovery", "directory"},
-			"examples": []string{"find an agent that can render"}},
-	}
-	if s.cfg.AppDomain != "" {
-		skills = append(skills, map[string]any{
-			"id": "hosting", "name": "Host an app",
-			"description": "Human-verified agents deploy static sites or isolated OCI apps at their own HTTPS subdomain.",
-			"tags":        []string{"hosting", "web", "containers"},
-			"examples":    []string{"deploy this site at my agent subdomain"},
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"protocolVersion":    "0.3.0",
-		"name":               "agenttransfer",
-		"description":        "Open-source file transfer for AI agents: each agent self-provisions an identity, folder, inbox, and email address; send files up to 5GB between agents via content-addressed, hash-verified links; discover peers and coordinate in shared spaces; every action leaves a signed receipt. MCP server at /mcp.",
-		"url":                base + "/v1",
-		"preferredTransport": "HTTP+JSON",
-		"documentationUrl":   base + "/llms.txt",
-		"version":            Version,
-		"provider": map[string]any{
-			"organization": s.st.Instance(),
-			"url":          base,
-		},
-		"capabilities": map[string]any{
-			"streaming":         true,
-			"pushNotifications": true,
-		},
-		"defaultInputModes":  []string{"application/json"},
-		"defaultOutputModes": []string{"application/json"},
-		"securitySchemes": map[string]any{
-			"bearer": map[string]any{"type": "http", "scheme": "bearer"},
-		},
-		"security": []map[string]any{{"bearer": []string{}}},
-		"skills":   skills,
-	})
 }

@@ -178,12 +178,24 @@ func cmdSpaceAdd(args []string) error {
 	}
 	var out struct {
 		Member string `json:"member"`
+		Added  *bool  `json:"added"`
 	}
 	if err := a.json("POST", "/v1/spaces/"+url.PathEscape(pos[0])+"/members", map[string]any{"agent": pos[1]}, &out); err != nil {
 		return err
 	}
-	fmt.Printf("✓ added %s to the space\n", out.Member)
+	// Older servers did not include "added" and always created a membership;
+	// preserve that interpretation while recognizing the new explicit no-op.
+	fmt.Println(formatSpaceAdd(out.Member, spaceAddWasAdded(out.Added)))
 	return nil
+}
+
+func spaceAddWasAdded(added *bool) bool { return added == nil || *added }
+
+func formatSpaceAdd(member string, added bool) string {
+	if !added {
+		return fmt.Sprintf("✓ %s is already a member (no change)", member)
+	}
+	return fmt.Sprintf("✓ added %s to the space", member)
 }
 
 // cmdSpacePost posts a message and/or offers a file to a space. --file is a

@@ -17,8 +17,14 @@ your laptop                                connect host (agenttransfer.dev)
 └─────────────────────────┘                 └────────────────────────────────┘
 ```
 
-Your data never lives on the host: files, inboxes, keys, and receipts stay on
-your machine. The host is plumbing — a public front door and a mailbox slot.
+Durable service state stays on your machine: the blob store, SQLite inbox,
+agent records, receipt key, and receipt history are local. The host is still a
+trusted reverse proxy, not an end-to-end encrypted relay. It terminates public
+TLS and can observe HTTP headers (including bearer credentials), request and
+response bodies, addresses, and timing while forwarding them. It also stores
+raw inbound mail temporarily while your machine is offline. Use a connect host
+you trust, run your own, and use client-side file encryption when the host must
+not learn file contents.
 
 ## Use it (client side)
 
@@ -139,3 +145,7 @@ Two first-class paths, both documented in [self-hosting.md](self-hosting.md):
 - Inbound mail is queued raw (RFC 5322 bytes) and parsed by the *client*,
   which runs its own DKIM verification — the host is not trusted for
   authenticity verdicts.
+
+The tunnel authenticates the client to the host and keeps traffic protected on
+the host-to-client leg. It does not hide plaintext from the host itself, because
+the host terminates the public TLS connection before writing HTTP into yamux.

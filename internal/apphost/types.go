@@ -22,18 +22,41 @@ type RunnerConfig struct {
 	SocketPath string
 	// SocketMode defaults to 0660. 0666 is explicitly supported for
 	// deployments where runner and server use unrelated DynamicUser IDs; the
-	// 256-bit bearer token remains mandatory on every request.
+	// A random bearer token of at least 32 bytes remains mandatory on every
+	// request; the setup command generates 256 random bits.
 	SocketMode os.FileMode
 	// SocketGID changes the socket group when positive; zero leaves it as the
 	// runner process's group.
-	SocketGID   int
-	AuthToken   string
-	AppRoot     string
-	DockerPath  string
-	ImagePrefix string
+	SocketGID int
+	AuthToken string
+	// BuildRoot is the public service-owned tree containing build contexts.
+	// DataRoot is a distinct runner-owned tree used only for /data mounts.
+	// SnapshotRoot is runner-owned transient build scratch; nesting any of
+	// these roots beneath one another is rejected.
+	BuildRoot    string
+	DataRoot     string
+	SnapshotRoot string
+	DockerPath   string
+	ImagePrefix  string
+	// AllowedRegistries is the exact allowlist for pinned external images and
+	// Dockerfile base images. Unqualified names belong to docker.io.
+	AllowedRegistries []string
+	// AllowSourceBuilds is an explicit trust opt-in. BuildKit supports remote
+	// frontends and fetch-bearing instructions beyond FROM, so arbitrary
+	// tenant Dockerfiles stay disabled by default.
+	AllowSourceBuilds bool
 	// BuildNetwork controls network access for Dockerfile RUN instructions:
 	// "none" (default) or "bridge". Base-image pulls remain allowed.
 	BuildNetwork string
+	// RuntimeEgress opts app containers into outbound network access and a
+	// loopback-published port. The default uses the private IPv4 endpoint on an
+	// internal per-app bridge, which requires direct routing from runner host to
+	// Docker bridge (normally Linux; Docker Desktop generally needs the opt-in).
+	RuntimeEgress bool
+	// MaxBuildQueue bounds admitted build requests, including the active
+	// build. Requests beyond the bound fail immediately instead of consuming
+	// an unbounded number of goroutines while Docker is busy.
+	MaxBuildQueue int
 
 	CommandTimeout time.Duration
 	BuildTimeout   time.Duration
@@ -41,6 +64,10 @@ type RunnerConfig struct {
 	HealthTimeout  time.Duration
 	MaxOutputBytes int64
 	MaxLogLines    int
+	// MaxBuildContextBytes independently caps the root-owned snapshot copied
+	// from the public build tree before Docker sees it.
+	MaxBuildContextBytes int64
+	MaxImageBytes        int64
 
 	CPUCount       float64
 	MemoryBytes    int64
@@ -64,7 +91,7 @@ type ClientConfig struct {
 }
 
 // BuildRequest asks the runner to build a managed image from an already
-// materialized context. ContextDir must resolve beneath RunnerConfig.AppRoot.
+// materialized context. ContextDir must resolve beneath RunnerConfig.BuildRoot.
 // The runner derives the image name; arbitrary tags are never passed through.
 type BuildRequest struct {
 	AppID      string `json:"app_id"`
@@ -82,9 +109,19 @@ type BuildResult struct {
 
 type BuildResponse = BuildResult
 
+// RemoveImageResult reports idempotent cleanup of one runner-derived managed
+// build tag. Callers provide app/release IDs, never an arbitrary Docker ref.
+type RemoveImageResult struct {
+	AppID     string `json:"app_id"`
+	ReleaseID string `json:"release_id"`
+	Image     string `json:"image"`
+	Removed   bool   `json:"removed"`
+}
+
 // DeployRequest starts a previously built managed image. ContainerPort and
-// HealthPath describe the app inside the container; Docker chooses a random
-// loopback-only host port.
+// HealthPath describe the app inside the container. The runner either uses its
+// private internal-bridge address or a random loopback port, per operator
+// egress policy.
 type DeployRequest struct {
 	AppID         string            `json:"app_id"`
 	ReleaseID     string            `json:"release_id"`
@@ -117,6 +154,7 @@ type AppStatus struct {
 	AppID         string `json:"app_id"`
 	ReleaseID     string `json:"release_id"`
 	Image         string `json:"image"`
+	ImageID       string `json:"image_id,omitempty"`
 	ContainerID   string `json:"container_id"`
 	ContainerName string `json:"container_name"`
 	State         string `json:"state"`
@@ -172,7 +210,15 @@ type PurgeResult struct {
 }
 
 type healthResult struct {
-	OK bool `json:"ok"`
+	OK             bool   `json:"ok"`
+	ContainerReady bool   `json:"container_ready"`
+	ContainerState string `json:"container_state"`
+}
+
+type RunnerReadiness struct {
+	DockerHealthy  bool   `json:"docker_healthy"`
+	ContainerReady bool   `json:"container_ready"`
+	ContainerState string `json:"container_state"`
 }
 
 type errorEnvelope struct {

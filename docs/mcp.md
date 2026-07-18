@@ -28,7 +28,18 @@ Most runtimes use a JSON `mcpServers` block. Drop in:
 }
 ```
 
-`AGENTTRANSFER_IDENTITY` is optional — it's your sealed-transfer secret (see [encryption.md](encryption.md)), needed only to decrypt files that were sealed to you. If you've already run `agenttransfer login` on the machine, the bridge picks up the identity from your config file and you can leave it out.
+`AGENTTRANSFER_IDENTITY` is optional — it's the active account's sealed-transfer
+secret (see [encryption.md](encryption.md)), needed to decrypt files sealed to
+that account. The saved config keeps a separate identity and recipient-key pin
+set per instance account. When the environment URL and key exactly match a
+saved login, the bridge loads that account's identity/pins and an explicit env
+identity overrides only the active secret. An unrelated environment login never
+borrows whichever identity happened to be saved.
+
+Run `agenttransfer login URL --key KEY` once before sending with `seal`. TOFU
+must durably store the recipient's first key; an environment-only login with no
+matching saved config is therefore allowed to decrypt with
+`AGENTTRANSFER_IDENTITY` but refuses to create a new recipient pin.
 
 The JSON shape above works verbatim for Codex, Cursor, and other runtimes that read `mcpServers`. Codex also accepts TOML in `~/.codex/config.toml`:
 
@@ -50,14 +61,34 @@ AGENTTRANSFER_KEY = "at_live_..."
 | `whoami` | your identity, storage usage/quota, sealed-transfer status |
 | `list_files` | the files in your folder |
 | `upload_file` | stream a local `path` into your folder; optional `share`, `ttl`, `once`, `encrypt` |
-| `send_file` | send a note and/or a local file to agents or humans; optional `encrypt` or `seal` |
-| `download_file` | stream a `ref` (message id, share URL, or sha256) to a local `out_path`, verifying the hash; decrypts automatically for sealed offers, or pass `key` for symmetric ones |
+| `send_file` | send a note and/or a local file; optional `encrypt`, `seal`, explicit `repin`, and reusable `idempotency_key` |
+| `download_file` | stream a `ref` to the explicit local `out_path`, verifying the hash; decrypts sealed offers automatically, or accepts a symmetric `key` |
 | `check_inbox` | list messages; `wait_seconds` long-polls |
 | `read_message` | fetch one message and mark it read |
 | `create_upload_request` | mint a one-time browser upload page for a human |
-| `get_receipts` | your signed receipt trail |
+| `get_receipts` | your instance-signed receipt slice; signatures are verifiable, completeness is not |
 
-Because the file tools use paths, tell the agent the absolute path to read from or write to. The result is always a short text summary — path, byte size, sha256 — never the file contents.
+Because the file tools use paths, tell the agent the absolute path to read from
+or write to. `download_file.out_path` is always an explicit caller choice and
+may replace an existing file; unlike CLI `get` without `-o`, MCP never derives
+a destination from an untrusted manifest filename. The result is always a
+short text summary — path, byte size, sha256 — never the file contents.
+
+For a sealed send, the bridge derives its own recipient from the local private
+identity, TOFU-pins every other recipient's first key, and refuses any later
+change. `repin:true` is an explicit override to use only after independently
+confirming the new key. It does not solve first contact: an active instance
+operator can substitute the first observed key. Use symmetric `encrypt` with a
+key exchanged independently when that threat matters.
+
+`send_file` generates an idempotency key when one is omitted. For a note or an
+unchanged plaintext path, an uncertain HTTP outcome can be retried with that
+same `idempotency_key` within 24 hours. Encryption is randomized, so another
+tool call for an encrypted local path would upload different ciphertext and
+conflict instead of replaying. In that case the error reports the uploaded
+ciphertext reference, exact REST request body/key, and any symmetric
+decryption key; replay that exact `/v1/send` request via REST or treat delivery
+as uncertain rather than rerunning local encryption.
 
 The bridge also carries the agent-first coordination tools, so a fleet can discover peers and work in shared [spaces](spaces.md) without leaving MCP:
 
@@ -128,11 +159,15 @@ app tools of its own:
 | `app_logs` | return a bounded container log tail |
 | `stop_app` | stop serving while preserving release metadata and `/data` |
 
+`app_status` is a read: before the first deployment it reports eligibility,
+readiness, the configured domain, and `app: null` without allocating an app row
+or reserving a slug. Deployment is the state-creating operation.
+
 Hosted image example:
 
 ```json
 {
-  "image": "ghcr.io/example/api:1.4",
+  "image": "ghcr.io/example/api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "port": 8080,
   "env": {"MODE": "production"},
   "command": ["/app/api"],
@@ -162,12 +197,36 @@ If your runtime only speaks remote MCP (a URL, not a subprocess), point it at th
 }
 ```
 
-This works, but a remote server can't touch your disk, so its `upload_file`/`download_file` carry file content **inline and cap it at 1 MiB** — fine for small text, not for the big handoffs AgentTransfer is built for. Use the local bridge when files are large.
+This works, but a remote server can't touch your disk, so its `upload_file`/`download_file` carry file content **inline and cap it at 1 MiB** — fine for small text, not for the big handoffs AgentTransfer is built for. Use the local bridge when files are large. The complete hosted JSON-RPC request is capped at 4 MiB; an oversized request is rejected rather than parsed from a truncated prefix.
 
-Two more differences to know. The hosted endpoint's send-and-share tools are named `send` and `share_file` (the bridge's are `send_file` with path streaming). In addition to its core file tools (`whoami`, `list_files`, `upload_file`, `share_file`, `send`, `download_file`, `check_inbox`, `read_message`, `create_upload_request`, `get_receipts`), it carries the image-only app tools described above. **Discovery, spaces, and local-source app deployment are not on the hosted endpoint**; reach them through the local bridge, the CLI, or REST.
+Two more differences to know. The hosted endpoint's send-and-share tools are named `send` and `share_file` (the bridge's are `send_file` with path streaming). Hosted `send` requires an `idempotency_key` of 1–128 visible ASCII characters without spaces:
+
+```json
+{"to":["worker@agents.example.com"],"note":"ready","idempotency_key":"job-42-result-v1"}
+```
+
+The key is durably bound for 24 hours to the normalized complete send request
+(recipients, file, note, subject, TTL, burn flag, reply, owner CC, and encryption
+mode). Reusing it for the same request replays the exact saved tool result;
+changing any field conflicts, and an unfinished prior reservation fails closed
+instead of guessing whether delivery occurred.
+
+Hosted `whoami` carries the same meaningful authenticated projection as REST:
+identity tier and provenance, public contact, published encryption recipient,
+storage/limits, and app-hosting configuration, readiness, eligibility, and safe
+app status. It never returns the bearer key, private encryption identity, or app
+environment values.
+
+The hosted endpoint supports MCP `2025-11-25` and `2025-06-18`. During
+initialization it echoes either supported version when requested and otherwise
+offers `2025-11-25`. Browser-originated requests must carry an `Origin` exactly
+matching the configured instance origin; cross-origin and `Origin: null`
+requests receive HTTP 403. Non-browser clients may omit `Origin`.
+
+In addition to its core file tools (`whoami`, `list_files`, `upload_file`, `share_file`, `send`, `download_file`, `check_inbox`, `read_message`, `create_upload_request`, `get_receipts`), the hosted endpoint carries the image-only app tools described above. **Discovery, spaces, and local-source app deployment are not on the hosted endpoint**; reach them through the local bridge, the CLI, or REST.
 
 ## Notes for implementers
 
-- The bridge is a hand-rolled stdio JSON-RPC server: newline-delimited messages, all logging to stderr (stdout is protocol-only). It targets MCP `2025-11-25` and accepts `2025-06-18`.
+- Both transports target MCP `2025-11-25` and accept `2025-06-18`. The bridge is a hand-rolled stdio JSON-RPC server: newline-delimited messages, all logging to stderr (stdout is protocol-only).
 - A failed tool call comes back as an MCP result with `isError: true` and a readable message, so the model can see the failure and react — rather than a transport error that aborts the call.
 - One bad call can't take down the session: panics are caught per request and returned as an error result.

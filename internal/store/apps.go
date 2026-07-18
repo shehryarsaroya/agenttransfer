@@ -561,10 +561,9 @@ func (s *Store) SetAppRuntime(agentID, deploymentID, runtimeID, upstream, image 
 	return s.activateAppDeployment(agentID, deploymentID, runtimeID, upstream, image, port, envKeys, true)
 }
 
-// RefreshAppRuntimeUpstream updates the loopback endpoint observed for the
-// exact active runtime. Docker normally preserves a published port across a
-// daemon restart, but persisting the live value prevents a stale port from
-// proxying to whatever process later acquires it.
+// RefreshAppRuntimeUpstream updates the runner-approved endpoint observed for
+// the exact active runtime. Persisting the live value prevents a stale
+// published port or bridge address from routing to a different process.
 func (s *Store) RefreshAppRuntimeUpstream(agentID, runtimeID, upstream string) error {
 	if strings.TrimSpace(runtimeID) == "" || strings.TrimSpace(upstream) == "" {
 		return errors.New("runtime id and upstream are required")
@@ -808,8 +807,15 @@ func (s *Store) ActiveAppUsage(agentID string) (AppUsage, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, ErrNotFound
 	}
-	u.TotalBytes = u.SourceBytes + u.FileBytes
-	return u, err
+	if err != nil {
+		return u, err
+	}
+	total, err := addStorageBytes(u.SourceBytes, u.FileBytes)
+	if err != nil {
+		return u, err
+	}
+	u.TotalBytes = total
+	return u, nil
 }
 
 // AppSourceUsage is the active release's logical uploaded source size.
@@ -834,7 +840,11 @@ func (s *Store) RetainedAppUsage(agentID string) (AppUsage, error) {
 		JOIN app_deployments d ON d.id=f.deployment_id WHERE d.app_id=?`, appID).Scan(&u.FileBytes); err != nil {
 		return u, err
 	}
-	u.TotalBytes = u.SourceBytes + u.FileBytes
+	total, err := addStorageBytes(u.SourceBytes, u.FileBytes)
+	if err != nil {
+		return u, err
+	}
+	u.TotalBytes = total
 	return u, nil
 }
 

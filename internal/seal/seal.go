@@ -36,12 +36,16 @@ const KeyPrefix = "atk_"
 const scryptWorkFactor = 10
 
 // NewKey returns a fresh random symmetric key string ("atk_<base64url>").
-func NewKey() string {
+func NewKey() (string, error) {
+	return newKeyFrom(rand.Reader)
+}
+
+func newKeyFrom(random io.Reader) (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		panic(err) // crypto/rand failure is unrecoverable
+	if _, err := io.ReadFull(random, b); err != nil {
+		return "", fmt.Errorf("seal: generate symmetric key: %w", err)
 	}
-	return KeyPrefix + base64.RawURLEncoding.EncodeToString(b)
+	return KeyPrefix + base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // EncryptSymmetric wraps dst so that plaintext written to the returned

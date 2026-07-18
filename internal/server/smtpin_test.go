@@ -3,13 +3,17 @@ package server
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
+	gosmtp "github.com/emersion/go-smtp"
 
 	mailpkg "github.com/shehryarsaroya/agenttransfer/internal/mail"
+	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
 
 // A valid DKIM signature only makes an offer trusted when its signing domain
@@ -41,6 +45,40 @@ func TestDKIMVerdictRequiresAlignment(t *testing.T) {
 		if got := dkimVerdict(tc.verifs, tc.from); got != tc.want {
 			t.Errorf("%s: dkimVerdict = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestSMTPMailboxCapReturnsRetryable452(t *testing.T) {
+	e := newEnv(t)
+	_, key := e.createAgent("smtp-full")
+	agent, err := e.srv.st.AgentByKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := e.srv.st.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO messages(id,agent_id,from_addr,received_at) VALUES(?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < store.MaxInboxMessagesPerAgent; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("full-%05d", i), agent.ID, "seed@example.test", i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	raw := "From: sender@example.test\r\nTo: " + agent.Email + "\r\n" +
+		"Subject: over cap\r\nMessage-ID: <full-cap@example.test>\r\n\r\nhello\r\n"
+	ss := &smtpSession{s: e.srv, from: "sender@example.test", agents: []store.Agent{agent}}
+	err = ss.Data(strings.NewReader(raw))
+	var smtpErr *gosmtp.SMTPError
+	if !errors.As(err, &smtpErr) || smtpErr.Code != 452 || smtpErr.EnhancedCode != (gosmtp.EnhancedCode{4, 2, 2}) {
+		t.Fatalf("full mailbox Data error=%v, want 452 4.2.2", err)
 	}
 }
 

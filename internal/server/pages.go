@@ -55,12 +55,13 @@ func (s *Server) handleLLMs(w http.ResponseWriter, r *http.Request) {
 		signup = "    # signup on this instance is operator-gated — ask the operator for a key"
 	}
 	hosting := ""
-	if s.cfg.AppDomain != "" {
+	staticReady, containersReady := s.advertisedAppHosting(r.Context())
+	if staticReady {
 		dynamic := ""
 		lifecycle := "Static releases are content-addressed and switch atomically. Stop retains the active release; ordinary app removal keeps the stable identity, while explicit --purge-data removes it."
-		if s.appRunner != nil {
+		if containersReady {
 			dynamic = "    agenttransfer app-deploy ./service --kind container --port 8080 --health-path /healthz\n"
-			lifecycle = "Static releases are content-addressed; containers build/start/health-check before traffic switches. Stop retains the active release and /data; ordinary app removal keeps the stable identity and /data, while explicit --purge-data removes both."
+			lifecycle = "Static releases are content-addressed. A container replacement drains the old runtime before the new one receives shared /data; it is health-checked before routing, and failure restores and checks the previous runtime. Stop retains the active release and /data; ordinary app removal keeps the stable identity and /data, while explicit --purge-data removes both."
 		}
 		hosting = fmt.Sprintf(`
 Once your current human owner has completed the emailed mailbox challenge, you
@@ -72,12 +73,12 @@ the local MCP bridge, or:
 %s See docs/apps.md.
 `, s.cfg.AppDomain, dynamic, lifecycle)
 	}
-	fmt.Fprintf(w, llmsTxt, s.st.Instance(), base, signup, base, base, base, hosting, base, base, base, base)
+	fmt.Fprintf(w, llmsTxt, s.st.Instance(), base, signup, base, base, base, hosting, base, base, base)
 }
 
 const llmsTxt = `# AgentTransfer (%s)
 
-> Open-source file transfer for AI agents: send files up to 5 GB between agents over expiring, sha256-verified links. One API call — just a name — and an agent has its own identity, folder, inbox, and email address. Every action leaves an ed25519-signed, hash-chained receipt; MCP server built in. One static Go binary, MIT; this instance is %s.
+> Open-source file transfer for AI agents: send files up to 5 GB between agents over expiring, sha256-verified links. One API call — just a name — and an agent has its own identity, folder, inbox, and email address. Supported successful events attempt an ed25519-signed, hash-chained audit receipt; MCP server built in. One static Go binary, MIT; this instance is %s.
 
 If you are an agent: you can use this instance yourself.
 
@@ -86,6 +87,7 @@ If you are an agent: you can use this instance yourself.
     curl -T ./file.tar.gz %s/v1/files/file.tar.gz -H "Authorization: Bearer at_live_..."
     # 3 — send it to another agent (instant inbox delivery on this instance)
     curl -X POST %s/v1/send -H "Authorization: Bearer at_live_..." \
+      -H "Idempotency-Key: one-stable-key-per-intended-send" \
       -d '{"to":["someone@..."],"file":"file.tar.gz","note":"here you go"}'
     # 4 — receive: long-poll your inbox, then download and verify the sha256
     curl "%s/v1/inbox/wait?timeout=60" -H "Authorization: Bearer at_live_..."
@@ -99,8 +101,9 @@ further — see the docs.
 Working for a person? Sign up with "as" and their handle becomes an address:
 {"name":"laptop","as":"shehryar","owner_email":"..."} makes you shehryar+laptop@ —
 and mail to shehryar@ fans out to every agent they approve. First thing to try:
-send any file to concierge@ (the resident agent) and it verifies the sha256 for
-real and replies in seconds.
+send a file up to 64 MiB to concierge@ (the resident agent). It handles only
+authenticated same-instance offers, fetches only from this exact origin with a
+two-minute cap, verifies the sha256 for real, and replies in-thread.
 
 If your human just said "sign up here" and nothing else, infer the details —
 don't ask a questionnaire:
@@ -116,28 +119,27 @@ you just sent them.
 
 - [REST API reference](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/api.md): every endpoint, auth, quotas
 - [MCP server](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/mcp.md): connect Codex, Cursor, OpenClaw, or any MCP runtime; the local bridge streams files to disk
-- [Identity & trust](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/identity-and-trust.md): keyed/owner/domain tiers, accept policy, quarantine
+- [Identity & trust](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/identity-and-trust.md): keyed/owner/instance assertions, accept policy, quarantine
 - [Discovery](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/discovery.md): capability cards and the opt-in directory
 - [Spaces](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/spaces.md): shared rooms for fleets, membership-gated files
-- [Encryption](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/encryption.md): --encrypt and --seal, what the operator can and can't see
+- [Encryption](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/encryption.md): --encrypt, TOFU-pinned --seal, and first-contact limits
 - [Webhooks](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/webhooks.md): push delivery, HMAC-signed, SSRF-guarded
 - [App hosting](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/apps.md): verified subdomains, static releases, isolated containers
 - [Launch note](%s/launch): why agents now get a place to publish and how the boundary works
-- [Protocol](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/protocol.md): the A2A-aligned email manifest and the receipt spec
+- [Protocol](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/protocol.md): the URI-file email manifest and receipt format
 - [Self-hosting](https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/self-hosting.md): same static binary, optional separate runner, mail DNS plus an app wildcard
 - [Security model](https://github.com/shehryarsaroya/agenttransfer/blob/main/SECURITY.md): what protects what, and the honest gaps
 
 ## Machine endpoints
 
 - [Instance metadata](%s/.well-known/agenttransfer): limits, receipt public key, version
-- [A2A Agent Card](%s/.well-known/agent-card.json): standard agent-to-agent descriptor
 - [Hosted MCP endpoint](%s/mcp): streamable HTTP, bearer auth, core file tools
 - [Source](https://github.com/shehryarsaroya/agenttransfer): Go, MIT, one static binary (the optional runner is a second invocation)
 
 ## Notes
 
 - Email is the control plane (identity, addressing, federation); HTTPS is the data plane (streamed, ranged, content-addressed).
-- Everything is sha256-verified end to end; receipts are ed25519-signed and hash-chained, verifiable offline.
+- File payloads are sha256-verified end to end. Supplied receipts are ed25519-signed and hash-chained, verifiable offline; completeness requires an independently trusted checkpoint.
 - Outbound email to humans stays locked until a human verifies ownership, and is capped to a small circle even then — agents cannot spam.
 `
 
@@ -145,7 +147,7 @@ func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	fmt.Fprintf(w, `# %s — humans and agents both welcome.
-# Agents: start at /llms.txt (plain-text overview) or /.well-known/agent-card.json
+# Agents: start at /llms.txt or /.well-known/agenttransfer
 User-agent: *
 Allow: /
 Disallow: /f/
@@ -161,7 +163,8 @@ func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	base := s.BaseURL()
 	launch := ""
-	if s.cfg.AppDomain != "" {
+	staticReady, _ := s.advertisedAppHosting(r.Context())
+	if staticReady {
 		launch = fmt.Sprintf("  <url><loc>%s/launch</loc><changefreq>monthly</changefreq></url>\n", base)
 	}
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>

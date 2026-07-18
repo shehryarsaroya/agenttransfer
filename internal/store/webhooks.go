@@ -75,29 +75,37 @@ const MaxWebhooksPerAgent = 5
 // stored as given (the plaintext signing secret); it is shown to the caller
 // once and never returned again.
 func (s *Store) CreateWebhook(agentID, url, secret, eventTypes string) (Webhook, error) {
-	var n int64
-	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM webhooks WHERE agent_id=?`, agentID).Scan(&n); err != nil {
-		return Webhook{}, err
-	}
-	if n >= MaxWebhooksPerAgent {
-		return Webhook{}, fmt.Errorf("webhook limit reached (%d per agent)", MaxWebhooksPerAgent)
-	}
 	if eventTypes == "" {
 		eventTypes = "*"
 	}
 	if len(eventTypes) > 256 {
 		return Webhook{}, fmt.Errorf("event_types too long")
 	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return Webhook{}, err
+	}
+	defer tx.Rollback()
+	var n int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM webhooks WHERE agent_id=?`, agentID).Scan(&n); err != nil {
+		return Webhook{}, err
+	}
+	if n >= MaxWebhooksPerAgent {
+		return Webhook{}, fmt.Errorf("%w: webhook limit reached (%d per agent)", ErrLimit, MaxWebhooksPerAgent)
+	}
 	w := Webhook{
 		ID: NewID("whk"), AgentID: agentID, URL: url, Secret: secret,
 		EventTypes: eventTypes, Enabled: true, CreatedAt: now(),
 	}
-	_, err := s.DB.Exec(`INSERT INTO webhooks(id,agent_id,url,secret,event_types,enabled,created_at) VALUES(?,?,?,?,?,1,?)`,
+	_, err = tx.Exec(`INSERT INTO webhooks(id,agent_id,url,secret,event_types,enabled,created_at) VALUES(?,?,?,?,?,1,?)`,
 		w.ID, w.AgentID, w.URL, w.Secret, w.EventTypes, w.CreatedAt)
 	if err != nil {
 		if isUniqueErr(err) {
 			return Webhook{}, errors.New("a webhook for that URL already exists")
 		}
+		return Webhook{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Webhook{}, err
 	}
 	return w, nil
@@ -193,29 +201,50 @@ func (s *Store) HasEnabledWebhooks(agentID string) bool {
 // whose webhook has since been disabled.
 func (s *Store) ClaimDueDeliveries(limit int) ([]WebhookDelivery, error) {
 	ts := now()
-	rows, err := s.DB.Query(`SELECT d.id, d.webhook_id, w.url, w.secret, d.event_type, d.payload, d.attempts
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT d.id, d.webhook_id, w.url, w.secret, d.event_type, d.payload, d.attempts
 		FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id
 		WHERE d.status='pending' AND d.next_attempt_at<=? AND w.enabled=1
 		ORDER BY d.next_attempt_at LIMIT ?`, ts, limit)
 	if err != nil {
 		return nil, err
 	}
-	var out []WebhookDelivery
+	var candidates []WebhookDelivery
 	for rows.Next() {
 		var d WebhookDelivery
 		if err := rows.Scan(&d.ID, &d.WebhookID, &d.URL, &d.Secret, &d.EventType, &d.Payload, &d.Attempts); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		out = append(out, d)
+		candidates = append(candidates, d)
 	}
-	rows.Close()
-	for _, d := range out {
-		if _, err := s.DB.Exec(`UPDATE webhook_deliveries SET status='delivering', updated_at=? WHERE id=?`, ts, d.ID); err != nil {
-			return out, err
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	claimed := make([]WebhookDelivery, 0, len(candidates))
+	for _, d := range candidates {
+		res, err := tx.Exec(`UPDATE webhook_deliveries SET status='delivering', updated_at=?
+			WHERE id=? AND status='pending' AND next_attempt_at<=?
+			AND EXISTS (SELECT 1 FROM webhooks WHERE id=webhook_id AND enabled=1)`, ts, d.ID, ts)
+		if err != nil {
+			return nil, err
+		}
+		if changed, _ := res.RowsAffected(); changed == 1 {
+			claimed = append(claimed, d)
 		}
 	}
-	return out, nil
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return claimed, nil
 }
 
 // MarkDelivered records a successful delivery and clears the endpoint's

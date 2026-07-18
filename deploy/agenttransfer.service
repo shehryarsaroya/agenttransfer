@@ -9,6 +9,7 @@ EnvironmentFile=/etc/agenttransfer/env
 DynamicUser=yes
 StateDirectory=agenttransfer
 Environment=DATA_DIR=/var/lib/agenttransfer
+Environment=APP_BUILD_ROOT=/var/lib/agenttransfer/app-builds
 # certmagic (autocert) stores certs under $XDG_DATA_HOME/certmagic, falling back
 # to $HOME/.local/share — both of which ProtectHome/DynamicUser leave unset or
 # read-only, so the process tries to mkdir a relative ".local" and dies. Point
@@ -35,6 +36,7 @@ MemoryDenyWriteExecute=yes
 
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=35s
 
 [Install]
 WantedBy=multi-user.target

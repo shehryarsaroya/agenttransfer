@@ -32,7 +32,8 @@ A small JSON body that **points at the message rather than containing it**:
 Your handler fetches the real thing with its own API key:
 
 ```sh
-agenttransfer read msg_…            # or GET the resource_url with your Bearer key
+curl "$RESOURCE_URL" -H "Authorization: Bearer $AGENTTRANSFER_KEY"
+# or call local MCP read_message with {"id":"msg_…"}
 ```
 
 Reference-only is deliberate: the webhook carries no file bytes and nothing secret, so a misdirected or logged delivery leaks a pointer, not your data — and the fetch is authenticated as *you*, not as whoever received the POST. `message.received` is the event today (a new inbox message, whether from another agent, inbound email, or an upload-request drop); the `type` field is there so more can be added without breaking your handler.
@@ -48,11 +49,17 @@ Deliveries are signed with the [Standard Webhooks](https://www.standardwebhooks.
 The signed content is `{id}.{timestamp}.{body}` — the raw request body, joined with dots. Recompute the HMAC with your secret and compare:
 
 ```python
-import hmac, hashlib, base64
+import hmac, hashlib, base64, time
 
 def verify(secret, headers, raw_body):
-    signed = f"{headers['Webhook-Id']}.{headers['Webhook-Timestamp']}.{raw_body}"
-    mac = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).digest()
+    if not secret.startswith("whsec_"):
+        raise ValueError("bad secret")
+    key = base64.b64decode(secret.removeprefix("whsec_"), validate=True)
+    timestamp = int(headers["Webhook-Timestamp"])
+    if abs(time.time() - timestamp) > 300:
+        raise ValueError("stale webhook")
+    signed = (headers["Webhook-Id"] + "." + str(timestamp) + ".").encode() + raw_body
+    mac = hmac.new(key, signed, hashlib.sha256).digest()
     expected = "v1," + base64.b64encode(mac).decode()
     got = headers["Webhook-Signature"]
     ok = any(hmac.compare_digest(expected, s) for s in got.split())
@@ -60,7 +67,7 @@ def verify(secret, headers, raw_body):
         raise ValueError("bad signature")
 ```
 
-Reject anything that doesn't verify, and reject a stale `Webhook-Timestamp` (say, older than five minutes) so a captured delivery can't be replayed later. Use the raw bytes for the HMAC — re-serializing the JSON will change the signature.
+`raw_body` above must be the request bytes, not decoded text. The `whsec_` value is a serialized secret: strip the prefix and base64-decode it before using the random bytes as the HMAC key. Do **not** pass the literal ASCII `whsec_...` string to `hmac.new`; that produces a different, non-Standard-Webhooks signature. Reject stale timestamps and de-duplicate `Webhook-Id` values so a captured delivery cannot be replayed. Re-serializing the JSON will change the signature.
 
 ## Retries and auto-disable
 
@@ -71,7 +78,8 @@ A delivery is a success on a `2xx`. Anything else — non-2xx, timeout, connecti
 You hand the server a URL and it makes a request to it — the textbook setup for a [server-side request forgery](https://owasp.org/www-community/attacks/Server_Side_Request_Forgery). Without a guard, `http://169.254.169.254/…` would make the server fetch its own cloud credentials and POST them somewhere. AgentTransfer defends in depth:
 
 - **HTTPS only** on a public instance.
-- **The IP is validated at connect time, not parse time.** The check runs in the dialer's `Control` hook — after DNS resolution, immediately before the socket connects — so it sees the exact IP the connection will use. A hostname that resolves to a public address when you register it and to `10.0.0.1` a second later (DNS rebinding) is caught, because the check fires on the address actually being dialed. Redirects reuse the same transport, so every hop is re-validated.
+- **The IP is validated at connect time, not parse time.** The check runs in the dialer's `Control` hook — after DNS resolution, immediately before the socket connects — so it sees the exact IP the connection will use. A hostname that resolves to a public address when you register it and to `10.0.0.1` a second later (DNS rebinding) is caught, because the check fires on the address actually being dialed.
+- **Redirects are rejected.** A webhook target must return its own response; AgentTransfer never follows a `3xx` to another origin or address.
 - **Private and special ranges are refused** — loopback, RFC-1918, link-local (including the cloud metadata address), CGNAT, and the IPv6 equivalents. Only public unicast is allowed to connect.
 
 The upshot: a webhook URL can only ever reach a genuine public endpoint, and there's no way to trick it into probing the instance's own network.

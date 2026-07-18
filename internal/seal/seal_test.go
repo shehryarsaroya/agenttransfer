@@ -8,7 +8,10 @@ import (
 )
 
 func TestSymmetricRoundTrip(t *testing.T) {
-	key := NewKey()
+	key, err := NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasPrefix(key, KeyPrefix) {
 		t.Fatalf("key %q missing prefix", key)
 	}
@@ -42,11 +45,25 @@ func TestSymmetricRoundTrip(t *testing.T) {
 	}
 
 	// Wrong key must fail, not silently return garbage.
-	r2, _ := DecryptSymmetric(bytes.NewReader(ct.Bytes()), NewKey())
+	wrongKey, err := NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := DecryptSymmetric(bytes.NewReader(ct.Bytes()), wrongKey)
 	if r2 != nil {
 		if _, err := io.ReadAll(r2); err == nil {
 			t.Fatal("wrong key decrypted without error")
 		}
+	}
+}
+
+func TestSymmetricKeyGenerationReturnsEntropyFailure(t *testing.T) {
+	key, err := newKeyFrom(strings.NewReader(strings.Repeat("x", 16)))
+	if err != nil || key != KeyPrefix+"eHh4eHh4eHh4eHh4eHh4eA" {
+		t.Fatalf("deterministic key = %q err=%v", key, err)
+	}
+	if _, err := newKeyFrom(strings.NewReader("short")); err == nil || !strings.Contains(err.Error(), "generate symmetric key") {
+		t.Fatalf("short entropy error = %v", err)
 	}
 }
 

@@ -25,3 +25,15 @@ func TestFormatSpaceEvent(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatSpaceAddDistinguishesIdempotentReplay(t *testing.T) {
+	if got := formatSpaceAdd("bob", true); got != "✓ added bob to the space" {
+		t.Fatalf("new member output = %q", got)
+	}
+	if got := formatSpaceAdd("bob", false); got != "✓ bob is already a member (no change)" {
+		t.Fatalf("existing member output = %q", got)
+	}
+	if !spaceAddWasAdded(nil) {
+		t.Fatal("legacy response without added field was treated as a no-op")
+	}
+}

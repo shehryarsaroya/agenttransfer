@@ -41,6 +41,8 @@ type connectClient struct {
 	session   *yamux.Session // nil when down
 }
 
+var errConnectRegistrationGone = errors.New("connect registration expired")
+
 func (c *connectClient) setIdentity(name, token, publicURL string) {
 	c.mu.Lock()
 	c.name, c.token, c.publicURL = name, token, publicURL
@@ -65,7 +67,7 @@ func (c *connectClient) liveControl() *http.Client {
 	return c.control
 }
 
-func newConnectClient(s *Server) *connectClient {
+func newConnectClient(s *Server) (*connectClient, error) {
 	c := &connectClient{s: s, url: s.cfg.Connect}
 	// Resume a prior registration if it was against the same host.
 	if savedURL, _ := s.st.GetSetting("connect_url"); savedURL == c.url {
@@ -74,15 +76,29 @@ func newConnectClient(s *Server) *connectClient {
 		publicURL, _ := s.st.GetSetting("connect_public_url")
 		c.setIdentity(name, token, publicURL)
 	}
+	// A resumed identity must be applied synchronously, before Run opens local
+	// listeners. New registrations are applied by the retrying run loop before
+	// it attempts their first tunnel.
 	if c.registered() {
-		c.applyIdentity()
+		if err := c.applyIdentity(); err != nil {
+			return nil, err
+		}
 	}
-	return c
+	return c, nil
 }
 
 func (c *connectClient) registered() bool {
 	name, token, publicURL := c.identity()
 	return name != "" && token != "" && publicURL != ""
+}
+
+func (c *connectClient) forgetRegistration() {
+	c.setIdentity("", "", "")
+	// Clear the host marker first: even if the process stops between writes, the
+	// next startup will not resume the rejected token.
+	for _, key := range []string{"connect_url", "connect_name", "connect_token", "connect_public_url"} {
+		_ = c.s.st.SetSetting(key, "")
+	}
 }
 
 func (c *connectClient) connected() bool {
@@ -93,17 +109,18 @@ func (c *connectClient) connected() bool {
 
 // applyIdentity makes the borrowed public URL this instance's identity:
 // base URL for links, instance domain for agent addresses and receipts.
-func (c *connectClient) applyIdentity() {
+func (c *connectClient) applyIdentity() error {
 	_, _, publicURL := c.identity()
-	u, err := url.Parse(publicURL)
-	if err != nil || u.Host == "" {
-		return
+	u, err := parseBaseOrigin(publicURL)
+	if err != nil || u.Scheme != "https" || u.Port() != "" || !publicURLUnderHost(publicURL, c.url) {
+		return fmt.Errorf("invalid connect public URL %q", publicURL)
 	}
-	if err := c.s.st.RenameInstance(u.Host); err != nil {
-		log.Printf("connect: rename instance: %v", err)
-		return
+	instance := strings.ToLower(u.Hostname())
+	if err := c.s.st.RenameInstance(instance); err != nil {
+		return fmt.Errorf("rename instance to %s: %w", instance, err)
 	}
 	c.s.SetBaseURL(publicURL)
+	return nil
 }
 
 // run registers (once), then dials and re-dials the tunnel until ctx ends.
@@ -119,11 +136,26 @@ func (c *connectClient) run(ctx context.Context) {
 			}
 			backoff = time.Second
 		}
+		// Applying the borrowed domain rewrites every local agent address. Never
+		// expose a tunnel whose public origin and stored identity disagree; retry
+		// this local transition before attempting the upgrade.
+		if err := c.applyIdentity(); err != nil {
+			log.Printf("connect: cannot apply registered identity: %v (retrying)", err)
+			sleepCtx(ctx, backoff)
+			backoff = min(backoff*2, time.Minute)
+			continue
+		}
 		err := c.serveTunnel(ctx)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
+			if errors.Is(err, errConnectRegistrationGone) {
+				log.Printf("connect: host expired this registration; requesting a fresh identity")
+				c.forgetRegistration()
+				backoff = time.Second
+				continue
+			}
 			log.Printf("connect: tunnel to %s dropped: %v (reconnecting)", c.url, err)
 		}
 		sleepCtx(ctx, backoff)
@@ -162,7 +194,6 @@ func (c *connectClient) register(ctx context.Context) error {
 	if reg.Token == "" || !publicURLUnderHost(reg.PublicURL, c.url) {
 		return fmt.Errorf("register: host returned an unexpected identity %q", reg.PublicURL)
 	}
-	c.setIdentity(reg.Name, reg.Token, reg.PublicURL)
 	for k, v := range map[string]string{
 		"connect_url": c.url, "connect_name": reg.Name,
 		"connect_token": reg.Token, "connect_public_url": reg.PublicURL,
@@ -171,7 +202,9 @@ func (c *connectClient) register(ctx context.Context) error {
 			return err
 		}
 	}
-	c.applyIdentity()
+	// Do not make a partially persisted registration live in memory. The run
+	// loop applies its identity, and only then is allowed to open the tunnel.
+	c.setIdentity(reg.Name, reg.Token, reg.PublicURL)
 	log.Printf("connect: registered — this instance is %s", reg.PublicURL)
 	return nil
 }
@@ -180,12 +213,12 @@ func (c *connectClient) register(ctx context.Context) error {
 // the connect host we actually dialed — a defense against a misbehaving or
 // spoofed host handing us someone else's origin.
 func publicURLUnderHost(publicURL, hostBase string) bool {
-	pu, err := url.Parse(publicURL)
-	if err != nil || pu.Scheme != "https" || pu.Hostname() == "" {
+	pu, err := parseBaseOrigin(publicURL)
+	if err != nil || pu.Scheme != "https" || pu.Port() != "" {
 		return false
 	}
-	hu, err := url.Parse(hostBase)
-	if err != nil || hu.Hostname() == "" {
+	hu, err := parseBaseOrigin(hostBase)
+	if err != nil {
 		return false
 	}
 	host := strings.ToLower(hu.Hostname())
@@ -224,6 +257,9 @@ func (c *connectClient) serveTunnel(ctx context.Context) error {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		conn.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("%w: HTTP %d", errConnectRegistrationGone, resp.StatusCode)
+		}
 		return fmt.Errorf("tunnel refused: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -256,14 +292,23 @@ func (c *connectClient) serveTunnel(ctx context.Context) error {
 func (c *connectClient) publicHandler() http.Handler {
 	next := c.s.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-			parts := strings.Split(xf, ",")
-			if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
-				r.RemoteAddr = ip + ":0"
-			}
+		if remoteAddr, ok := connectForwardedRemoteAddr(r.Header.Get("X-Forwarded-For")); ok {
+			r.RemoteAddr = remoteAddr
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func connectForwardedRemoteAddr(xForwardedFor string) (string, bool) {
+	if xForwardedFor == "" {
+		return "", false
+	}
+	parts := strings.Split(xForwardedFor, ",")
+	ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1]))
+	if ip == nil {
+		return "", false
+	}
+	return net.JoinHostPort(ip.String(), "0"), true
 }
 
 // ---- control calls (client → host over the tunnel) ----

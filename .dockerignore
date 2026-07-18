@@ -2,6 +2,14 @@
 .gstack
 .idea
 .vscode
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
 
 # Local planning, generated artifacts, and runtime state never belong in the
 # build context. The final image already copies only the binary; excluding

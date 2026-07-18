@@ -19,3 +19,13 @@
 .idea/
 .vscode/
 .gstack/
+
+# local credentials and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json

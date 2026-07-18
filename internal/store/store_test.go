@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -200,6 +202,114 @@ func TestPutBlobStopsBeforeCrossingDiskReserve(t *testing.T) {
 	}
 }
 
+func TestDiskAdmissionAccountsForConcurrentPendingWrites(t *testing.T) {
+	s := newStore(t)
+	s.volumeStats = func(string) (int64, int64, error) { return 100, 1000, nil }
+	s.SetDiskReserve(40)
+	release, err := s.admitDiskWrite(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.admitDiskWrite(20); !errors.Is(err, ErrDiskReserve) {
+		t.Fatalf("second pending write error=%v, want reserve refusal", err)
+	}
+	release()
+	release, err = s.admitDiskWrite(20)
+	if err != nil {
+		t.Fatalf("released headroom was not reusable: %v", err)
+	}
+	release()
+}
+
+type blockingDiskWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingDiskWriter) Write(p []byte) (int, error) {
+	close(w.started)
+	<-w.release
+	return len(p), nil
+}
+
+func TestWriteWithDiskReserveSharesAdmissionAcrossVolumes(t *testing.T) {
+	s := newStore(t)
+	paths := make(chan string, 2)
+	s.volumeStats = func(path string) (int64, int64, error) {
+		paths <- path
+		return 100, 1000, nil
+	}
+	s.SetDiskReserve(40)
+	blocking := &blockingDiskWriter{started: make(chan struct{}), release: make(chan struct{})}
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := s.WriteWithDiskReserve("/build-volume", blocking, make([]byte, 50))
+		firstErr <- err
+	}()
+	<-blocking.started
+	if _, err := s.WriteWithDiskReserve("/build-volume", io.Discard, make([]byte, 20)); !errors.Is(err, ErrDiskReserve) {
+		t.Fatalf("overlapping build write error=%v, want ErrDiskReserve", err)
+	}
+	close(blocking.release)
+	if err := <-firstErr; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if path := <-paths; path != "/build-volume" {
+			t.Fatalf("volume stats path = %q", path)
+		}
+	}
+}
+
+type pausingBlobReader struct {
+	stage   int
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (r *pausingBlobReader) Read(p []byte) (int, error) {
+	if r.stage == 0 {
+		r.stage++
+		return copy(p, []byte("first chunk")), nil
+	}
+	if r.stage == 1 {
+		r.stage++
+		close(r.blocked)
+		<-r.release
+	}
+	return 0, io.EOF
+}
+
+func TestNormalPutBlobStreamsAreNotGloballySerialized(t *testing.T) {
+	s := newStore(t)
+	paused := &pausingBlobReader{blocked: make(chan struct{}), release: make(chan struct{})}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := s.PutBlob(paused, 1<<20)
+		firstDone <- err
+	}()
+	<-paused.blocked
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := s.PutBlob(strings.NewReader("independent upload"), 1<<20)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			close(paused.release)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(paused.release)
+		t.Fatal("second upload blocked behind an unrelated paused stream")
+	}
+	close(paused.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeleteFileEntryDoesNotDeleteSameBlobUnderAnotherName(t *testing.T) {
 	s := newStore(t)
 	a, _, err := s.CreateAgent("entry-cleanup", "", false)
@@ -268,6 +378,38 @@ func TestCloseLinkKeepsReferencedBlob(t *testing.T) {
 	}
 	if !survivesGC(t, s, sha) {
 		t.Fatal("blob GC'd while a file still references it")
+	}
+}
+
+func TestCountActiveDownloadRejectsClosedOrExpiredLink(t *testing.T) {
+	s := newStore(t)
+	a, _, err := s.CreateAgent("active-download", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, size := put(t, s, "download")
+	live, err := s.CreateLink(a.ID, sha, "f.txt", "text/plain", size, false, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CountActiveDownload(live.Token); err != nil {
+		t.Fatalf("active link count: %v", err)
+	}
+	if _, err := s.RevokeLink(live.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CountActiveDownload(live.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("revoked link count: got %v, want ErrNotFound", err)
+	}
+	expired, err := s.CreateLink(a.ID, sha, "f.txt", "text/plain", size, false, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE links SET expires_at=1 WHERE token=?`, expired.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CountActiveDownload(expired.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired link count: got %v, want ErrNotFound", err)
 	}
 }
 

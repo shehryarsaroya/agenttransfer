@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,11 +28,18 @@ import (
 
 // clientConfig is what `agenttransfer login` writes.
 type clientConfig struct {
-	URL    string `json:"url"`
-	APIKey string `json:"api_key"`
+	URL        string `json:"url"`
+	APIKey     string `json:"api_key"`
+	AgentID    string `json:"agent_id,omitempty"`
+	AgentEmail string `json:"agent_email,omitempty"`
 	// Identity is this login's sealed-transfer secret ("AGE-SECRET-KEY-1...").
 	// It never leaves the machine; only its public half is published.
 	Identity string `json:"identity,omitempty"`
+	// Identities preserves one sealed-transfer identity per instance account.
+	// Identity remains the active value for backwards compatibility with old
+	// config files and AGENTTRANSFER_IDENTITY.
+	Identities    map[string]string `json:"identities,omitempty"`
+	RecipientPins map[string]string `json:"recipient_pins,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -49,13 +57,16 @@ func loadConfig() (clientConfig, error) {
 		c.APIKey = os.Getenv("AGENTTRANSFER_KEY")
 		if c.APIKey != "" {
 			c.Identity = strings.TrimSpace(os.Getenv("AGENTTRANSFER_IDENTITY"))
-			// Fall back to the config file's sealed-transfer identity when the
-			// env doesn't carry one. Without this, env-auth would shadow (and
-			// rotate-key would then overwrite) a good on-disk identity, and
-			// `get --seal` couldn't find it.
-			if c.Identity == "" {
-				if fc, ferr := readFileConfig(); ferr == nil {
-					c.Identity = fc.Identity
+			// A matching saved login owns the per-account keyring and recipient
+			// pins even when the active identity is supplied explicitly in the
+			// environment. The env identity overrides only that active secret.
+			if fc, ferr := readFileConfig(); ferr == nil && sameLogin(fc, c) {
+				c.AgentID = fc.AgentID
+				c.AgentEmail = fc.AgentEmail
+				c.Identities = cloneIdentities(fc.Identities)
+				c.RecipientPins = clonePins(fc.RecipientPins)
+				if c.Identity == "" {
+					c.Identity = activeIdentity(fc)
 				}
 			}
 			return c, nil
@@ -75,6 +86,7 @@ func loadConfig() (clientConfig, error) {
 	if c.URL == "" || c.APIKey == "" {
 		return c, errors.New("config incomplete: run `agenttransfer login` again")
 	}
+	c.Identity = activeIdentity(c)
 	return c, nil
 }
 
@@ -240,6 +252,58 @@ func (a *api) jsonWithClient(hc *http.Client, method, path string, in any, out a
 	return nil
 }
 
+// jsonIdempotent performs a JSON POST with a caller-stable key. Besides server
+// replay protection, the header lets net/http safely retry a request whose
+// reused connection died before any response was observed.
+func (a *api) jsonIdempotent(path string, in any, out any, key string) error {
+	buf, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, a.base+path, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", strings.TrimSpace(key))
+	resp, err := a.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 300 {
+		return apiError(resp.StatusCode, data)
+	}
+	if out == nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, out)
+}
+
+// sendFailureError gives a safe retry instruction without pretending that a
+// nondeterministically encrypted local path can be recreated byte-for-byte in
+// a later CLI/MCP call. The compact request body is the exact server-side
+// idempotency payload and contains a reference to the already-uploaded
+// ciphertext, never the file bytes.
+func sendFailureError(cause error, base, idem, encMode, symmetricKey, ordinaryRetryHint string, req map[string]any) error {
+	if encMode == "" {
+		return fmt.Errorf("send failed: %w (if delivery is uncertain, retry the same unchanged operation with %s)", cause, ordinaryRetryHint)
+	}
+	body, marshalErr := json.Marshal(req)
+	if marshalErr != nil {
+		return fmt.Errorf("send failed: %w; encrypted delivery is uncertain and the exact retry request could not be encoded: %v", cause, marshalErr)
+	}
+	fileRef, _ := req["file"].(string)
+	keyNote := ""
+	if symmetricKey != "" {
+		keyNote = "; preserve the symmetric key for any delivered copy: " + symmetricKey
+	}
+	return fmt.Errorf("send failed: %w; if delivery is uncertain, encrypted upload %s cannot be recreated byte-for-byte by rerunning the local path. Treat delivery as uncertain, or replay POST %s/v1/send with Idempotency-Key %q and this exact JSON body: %s%s",
+		cause, fileRef, strings.TrimRight(base, "/"), idem, body, keyNote)
+}
+
 func apiError(status int, body []byte) error {
 	var e struct {
 		Error string `json:"error"`
@@ -392,8 +456,8 @@ client:
   agenttransfer login <url> --key K   store credentials (in your OS user-config dir)
   agenttransfer whoami
   agenttransfer put <file> [--share] [--ttl 3h] [--once] [--encrypt]   upload into your folder
-  agenttransfer send <file> --to a@b[,c@d] [--note s] [--ttl 3h] [--once] [--cc-owner] [--encrypt|--seal]
-  agenttransfer msg <text> --to a@b [--reply-to msg_...] [--subject s] [--cc-owner]
+  agenttransfer send <file> --to a@b[,c@d] [--note s] [--ttl 3h] [--once] [--cc-owner] [--encrypt|--seal] [--repin] [--idempotency-key k]
+  agenttransfer msg <text> --to a@b [--reply-to msg_...] [--subject s] [--cc-owner] [--idempotency-key k]
   agenttransfer inbox [--wait N] [--all] [--json]
   agenttransfer get <msg_...|url|sha256:...> [-o path] [--key atk_...]
   agenttransfer ls [--links]
@@ -478,6 +542,7 @@ func cmdSignup(args []string) error {
 	a := newAPI(clientConfig{URL: base})
 	a.hc.Timeout = 30 * time.Second
 	var out struct {
+		AgentID       string `json:"agent_id"`
 		Name          string `json:"name"`
 		Email         string `json:"email"`
 		APIKey        string `json:"api_key"`
@@ -498,12 +563,17 @@ func cmdSignup(args []string) error {
 		return err
 	}
 
-	c := clientConfig{URL: base, APIKey: out.APIKey}
+	c := clientConfig{URL: base, APIKey: out.APIKey, AgentID: out.AgentID, AgentEmail: out.Email}
+	if prev, err := readFileConfig(); err == nil {
+		carryKeyHistory(&c, prev)
+	}
 	if err := saveConfig(c); err != nil {
-		return err
+		return fmt.Errorf("agent was created but its one-time API key could not be saved; store this key now: %s (%w)", out.APIKey, err)
 	}
 	// Generate + publish a sealed-transfer identity so `send --seal` works.
-	_, _ = ensureIdentity(newAPI(c), &c)
+	if _, err := ensureIdentity(newAPI(c), &c); err != nil {
+		return fmt.Errorf("create sealed-transfer identity: %w", err)
+	}
 	p, _ := configPath()
 
 	fmt.Printf("✓ you are %s\n", out.Email)
@@ -547,23 +617,32 @@ func cmdLogin(args []string) error {
 		return errors.New("provide --key at_live_... (from agent creation)")
 	}
 	c := clientConfig{URL: url, APIKey: k}
-	// Preserve any existing sealed-transfer identity (an X25519 keypair is fine
-	// to reuse across instances; regenerating it would orphan already-received
-	// sealed files). Read the file directly so env-auth can't hide it.
-	if prev, err := readFileConfig(); err == nil {
-		c.Identity = prev.Identity
-	}
 	a := newAPI(c)
 	var who struct {
-		Email string `json:"email"`
+		AgentID string `json:"agent_id"`
+		Email   string `json:"email"`
 	}
 	if err := a.json("GET", "/v1/whoami", nil, &who); err != nil {
 		return fmt.Errorf("login check failed: %w", err)
 	}
+	c.AgentID, c.AgentEmail = who.AgentID, who.Email
+	// Keep a keyring across account switches, but activate only the identity
+	// scoped to this exact instance + agent id. Never reuse whichever identity
+	// happened to be active for another account.
+	if prev, err := readFileConfig(); err == nil {
+		carryKeyHistory(&c, prev)
+		if secret := c.Identities[identitySlot(c.URL, c.AgentID)]; secret != "" {
+			c.Identity = secret
+		} else if sameLogin(prev, c) { // one-time migration of an old config
+			c.Identity = activeIdentity(prev)
+		}
+	}
 	if err := saveConfig(c); err != nil {
 		return err
 	}
-	_, _ = ensureIdentity(a, &c) // generate + publish sealed-transfer key if absent
+	if _, err := ensureIdentity(a, &c); err != nil {
+		return fmt.Errorf("create sealed-transfer identity: %w", err)
+	}
 	fmt.Printf("✓ logged in as %s (%s)\n", who.Email, url)
 	return nil
 }
@@ -620,7 +699,10 @@ func cmdPut(args []string) error {
 	var body io.ReadCloser
 	var encKey string
 	if *encrypt {
-		encKey = seal.NewKey()
+		encKey, err = seal.NewKey()
+		if err != nil {
+			return err
+		}
 		body, err = encryptingReader(pos[0], encKey, nil)
 	} else {
 		body, err = os.Open(pos[0])
@@ -678,6 +760,10 @@ func cmdPut(args []string) error {
 }
 
 func cmdSend(args []string) error {
+	return cmdSendWithIdempotencyGenerator(args, newIdempotencyKey)
+}
+
+func cmdSendWithIdempotencyGenerator(args []string, generate func() (string, error)) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	to := fs.String("to", "", "recipients, comma-separated")
 	note := fs.String("note", "", "message text")
@@ -687,21 +773,31 @@ func cmdSend(args []string) error {
 	ccOwner := fs.Bool("cc-owner", false, "CC your human owner")
 	encrypt := fs.Bool("encrypt", false, "encrypt with a symmetric key printed for out-of-band sharing")
 	sealed := fs.Bool("seal", false, "encrypt to the recipients' keys — only they can decrypt (same-instance)")
+	repin := fs.Bool("repin", false, "accept changed sealed-recipient keys after independently verifying them")
+	idemFlag := fs.String("idempotency-key", "", "stable retry key; encrypted failures require exact uploaded-reference replay")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 || *to == "" {
-		return errors.New("usage: agenttransfer send <file> --to a@b[,c@d] [--note ...] [--encrypt|--seal]")
+		return errors.New("usage: agenttransfer send <file> --to a@b[,c@d] [--note ...] [--encrypt|--seal] [--repin] [--idempotency-key k]")
 	}
 	if *encrypt && *sealed {
 		return errors.New("--encrypt and --seal are mutually exclusive")
 	}
-	path := pos[0]
-	a, err := client()
+	if *repin && !*sealed {
+		return errors.New("--repin requires --seal")
+	}
+	idem, err := prepareIdempotencyKeyWith(*idemFlag, generate)
 	if err != nil {
 		return err
 	}
+	path := pos[0]
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	a := newAPI(cfg)
 	recipients := splitComma(*to)
 	name := filepath.Base(path)
 
@@ -710,9 +806,12 @@ func cmdSend(args []string) error {
 	var body io.ReadCloser
 	switch {
 	case *sealed:
-		keys, err := resolveRecipientKeys(a, recipients)
+		keys, pinNotes, err := resolveRecipientKeys(a, &cfg, recipients, *repin)
 		if err != nil {
 			return err
+		}
+		for _, note := range pinNotes {
+			fmt.Fprintf(os.Stderr, "security: %s\n", note)
 		}
 		encMode = "sealed"
 		body, err = encryptingReader(path, "", keys)
@@ -720,7 +819,11 @@ func cmdSend(args []string) error {
 			return err
 		}
 	case *encrypt:
-		encMode, encKey = "symmetric", seal.NewKey()
+		encMode = "symmetric"
+		encKey, err = seal.NewKey()
+		if err != nil {
+			return err
+		}
 		body, err = encryptingReader(path, encKey, nil)
 		if err != nil {
 			return err
@@ -786,8 +889,8 @@ func cmdSend(args []string) error {
 	if encMode != "" {
 		req["enc_mode"] = encMode
 	}
-	if err := a.json("POST", "/v1/send", req, &out); err != nil {
-		return err
+	if err := a.jsonIdempotent("/v1/send", req, &out, idem); err != nil {
+		return sendFailureError(err, a.base, idem, encMode, encKey, "--idempotency-key "+idem, req)
 	}
 	if encMode == "symmetric" {
 		fmt.Printf("  key: %s  (share out-of-band; recipient: agenttransfer get %s --key %s)\n", encKey, out.MessageID, encKey)
@@ -821,12 +924,17 @@ func cmdMsg(args []string) error {
 	replyTo := fs.String("reply-to", "", "message id this replies to")
 	subject := fs.String("subject", "", "subject")
 	ccOwner := fs.Bool("cc-owner", false, "CC your human owner")
+	idemFlag := fs.String("idempotency-key", "", "stable retry key (reuse after an uncertain send result)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 || *to == "" {
-		return errors.New("usage: agenttransfer msg <text> --to a@b [--reply-to msg_...]")
+		return errors.New("usage: agenttransfer msg <text> --to a@b [--reply-to msg_...] [--idempotency-key k]")
+	}
+	idem, err := prepareIdempotencyKey(*idemFlag)
+	if err != nil {
+		return err
 	}
 	a, err := client()
 	if err != nil {
@@ -846,8 +954,8 @@ func cmdMsg(args []string) error {
 		MessageID string           `json:"message_id"`
 		Delivered []map[string]any `json:"delivered"`
 	}
-	if err := a.json("POST", "/v1/send", req, &out); err != nil {
-		return err
+	if err := a.jsonIdempotent("/v1/send", req, &out, idem); err != nil {
+		return sendFailureError(err, a.base, idem, "", "", "--idempotency-key "+idem, req)
 	}
 	for _, d := range out.Delivered {
 		printDelivery(d)
@@ -999,8 +1107,9 @@ func cmdGet(args []string) error {
 		name = nameFromResponse(resp, url)
 	}
 	dest := *out
+	explicitDest := dest != ""
 	if dest == "" {
-		dest = name
+		dest = safeImplicitDownloadName(name)
 	}
 	if wantSHA == "" {
 		wantSHA = strings.TrimPrefix(resp.Header.Get("X-Sha256"), "sha256:")
@@ -1008,11 +1117,16 @@ func cmdGet(args []string) error {
 
 	// Encrypted path: verify the ciphertext hash and decrypt to dest in one stream.
 	if decryptSym || decryptSealed {
-		if err := verifyAndDecrypt(resp.Body, dest, wantSHA, *key, ident); err != nil {
+		got, err := verifyAndDecrypt(resp.Body, dest, wantSHA, *key, ident, explicitDest)
+		if err != nil {
 			return err
 		}
 		markReadIfSet(a, markRead)
-		fmt.Printf("🔓 %s (decrypted; ciphertext sha256 verified)\n", dest)
+		if wantSHA != "" {
+			fmt.Printf("🔓 %s (decrypted; ciphertext sha256 verified: %s)\n", dest, got)
+		} else {
+			fmt.Printf("🔓 %s (decrypted; ciphertext sha256: %s — no expected hash to verify against)\n", dest, got)
+		}
 		return nil
 	}
 
@@ -1032,7 +1146,7 @@ func cmdGet(args []string) error {
 		os.Remove(tmp.Name())
 		return fmt.Errorf("sha256 mismatch: got %s want %s — refusing the file", got, wantSHA)
 	}
-	if err := os.Rename(tmp.Name(), dest); err != nil {
+	if err := commitDownloadedFile(tmp.Name(), dest, explicitDest); err != nil {
 		os.Remove(tmp.Name())
 		return err
 	}
@@ -1062,10 +1176,9 @@ func markReadIfSet(a *api, ref string) {
 
 func nameFromResponse(resp *http.Response, url string) string {
 	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-		if i := strings.Index(cd, `filename="`); i >= 0 {
-			rest := cd[i+len(`filename="`):]
-			if j := strings.IndexByte(rest, '"'); j > 0 {
-				return rest[:j]
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if name := strings.TrimSpace(params["filename"]); name != "" {
+				return name
 			}
 		}
 	}
@@ -1213,11 +1326,19 @@ func cmdKeep(args []string) error {
 		return err
 	}
 	sha := strings.TrimPrefix(args[0], "sha256:")
-	var out map[string]any
+	var out struct {
+		Name      string `json:"name"`
+		Claimed   bool   `json:"claimed"`
+		ExpiresAt string `json:"expires_at"`
+	}
 	if err := a.json("POST", "/v1/files/"+sha+"/keep", map[string]any{}, &out); err != nil {
 		return err
 	}
-	fmt.Printf("✓ kept %v — it's now persistent\n", out["name"])
+	if out.ExpiresAt != "" {
+		fmt.Printf("✓ kept %s — retained until %s at your current storage tier\n", out.Name, out.ExpiresAt)
+	} else {
+		fmt.Printf("✓ kept %s — now persistent\n", out.Name)
+	}
 	return nil
 }
 
@@ -1328,7 +1449,11 @@ func formatReceiptLine(r receipt.Receipt) string {
 	}
 	line := fmt.Sprintf("%-11s %s", r.Action, flow)
 	if r.SHA256 != "" {
-		line += "  sha256:" + r.SHA256[:12] + "…"
+		short := r.SHA256
+		if len(short) > 12 {
+			short = short[:12] + "…"
+		}
+		line += "  sha256:" + short
 	}
 	return line
 }
@@ -1413,47 +1538,68 @@ func cmdVerify(args []string) error {
 	if err := receipt.VerifyChain(rs, pubKey, true); err != nil {
 		return fmt.Errorf("VERIFICATION FAILED: %w", err)
 	}
-	fmt.Printf("✓ full chain verified: %d receipts, signatures valid, no gaps, no tampering\n", len(rs))
+	fmt.Printf("✓ provided genesis-anchored export has %d valid signature(s) and no internal gaps; completeness requires a trusted checkpoint\n", len(rs))
 	return nil
 }
 
 func cmdRotateKey(args []string) error {
-	a, err := client()
+	if envAuthActive() {
+		return errors.New("rotate-key refuses environment-backed credentials because it cannot update AGENTTRANSFER_KEY; unset AGENTTRANSFER_URL/AGENTTRANSFER_KEY and log in with the saved config first")
+	}
+	c, err := readFileConfig()
 	if err != nil {
 		return err
 	}
+	if c.URL == "" || c.APIKey == "" {
+		return errors.New("saved config is incomplete; log in again before rotating")
+	}
+	// The current API cannot stage a caller-generated replacement key. Verify
+	// that an atomic config replacement succeeds before asking the server to
+	// invalidate the old key, minimizing the only remaining failure window.
+	if err := saveConfig(c); err != nil {
+		return fmt.Errorf("config is not safely writable; key was not rotated: %w", err)
+	}
+	a := newAPI(c)
 	var out struct {
 		APIKey string `json:"api_key"`
 	}
 	if err := a.json("POST", "/v1/agents/self/rotate_key", map[string]any{}, &out); err != nil {
 		return err
 	}
-	// Persist the new key immediately — the old one is already dead.
-	// saveConfig keeps the sealed-transfer identity intact.
-	c, _ := loadConfig()
+	if strings.TrimSpace(out.APIKey) == "" {
+		return errors.New("rotation response omitted the new API key; the server may already have invalidated the old key")
+	}
+	// The old key is now dead. Persist atomically and, if that unexpectedly
+	// fails after the preflight, return the one-time replacement in the error.
 	c.APIKey = out.APIKey
-	_ = saveConfig(c)
+	if err := saveConfig(c); err != nil {
+		return fmt.Errorf("KEY ROTATED BUT NOT SAVED: store this replacement now: %s (%w)", out.APIKey, err)
+	}
 	fmt.Printf("✓ key rotated and saved\n  new key: %s\n", out.APIKey)
 	return nil
+}
+
+func envAuthActive() bool {
+	return strings.TrimSpace(os.Getenv("AGENTTRANSFER_URL")) != "" && strings.TrimSpace(os.Getenv("AGENTTRANSFER_KEY")) != ""
 }
 
 // cmdDeleteSelf removes the logged-in agent. It clears the saved login only
 // when that file supplied the credentials; env-auth may intentionally point at
 // a different temporary agent and must never erase an unrelated saved login.
 func cmdDeleteSelf(args []string) error {
-	a, err := client()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
+	a := newAPI(cfg)
 	var out map[string]any
 	if err := a.json("DELETE", "/v1/agents/self", nil, &out); err != nil {
 		return err
 	}
 	fmt.Printf("✓ deleted %v — your key is dead; receipts are kept on the instance\n", out["deleted"])
-	envAuth := strings.TrimSpace(os.Getenv("AGENTTRANSFER_URL")) != "" && strings.TrimSpace(os.Getenv("AGENTTRANSFER_KEY")) != ""
-	if !envAuth {
-		if p, err := configPath(); err == nil {
-			_ = os.Remove(p)
+	if !envAuthActive() {
+		if err := clearDeletedLogin(cfg); err != nil {
+			return fmt.Errorf("agent was deleted, but local login cleanup failed: %w", err)
 		}
 	}
 	return nil
@@ -1514,12 +1660,18 @@ func cmdAgents(args []string) error {
 // card is an agent's public discovery profile, decoded from the wire form the
 // server returns (store.Card). The CLI never imports server/store types.
 type card struct {
-	Name         string   `json:"name"`
-	Pubkey       string   `json:"pubkey"`
-	Description  string   `json:"description"`
-	Capabilities []string `json:"capabilities"`
-	Listed       bool     `json:"listed"`
-	UpdatedAt    int64    `json:"updated_at"`
+	Name          string   `json:"name"`
+	Pubkey        string   `json:"pubkey"`
+	Description   string   `json:"description"`
+	Capabilities  []string `json:"capabilities"`
+	PublicContact string   `json:"public_contact"`
+	Verified      struct {
+		Tier     string `json:"tier"`
+		Instance string `json:"instance"`
+		Basis    string `json:"basis"`
+	} `json:"verified"`
+	Listed    bool  `json:"listed"`
+	UpdatedAt int64 `json:"updated_at"`
 }
 
 // cmdDirectory lists agents that opted into discovery — how an agent finds peers
@@ -1565,6 +1717,12 @@ func cmdDirectory(args []string) error {
 		if len(ag.Capabilities) > 0 {
 			parts = append(parts, strings.Join(ag.Capabilities, ", "))
 		}
+		if ag.Verified.Tier != "" {
+			parts = append(parts, "verified: "+ag.Verified.Tier+" ("+ag.Verified.Basis+")")
+		}
+		if ag.PublicContact != "" {
+			parts = append(parts, "contact: "+ag.PublicContact)
+		}
 		fmt.Println(strings.Join(parts, " — "))
 	}
 	return nil
@@ -1597,6 +1755,12 @@ func cmdCard(args []string) error {
 	}
 	if c.Pubkey != "" {
 		fmt.Printf("  pubkey: %s\n", c.Pubkey)
+	}
+	if c.Verified.Tier != "" {
+		fmt.Printf("  verified: %s (basis: %s; instance: %s)\n", c.Verified.Tier, c.Verified.Basis, c.Verified.Instance)
+	}
+	if c.PublicContact != "" {
+		fmt.Printf("  contact: %s\n", c.PublicContact)
 	}
 	return nil
 }

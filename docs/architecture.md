@@ -31,7 +31,7 @@ Internet HTTP(S)/SMTP                   outbound transport
   +------------------+                                        | /data mount
                                                               v
                                                      +------------------+
-                                                     | APP_ROOT/data    |
+                                                     | APP_DATA_ROOT    |
                                                      +------------------+
 ```
 
@@ -56,10 +56,13 @@ the proxy must route the app wildcard too.
 agenttransfer.db   SQLite/WAL metadata, identities, inboxes, receipts, releases
 blobs/             immutable sha256-addressed file and static-release bytes
 certmagic/         built-in TLS state, when enabled
-apps/              default APP_ROOT
-  data/            persistent container /data, keyed by durable app id
-  contexts/        transient materialized Docker build contexts
+app-builds/        default APP_BUILD_ROOT; transient public-service contexts
 ```
+
+Dynamic hosting adds two deliberately separate runner-owned paths outside the
+control plane: `APP_DATA_ROOT/<app-id>` for durable `/data`, and
+`APP_SNAPSHOT_ROOT` for transient descriptor-anchored copies that Docker is
+allowed to read. Snapshot scratch is never part of a backup.
 
 SQLite is authoritative for identity, ownership provenance, the active app
 release, and the desired runtime id. Blobs are immutable and deduplicated by
@@ -74,15 +77,18 @@ socket. It is the only component that invokes the Docker CLI. Requests are
 typed build/deploy/status/log/stop/reconcile/purge operations; callers cannot
 submit Docker flags or an arbitrary upstream URL.
 
-The runner owns host policy: serialized/time-bounded source builds, build
-network mode, best-effort builder resource flags, exact runtime
+The runner owns host policy: source builds disabled unless explicitly trusted,
+serialized/time-bounded builds, digest-pinned allowlisted registries, build
+network mode, descriptor-anchored snapshots, best-effort builder resource flags, exact runtime
 CPU/memory/process ceilings, nonroot runtime uid/gid, read-only root,
-dropped capabilities, bounded `/tmp`, rotating logs, a loopback-only published
-port, and one persistent `/data` bind mount. Runtime containers have bridge
-egress. The shipped systemd namespace exposes only `APP_ROOT`, the runner
-socket, and Docker; it hides the public service environment, SQLite database,
-transfer blobs, and TLS state. Docker remains a host security boundary, not a
-tenant-grade VM.
+dropped capabilities, bounded `/tmp`, rotating logs, one persistent `/data`
+bind mount, and a per-app network. Egress-off mode uses the exact validated
+RFC1918 endpoint on an internal bridge; egress-enabled mode publishes a random
+loopback port.
+Runtime egress is an explicit opt-in. The shipped systemd namespace exposes the
+build tree read-only, durable data/snapshot roots read-write, the runner socket,
+and Docker; it hides the public service environment, SQLite database, transfer
+blobs, and TLS state. Docker remains a host security boundary, not a tenant-grade VM.
 
 ### CLI and MCP
 
@@ -127,7 +133,9 @@ available so a workload cannot become unmanageable.
 
 Receipts for transfer and app lifecycle actions append to one ed25519-signed,
 hash-chained log. Agent deletion removes owned state but preserves receipts as
-deletion-evident history.
+instance-signed audit history. A supplied genesis-anchored export exposes
+internal edits and gaps; proving completeness requires an independently trusted
+head checkpoint.
 
 ### Static app deployment
 
@@ -146,16 +154,21 @@ deletion-evident history.
 ### Container deployment and routing
 
 1. Source archives pass the same validation, then the public service
-   materializes a temporary context below `APP_ROOT/contexts`. Image-only
-   deploys skip this step.
-2. The runner builds or pulls the image, starts a constrained container on a
-   random `127.0.0.1` port, measures `/data`, and polls the configured health
-   path until it returns 2xx.
-3. Only then does SQLite switch the desired runtime and public upstream. A bad
-   replacement is removed and the old healthy release remains live.
-4. The proxy forwards every HTTP method and body, replaces client-supplied
-   forwarding headers with a canonical view, and accepts only loopback
-   upstreams returned by the runner.
+   materializes a temporary context below `APP_BUILD_ROOT/contexts`. When the
+   operator has enabled source builds, the runner copies it through `os.Root`
+   into `APP_SNAPSHOT_ROOT`; Docker never reads mutable public input. Image-only
+   deploys skip this step and require a digest-pinned allowlisted image.
+2. Before a replacement mounts shared `/data`, the old runtime is drained. The
+   runner builds or pulls the image, starts a constrained container on a random
+   `127.0.0.1` port, measures `/data`, and polls the configured health path.
+3. Only after a 2xx does SQLite switch the desired runtime and public upstream.
+   A bad or uncertain replacement is reconciled away; the old desired runtime
+   is restarted and health-checked before its route is restored.
+4. The proxy forwards every HTTP method and body and replaces client-supplied
+   forwarding headers with a canonical view. Before each request it re-attests
+   the stored app/runtime/upstream with the runner. Egress-off targets must be
+   the exact RFC1918 address in the labeled private bridge/IPAM subnet;
+   egress-enabled targets must be loopback-published.
 5. After activation, and again in the janitor, reconciliation removes every
    stale managed runtime except SQLite's exact desired id. A container-to-static
    switch removes all runtimes while retaining `/data`.

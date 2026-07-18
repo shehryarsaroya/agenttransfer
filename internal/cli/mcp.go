@@ -200,15 +200,17 @@ var mcpProxyTools = []map[string]any{
 			"inbox delivery; others get email with a download link. encrypt = symmetric key (returned); " +
 			"seal = encrypt to the recipients' keys (same-instance).",
 		"inputSchema": mobj(map[string]any{
-			"to":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "recipient addresses"},
-			"path":     mstr("optional local file to attach"),
-			"note":     mstr("message text"),
-			"subject":  mstr("optional subject"),
-			"ttl":      mstr("link TTL like \"3h\""),
-			"once":     mbool("burn-after-read link"),
-			"cc_owner": mbool("CC your human owner"),
-			"encrypt":  mbool("symmetric encryption (key returned to share out-of-band)"),
-			"seal":     mbool("seal to recipients' keys (same-instance only)"),
+			"to":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "recipient addresses"},
+			"path":            mstr("optional local file to attach"),
+			"note":            mstr("message text"),
+			"subject":         mstr("optional subject"),
+			"ttl":             mstr("link TTL like \"3h\""),
+			"once":            mbool("burn-after-read link"),
+			"cc_owner":        mbool("CC your human owner"),
+			"encrypt":         mbool("symmetric encryption (key returned to share out-of-band)"),
+			"seal":            mbool("seal to recipients' keys (same-instance only; changed keys are refused)"),
+			"repin":           mbool("accept changed recipient keys only after independent verification"),
+			"idempotency_key": mstr("stable retry key; a later tool retry works for a note or unchanged plaintext, while encrypted paths require exact REST replay of the uploaded ciphertext reference"),
 		}, "to"),
 	},
 	{
@@ -618,7 +620,10 @@ func (s *mcpServer) upload(path string, share bool, ttl string, once, encrypt bo
 	case len(sealKeys) > 0:
 		reader, err = encryptingReader(path, "", sealKeys)
 	case encrypt:
-		key = seal.NewKey()
+		key, err = seal.NewKey()
+		if err != nil {
+			return "", 0, "", "", err
+		}
 		reader, err = encryptingReader(path, key, nil)
 	default:
 		reader, err = os.Open(path)
@@ -668,6 +673,10 @@ func (s *mcpServer) upload(path string, share bool, ttl string, once, encrypt bo
 }
 
 func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
+	return s.sendFileWithIdempotencyGenerator(args, newIdempotencyKey)
+}
+
+func (s *mcpServer) sendFileWithIdempotencyGenerator(args json.RawMessage, generate func() (string, error)) (string, error) {
 	var p struct {
 		To      []string `json:"to"`
 		Path    string   `json:"path"`
@@ -678,6 +687,8 @@ func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
 		CCOwner bool     `json:"cc_owner"`
 		Encrypt bool     `json:"encrypt"`
 		Seal    bool     `json:"seal"`
+		Repin   bool     `json:"repin"`
+		IdemKey string   `json:"idempotency_key"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -688,17 +699,28 @@ func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
 	if p.Encrypt && p.Seal {
 		return "", fmt.Errorf("encrypt and seal are mutually exclusive")
 	}
+	if p.Repin && !p.Seal {
+		return "", fmt.Errorf("repin requires seal=true")
+	}
+	if p.Path == "" && (p.Encrypt || p.Seal) {
+		return "", fmt.Errorf("encrypt and seal require path")
+	}
+	idem, err := prepareIdempotencyKeyWith(p.IdemKey, generate)
+	if err != nil {
+		return "", err
+	}
 	req := map[string]any{"to": p.To}
 	var key string
+	var pinNotes []string
 	if p.Path != "" {
 		var sealKeys []string
 		encMode := ""
 		if p.Seal {
-			ks, err := resolveRecipientKeys(s.a, p.To)
+			ks, notes, err := resolveRecipientKeys(s.a, &s.cfg, p.To, p.Repin)
 			if err != nil {
 				return "", err
 			}
-			sealKeys, encMode = ks, "sealed"
+			sealKeys, pinNotes, encMode = ks, notes, "sealed"
 		} else if p.Encrypt {
 			encMode = "symmetric"
 		}
@@ -731,8 +753,14 @@ func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
 		MessageID string           `json:"message_id"`
 		Delivered []map[string]any `json:"delivered"`
 	}
-	if err := s.a.json("POST", "/v1/send", req, &out); err != nil {
-		return "", err
+	if err := s.a.jsonIdempotent("/v1/send", req, &out, idem); err != nil {
+		encMode := ""
+		if p.Encrypt {
+			encMode = "symmetric"
+		} else if p.Seal {
+			encMode = "sealed"
+		}
+		return "", sendFailureError(err, s.a.base, idem, encMode, key, fmt.Sprintf("idempotency_key=%q", idem), req)
 	}
 	var vias []string
 	for _, d := range out.Delivered {
@@ -741,6 +769,9 @@ func (s *mcpServer) sendFile(args json.RawMessage) (string, error) {
 	msg := fmt.Sprintf("Sent %s → %s", out.MessageID, strings.Join(vias, ", "))
 	if p.Encrypt && key != "" {
 		msg += "\nSymmetric key to share out-of-band: " + key
+	}
+	for _, note := range pinNotes {
+		msg += "\nSecurity: " + note
 	}
 	return msg, nil
 }
@@ -800,21 +831,29 @@ func (s *mcpServer) download(ref, outPath, key string, forceSeal bool) (string, 
 
 	switch {
 	case key != "": // explicit symmetric key wins
-		if err := verifyAndDecrypt(resp.Body, outPath, wantSHA, key, nil); err != nil {
+		got, err := verifyAndDecrypt(resp.Body, outPath, wantSHA, key, nil, true)
+		if err != nil {
 			return "", err
 		}
 		s.markReadIfSet(markRead)
-		return fmt.Sprintf("Wrote %s (decrypted; ciphertext sha256 verified)", outPath), nil
+		if wantSHA != "" {
+			return fmt.Sprintf("Wrote %s (decrypted; ciphertext sha256:%s verified)", outPath, got), nil
+		}
+		return fmt.Sprintf("Wrote %s (decrypted; ciphertext sha256:%s computed, with no expected hash to verify against)", outPath, got), nil
 	case encMode == "sealed":
 		id, err := loadIdentity(s.cfg)
 		if err != nil {
 			return "", err
 		}
-		if err := verifyAndDecrypt(resp.Body, outPath, wantSHA, "", id); err != nil {
+		got, err := verifyAndDecrypt(resp.Body, outPath, wantSHA, "", id, true)
+		if err != nil {
 			return "", err
 		}
 		s.markReadIfSet(markRead)
-		return fmt.Sprintf("Wrote %s (decrypted with your identity; ciphertext sha256 verified)", outPath), nil
+		if wantSHA != "" {
+			return fmt.Sprintf("Wrote %s (decrypted with your identity; ciphertext sha256:%s verified)", outPath, got), nil
+		}
+		return fmt.Sprintf("Wrote %s (decrypted with your identity; ciphertext sha256:%s computed, with no expected hash to verify against)", outPath, got), nil
 	case encMode == "symmetric":
 		return "", fmt.Errorf("this file is symmetrically encrypted — supply key (atk_...)")
 	}
@@ -844,10 +883,13 @@ func (s *mcpServer) download(ref, outPath, key string, forceSeal bool) (string, 
 	// A file that arrived encrypted but wasn't decrypted is raw ciphertext —
 	// tell the model, don't claim it's verified/usable.
 	if looksEncrypted(outPath) {
-		return fmt.Sprintf("Wrote %s (%d bytes) but it appears to be age-encrypted ciphertext — "+
-			"call again with key (atk_...) or seal=true to decrypt", outPath, n), nil
+		return fmt.Sprintf("Wrote %s (%d bytes, ciphertext sha256:%s) but it appears to be age-encrypted ciphertext — "+
+			"call again with key (atk_...) or seal=true to decrypt", outPath, n, got), nil
 	}
-	return fmt.Sprintf("Wrote %s (%d bytes, sha256:%s verified)", outPath, n, got), nil
+	if wantSHA != "" {
+		return fmt.Sprintf("Wrote %s (%d bytes, sha256:%s verified)", outPath, n, got), nil
+	}
+	return fmt.Sprintf("Wrote %s (%d bytes, sha256:%s computed, with no expected hash to verify against)", outPath, n, got), nil
 }
 
 // markReadIfSet marks an inbox message read after a successful download.

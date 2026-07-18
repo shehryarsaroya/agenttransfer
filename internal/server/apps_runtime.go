@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,7 +56,25 @@ func (s *Server) deployContainerApp(ctx context.Context, agent store.Agent, app 
 		return app, deployment, cause
 	}
 
+	oldRuntime := app.RuntimeID
+	oldHealthPath := "/"
+	if oldRuntime != "" {
+		// Validate the restoration inputs before creating a managed build image.
+		// A corrupt active deployment must not leave a new release tag orphaned
+		// before the runner's Deploy transaction has taken ownership of it.
+		oldDeployment, err := s.st.ActiveAppDeployment(agent.ID)
+		if err != nil {
+			return fail(fmt.Errorf("load previous runtime config: %w", err))
+		}
+		var oldConfig containerAppConfig
+		if err := json.Unmarshal([]byte(oldDeployment.Config), &oldConfig); err != nil || validateAppHealthPath(oldConfig.HealthPath) != nil {
+			return fail(errors.New("previous runtime has an invalid health check configuration"))
+		}
+		oldHealthPath = oldConfig.HealthPath
+	}
+
 	image := strings.TrimSpace(req.Image)
+	builtImagePending := false
 	if source.ID != "" {
 		contextDir, err := s.materializeAppContext(app, deployment, files)
 		if err != nil {
@@ -68,34 +88,139 @@ func (s *Server) deployContainerApp(ctx context.Context, agent store.Agent, app 
 			return fail(fmt.Errorf("build: %w", err))
 		}
 		image = built.Image
+		builtImagePending = true
 	}
 
-	oldRuntime := app.RuntimeID
+	oldStopped := false
+	var drainErr error
+	if oldRuntime != "" {
+		// Every release mounts the same persistent /data directory read-write.
+		// Gracefully stop the old process before starting its replacement so two
+		// versions can never concurrently migrate or mutate the same state.
+		// Treat any stop error as ambiguous: Docker may have stopped the process
+		// even when the response was lost, so the restoration path must run.
+		oldStopped = true
+		if _, err := s.appRunner.StopRuntime(ctx, oldRuntime); err != nil {
+			drainErr = fmt.Errorf("drain previous runtime: %w", err)
+		}
+	}
+	cleanupBuiltImage := func(cause error) error {
+		if !builtImagePending {
+			return cause
+		}
+		// Cleanup uses only app/release IDs; the runner derives and validates the
+		// reserved image reference, so the public service never sends a Docker
+		// target. Use a detached timeout because the request that failed the
+		// deploy may already be cancelled.
+		builtImagePending = false
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, cleanupErr := s.appRunner.RemoveImage(cleanupCtx, app.ID, deployment.ID)
+		cancel()
+		if cleanupErr != nil {
+			return fmt.Errorf("%v; built image cleanup failed: %w", cause, cleanupErr)
+		}
+		return cause
+	}
+	restoreThenFail := func(cause error) (store.App, store.AppDeployment, error) {
+		cause = cleanupBuiltImage(cause)
+		if !oldStopped {
+			return fail(cause)
+		}
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, restoreErr := s.appRunner.ReconcileApp(restoreCtx, app.ID, oldRuntime)
+		var oldStatus apphost.AppStatus
+		if restoreErr == nil {
+			oldStatus, restoreErr = s.appRunner.StartRuntime(restoreCtx, oldRuntime)
+		}
+		if restoreErr == nil {
+			restoreErr = probeRuntimeHealth(restoreCtx, oldStatus.URL, oldHealthPath)
+		}
+		cancel()
+		if restoreErr != nil {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, _ = s.appRunner.Stop(stopCtx, app.ID)
+			stopCancel()
+			_, _ = s.st.StopApp(agent.ID)
+			s.forgetRuntimeTarget(app.ID)
+			cause = fmt.Errorf("%v; restoring previous runtime failed: %w", cause, restoreErr)
+		} else if oldStatus.URL != app.Upstream {
+			if err := s.st.RefreshAppRuntimeUpstream(agent.ID, oldRuntime, oldStatus.URL); err != nil {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, _ = s.appRunner.Stop(stopCtx, app.ID)
+				stopCancel()
+				_, _ = s.st.StopApp(agent.ID)
+				s.forgetRuntimeTarget(app.ID)
+				cause = fmt.Errorf("%v; restoring previous runtime route failed: %w", cause, err)
+			} else {
+				s.rememberRuntimeTarget(app.ID, oldRuntime, oldStatus.URL)
+			}
+		} else {
+			s.rememberRuntimeTarget(app.ID, oldRuntime, oldStatus.URL)
+		}
+		return fail(cause)
+	}
+	removeThenRestore := func(runtimeID string, cause error) (store.App, store.AppDeployment, error) {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, removeErr := s.appRunner.RemoveRuntime(cleanupCtx, runtimeID)
+		cancel()
+		if removeErr != nil {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, _ = s.appRunner.Stop(stopCtx, app.ID)
+			stopCancel()
+			_, _ = s.st.StopApp(agent.ID)
+			s.forgetRuntimeTarget(app.ID)
+			return fail(fmt.Errorf("%v; replacement cleanup failed while previous runtime remains stopped: %w", cause, removeErr))
+		}
+		return restoreThenFail(cause)
+	}
+	if drainErr != nil {
+		return restoreThenFail(drainErr)
+	}
 	runtime, err := s.appRunner.Deploy(ctx, apphost.DeployRequest{
 		AppID: app.ID, ReleaseID: deployment.ID, Image: image,
 		ContainerPort: req.Port, HealthPath: req.HealthPath,
 		Env: req.Env, Command: req.Command,
 	})
 	if err != nil {
-		return fail(fmt.Errorf("start: %w", err))
+		if oldRuntime == "" {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, cleanupErr := s.appRunner.RemoveApp(cleanupCtx, app.ID)
+			cancel()
+			if cleanupErr != nil {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, _ = s.appRunner.Stop(stopCtx, app.ID)
+				stopCancel()
+				_, _ = s.st.StopApp(agent.ID)
+				return fail(fmt.Errorf("start: %v; uncertain replacement cleanup failed: %w", err, cleanupErr))
+			}
+		}
+		return restoreThenFail(fmt.Errorf("start: %w", err))
 	}
+	builtImagePending = false
+	// A successful launch has just passed the runner's routing and HTTP health
+	// gates. Reflect that proof immediately instead of leaving discovery false
+	// until the short readiness cache expires.
+	s.markAppRunnerReady()
 	var releaseBytes int64 = source.Size
 	for _, file := range files {
-		releaseBytes += file.Size
+		var ok bool
+		releaseBytes, ok = addStorageBytes(releaseBytes, file.Size)
+		if !ok {
+			return removeThenRestore(runtime.RuntimeID, errors.New("app release byte count is invalid or overflowing"))
+		}
 	}
-	if releaseBytes+runtime.DataBytes > s.cfg.AppStorageQuota {
-		_, _ = s.appRunner.RemoveRuntime(ctx, runtime.RuntimeID)
-		return fail(fmt.Errorf("app uses %d bytes (release %d + persistent data %d), over quota %d",
-			releaseBytes+runtime.DataBytes, releaseBytes, runtime.DataBytes, s.cfg.AppStorageQuota))
+	if !storageAdditionFits(releaseBytes, runtime.DataBytes, s.cfg.AppStorageQuota) {
+		return removeThenRestore(runtime.RuntimeID, fmt.Errorf("app exceeds quota (release %d + persistent data %d; quota %d)",
+			releaseBytes, runtime.DataBytes, s.cfg.AppStorageQuota))
 	}
 	app, deployment, err = s.st.SetAppRuntime(agent.ID, deployment.ID, runtime.RuntimeID,
 		runtime.Upstream, runtime.Image, req.Port, envKeys)
 	if err != nil {
-		_, _ = s.appRunner.RemoveRuntime(ctx, runtime.RuntimeID)
-		return fail(fmt.Errorf("activate: %w", err))
+		return removeThenRestore(runtime.RuntimeID, fmt.Errorf("activate: %w", err))
 	}
-	// The new container is already healthy and routing now points at it. Only
-	// after that atomic DB switch do we drain/remove the previous release.
+	s.rememberRuntimeTarget(app.ID, runtime.RuntimeID, runtime.Upstream)
+	// The previous release was gracefully stopped before the replacement
+	// mounted shared /data. After the atomic DB switch, remove that old runtime.
 	if oldRuntime != runtime.RuntimeID {
 		if _, cleanupErr := s.appRunner.ReconcileApp(ctx, app.ID, runtime.RuntimeID); cleanupErr != nil {
 			log.Printf("apphost: stale runtime cleanup after deploy for %s: %v", app.ID, cleanupErr)
@@ -111,13 +236,13 @@ func jsonMarshal(v any) ([]byte, error) {
 }
 
 func (s *Server) materializeAppContext(app store.App, deployment store.AppDeployment, files []store.AppFileSpec) (string, error) {
-	root, err := filepath.Abs(s.cfg.AppRoot)
+	root, err := filepath.Abs(s.cfg.AppBuildRoot)
 	if err != nil {
 		return "", err
 	}
 	dir := filepath.Join(root, "contexts", app.ID, deployment.ID)
 	if rel, err := filepath.Rel(root, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("build context escaped APP_ROOT")
+		return "", errors.New("build context escaped APP_BUILD_ROOT")
 	}
 	var required int64
 	for _, file := range files {
@@ -126,7 +251,7 @@ func (s *Server) materializeAppContext(app store.App, deployment store.AppDeploy
 		}
 		required += file.Size
 	}
-	if free, total, reserve := s.st.DiskStats(); reserve > 0 && total > 0 &&
+	if free, total, reserve := s.st.DiskStatsAt(root); reserve > 0 && total > 0 &&
 		(free < reserve || required > free-reserve) {
 		return "", fmt.Errorf("%w: build context needs %d bytes above the free-space floor", store.ErrDiskReserve, required)
 	}
@@ -160,7 +285,7 @@ func (s *Server) materializeAppContext(app store.App, deployment store.AppDeploy
 			src.Close()
 			return cleanup(err)
 		}
-		n, copyErr := io.CopyBuffer(&appContextWriter{s: s, dst: dst},
+		n, copyErr := io.CopyBuffer(&appContextWriter{s: s, dst: dst, volumePath: root},
 			io.LimitReader(src, f.Size+1), make([]byte, 1<<20))
 		closeErr := dst.Close()
 		src.Close()
@@ -178,16 +303,13 @@ func (s *Server) materializeAppContext(app store.App, deployment store.AppDeploy
 }
 
 type appContextWriter struct {
-	s   *Server
-	dst io.Writer
+	s          *Server
+	dst        io.Writer
+	volumePath string
 }
 
 func (w *appContextWriter) Write(p []byte) (int, error) {
-	if free, total, reserve := w.s.st.DiskStats(); reserve > 0 && total > 0 &&
-		(free < reserve || int64(len(p)) > free-reserve) {
-		return 0, store.ErrDiskReserve
-	}
-	return w.dst.Write(p)
+	return w.s.st.WriteWithDiskReserve(w.volumePath, w.dst, p)
 }
 
 // stopAllAppRuntimes converges every runner-managed container for an app,
@@ -224,37 +346,182 @@ func (s *Server) purgeAppData(ctx context.Context, agentID string) error {
 	return err
 }
 
-func (s *Server) appRuntimeLogs(ctx context.Context, agentID string, tail int) (string, string, error) {
+func (s *Server) appRuntimeLogResult(ctx context.Context, agentID string, tail int) (apphost.LogsResult, string, error) {
 	app, err := s.st.AppByAgentID(agentID)
 	if err != nil {
-		return "", "", err
+		return apphost.LogsResult{}, "", err
 	}
 	if app.Kind != store.AppKindContainer || app.RuntimeID == "" || s.appRunner == nil {
-		return "", app.Status, store.ErrNotFound
+		return apphost.LogsResult{}, app.Status, store.ErrNotFound
 	}
 	logs, err := s.appRunner.RuntimeLogs(ctx, app.RuntimeID, tail)
 	if err != nil {
-		return "", app.Status, err
+		return apphost.LogsResult{}, app.Status, err
 	}
 	status, err := s.appRunner.RuntimeStatus(ctx, app.RuntimeID)
 	if err != nil {
-		return logs.Output, app.Status, nil
+		return logs, app.Status, nil
 	}
-	return logs.Output, status.State, nil
+	return logs, status.State, nil
+}
+
+const runtimeTargetTTL = 15 * time.Second
+
+type runtimeTarget struct {
+	runtimeID string
+	upstream  string
+	expires   time.Time
+}
+
+func parseRuntimeUpstream(raw string) (*url.URL, netip.Addr, error) {
+	base, err := url.Parse(raw)
+	if err != nil || base.Scheme != "http" || base.User != nil || base.Opaque != "" ||
+		base.Path != "" || base.RawPath != "" || base.RawQuery != "" || base.Fragment != "" {
+		return nil, netip.Addr{}, errors.New("invalid runtime upstream")
+	}
+	addr, err := netip.ParseAddr(base.Hostname())
+	if err != nil {
+		return nil, netip.Addr{}, errors.New("runtime upstream is not an IP address")
+	}
+	addr = addr.Unmap()
+	port, err := strconv.Atoi(base.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return nil, netip.Addr{}, errors.New("runtime upstream has an invalid port")
+	}
+	if !addr.Is4() || (!addr.IsLoopback() && !addr.IsPrivate()) || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return nil, netip.Addr{}, errors.New("runtime upstream is neither loopback nor private IPv4")
+	}
+	canonical := "http://" + net.JoinHostPort(addr.String(), strconv.Itoa(port))
+	if raw != canonical {
+		return nil, netip.Addr{}, errors.New("runtime upstream is not canonical")
+	}
+	return base, addr, nil
+}
+
+func (s *Server) rememberRuntimeTarget(appID, runtimeID, upstream string) {
+	if appID == "" || runtimeID == "" || upstream == "" {
+		return
+	}
+	s.appRuntimeTargets.Store(appID, runtimeTarget{
+		runtimeID: runtimeID, upstream: upstream, expires: time.Now().Add(runtimeTargetTTL),
+	})
+}
+
+func (s *Server) forgetRuntimeTarget(appID string) {
+	s.appRuntimeTargets.Delete(appID)
+}
+
+// trustedRuntimeTarget prevents a stored upstream from becoming an SSRF
+// primitive. Every target needs a fresh, exact attestation from the runner for
+// this app and immutable runtime ID; private bridge targets receive the same
+// treatment as loopback-published ports.
+func (s *Server) trustedRuntimeTarget(ctx context.Context, app store.App) (*url.URL, error) {
+	target, _, err := parseRuntimeUpstream(app.Upstream)
+	if err != nil {
+		return nil, err
+	}
+	if cached, ok := s.appRuntimeTargets.Load(app.ID); ok {
+		attested, valid := cached.(runtimeTarget)
+		if valid && attested.runtimeID == app.RuntimeID && attested.upstream == app.Upstream && time.Now().Before(attested.expires) {
+			return target, nil
+		}
+	}
+	if s.appRunner == nil || app.ID == "" || app.RuntimeID == "" {
+		return nil, errors.New("private runtime target is not runner-attested")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	observed, err := s.appRunner.RuntimeRoute(probeCtx, app.RuntimeID)
+	if err != nil {
+		return nil, fmt.Errorf("attest private runtime target: %w", err)
+	}
+	if observed.AppID != app.ID || observed.ContainerID != app.RuntimeID || !observed.Running || observed.URL != app.Upstream {
+		return nil, errors.New("stored private runtime target does not match the runner")
+	}
+	if _, _, err := parseRuntimeUpstream(observed.URL); err != nil {
+		return nil, errors.New("runner returned an invalid runtime target")
+	}
+	s.rememberRuntimeTarget(app.ID, app.RuntimeID, app.Upstream)
+	return target, nil
+}
+
+func probeRuntimeHealth(ctx context.Context, upstream, healthPath string) error {
+	base, _, err := parseRuntimeUpstream(upstream)
+	if err != nil || validateAppHealthPath(healthPath) != nil {
+		return errors.New("invalid runtime health endpoint")
+	}
+	base.Path, base.RawPath = healthPath, ""
+	transport := &http.Transport{Proxy: nil}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+		if reqErr != nil {
+			return reqErr
+		}
+		resp, reqErr := client.Do(req)
+		if reqErr == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			last = fmt.Errorf("health endpoint returned %s", resp.Status)
+		} else {
+			last = reqErr
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+	}
+	return last
 }
 
 func (s *Server) proxyContainerApp(w http.ResponseWriter, r *http.Request, app store.App) {
-	target, err := url.Parse(app.Upstream)
-	if err != nil || target.Scheme != "http" || target.User != nil || target.RawQuery != "" || target.Fragment != "" {
+	appSlots := s.appProxySlot(app.ID)
+	select {
+	case appSlots <- struct{}{}:
+		defer func() { <-appSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "app proxy is at per-app capacity", http.StatusServiceUnavailable)
+		return
+	}
+	select {
+	case s.appProxySlots <- struct{}{}:
+		defer func() { <-s.appProxySlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "app proxy is at capacity", http.StatusServiceUnavailable)
+		return
+	}
+	if r.ContentLength > s.cfg.AppProxyBodySize {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(w, r.Body, s.cfg.AppProxyBodySize)
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(s.cfg.AppProxyBodyTimeout))
+		defer rc.SetReadDeadline(time.Time{})
+	}
+	target, err := s.trustedRuntimeTarget(r.Context(), app)
+	if err != nil {
 		http.Error(w, "app runtime unavailable", http.StatusBadGateway)
 		return
 	}
-	host := target.Hostname()
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() || target.Port() == "" {
-		http.Error(w, "app runtime unavailable", http.StatusBadGateway)
-		return
-	}
-	proxy := &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) {
+	proxy := &httputil.ReverseProxy{Transport: s.appProxyTransport, Rewrite: func(pr *httputil.ProxyRequest) {
 		pr.SetURL(target)
 		// Agent apps get a canonical forwarding view. Never pass client-supplied
 		// Forwarded/X-Forwarded values to frameworks that may trust them.
@@ -277,6 +544,11 @@ func (s *Server) proxyContainerApp(w http.ResponseWriter, r *http.Request, app s
 		pr.Out.Header.Set("X-Forwarded-Proto", proto)
 	}}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		log.Printf("apphost: proxy %s (%s): %v", app.Slug, app.RuntimeID, err)
 		http.Error(w, "app is starting or unavailable", http.StatusBadGateway)
 	}

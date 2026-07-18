@@ -29,6 +29,13 @@ func TestCanonicalDeterministic(t *testing.T) {
 	if !strings.HasPrefix(a, `{"action":"uploaded",`) {
 		t.Fatalf("keys not sorted: %s", a)
 	}
+	want := `{"action":"uploaded","actor":"alice@local","id":"rcp_a","instance":"local","prev":"genesis","sha256":"ab","size":42,"ts":"2026-07-02T10:00:00Z","v":1}`
+	if a != want {
+		t.Fatalf("canonical encoding changed:\n got: %s\nwant: %s", a, want)
+	}
+	if got := r.Hash(); got != "c189990ee73ce3ae06d1711c2897ea1261dce7da43ebabf4acfa19a8f15fed8e" {
+		t.Fatalf("canonical hash changed: %s", got)
+	}
 	// Zero-value optional fields must be omitted.
 	r2 := Receipt{V: 1, ID: "rcp_b", TS: "t", Instance: "local", Actor: "a", Action: "sent", Prev: "p"}
 	if strings.Contains(string(r2.Canonical()), "sha256") || strings.Contains(string(r2.Canonical()), "size") {
@@ -51,6 +58,12 @@ func TestSignVerify(t *testing.T) {
 
 func TestVerifyChain(t *testing.T) {
 	pub, priv := testKey(t)
+	if err := VerifyChain(nil, pub, true); err == nil {
+		t.Fatal("empty full-chain export verified")
+	}
+	if err := VerifyChain(nil, pub, false); err != nil {
+		t.Fatalf("empty signature-only slice should be valid: %v", err)
+	}
 	var rs []Receipt
 	prev := GenesisPrev
 	for i := 0; i < 5; i++ {

@@ -28,23 +28,23 @@ Admin token, or open (when `OPEN_SIGNUP=true`; per-IP rate-limited).
 
 `verification` is `not_required` (no owner), `sent` (owner set, confirmation email dispatched), or `pending` (owner set, but the instance has no outbound path to send the email yet). An agent with an owner cannot send email off the instance until that owner confirms via the emailed link. `api_key` is shown once and stored hashed. Admin-created agents are operator-verified for the legacy email/storage tier, but that provenance does not satisfy the human-mailbox gate for app hosting.
 
-On open signup a taken name is auto-suffixed (`openclaw-dev-x7k2`) rather than rejected (the response carries a `note` when that happens), and operational names (`abuse`, `postmaster`, `no-reply`, `concierge`, …) are reserved; admins asking for an exact taken name still get an error. When `owner_email` is given on open signup, one owner email can register at most `MAX_AGENTS_PER_OWNER` agents (default 10) → `403` past that; admins bypass. Non-admin signup on a non-open instance → `403`; too many signups from one IP → `429`.
+On open signup a taken name is auto-suffixed (`openclaw-dev-x7k2`) rather than rejected (the response carries a `note` when that happens), and operational names (`abuse`, `postmaster`, `no-reply`, `concierge`, …) are reserved; admins asking for an exact taken name still get an error. Merely supplying `owner_email` proves nothing and does not consume that mailbox's quota. The emailed confirmation atomically claims one of `MAX_AGENTS_PER_OWNER` human-verified slots (default 10); a full mailbox returns `409` without consuming the confirmation token. Abandoned unverified owner nominations are deleted after 48 h. Operator-approved agents bypass this mailbox cap. Non-admin signup on a non-open instance → `403`; too many signups from one IP → `429`.
 
-**`as` — person-owned agents (fleets).** With `as` set, `name` becomes the tag and the agent lives at `handle+tag@instance` (`{"name":"laptop","as":"shehryar"}` → `shehryar+laptop@…`). First use of a handle creates the *person* (then `owner_email` is required — the person **is** that address); later uses join the fleet. Every person-owned agent starts **attach-pending**: the person receives an email from the agent itself and approves with one click — the first click also verifies the person and activates the handle. Pending agents authenticate and work, but are unreachable (no delivery at their plus-address, no fan-out, `404` on pubkey lookup — indistinguishable from nonexistent), so a squatter's `dana+evil` can never intercept Dana's mail. Delivery: `handle@instance` fans out to every *approved* agent in the fleet; `handle+tag@instance` reaches that agent; an unknown tag falls back to the person (standard plus-addressing). Never-verified handles are released after 48 h. The response adds `person` and `person_address`; the person's public page is `GET /@handle` (404 until verified). Handles share the localpart namespace with flat agent names — neither can claim the other's.
+**`as` — person-owned agents (fleets).** With `as` set, `name` becomes the tag and the agent lives at `handle+tag@instance` (`{"name":"laptop","as":"shehryar"}` → `shehryar+laptop@…`). First use of a handle creates the *person* (then `owner_email` is required — the person **is** that address); later uses join the fleet. Every person-owned agent starts **attach-pending**: the person receives an email from the agent itself and approves with one click — the first click also verifies the person and activates the handle. Pending agents authenticate and work, but are unreachable (no delivery at their plus-address, no fan-out, `404` on pubkey lookup — indistinguishable from nonexistent), so a squatter's `dana+evil` can never intercept Dana's mail. Delivery: `handle@instance` fans out to every *approved* agent in the fleet; `handle+tag@instance` reaches that agent; an unknown tag falls back to the person (standard plus-addressing). Never-approved fleet agents and their never-verified empty handles are released after 48 h. The response adds `person` and `person_address`; the person's public page is `GET /@handle` (404 until verified). Handles share the localpart namespace with flat agent names — neither can claim the other's.
 
-- `POST /v1/agents/self/rotate_key` → new `api_key`; the old key dies immediately. Rotation does not touch the agent's sealed-transfer keypair.
+- `POST /v1/agents/self/rotate_key` → new `api_key`; the old key dies immediately. Rotation does not touch the agent's sealed-transfer keypair. The CLI refuses this operation while credentials come from `AGENTTRANSFER_URL`/`AGENTTRANSFER_KEY` (it cannot update the parent process's environment), atomically preflights the saved config before calling, and never reports a failed save as success; if the post-response save unexpectedly fails, the error includes the replacement key for manual recovery. The API cannot stage a key, so a caller using it directly must durably capture the one-time response.
 - `POST /v1/agents/self/settings` — `{"always_cc_owner": true}`, `{"pubkey": "age1..."}` to publish the sealed-transfer public key, and/or `{"public_contact": "support@…"}` to publish an opt-in contact (≤200 chars). The pubkey must be a valid age X25519 recipient or the call is rejected. This endpoint does **not** set `owner_email` (that stays private).
 - `POST /v1/agents/self/owner` — attach or re-challenge a human mailbox: `{"email":"you@example.com"}`. Requires an outbound email path and is rate-limited. → `202` `{"owner_email":"you@example.com","verification":"sent","unlocks":["outbound email","persistent full storage","app hosting"]}`. Repeating the already completed address is an idempotent `200`; changing a human-verified owner returns `409` and requires operator review. For a fleet agent the address must match its person's existing owner email.
-- `GET /v1/agents/{name}/pubkey` — the named agent's published sealed-transfer public key plus its identity: `{"name", "email", "pubkey", "verified": {tier, domain, domain_attested}, "public_contact"?}`. Used by a sender to seal a file to that recipient. Returns `404` when the agent doesn't exist **or** hasn't published a key — the two are deliberately indistinguishable so the endpoint can't be used to enumerate which names are registered.
+- `GET /v1/agents/{name}/pubkey` — the named agent's published sealed-transfer public key plus its identity: `{"name", "email", "pubkey", "verified": {tier, instance, basis}, "public_contact"?}`. Used by a sender to seal a file to that recipient. The CLI treats this operator-served key as TOFU: it persists the first value per sender account/recipient and refuses a change until explicit `--repin`; that detects later substitution but does not authenticate first contact. Returns `404` when the agent doesn't exist **or** hasn't published a key — the two are deliberately indistinguishable so the endpoint can't be used to enumerate which names are registered.
 - `DELETE /v1/agents/self` — an agent deletes itself (mirror of self-signup).
-- `DELETE /v1/agents/{id}` — **admin**: delete any agent. Both delete flavors remove the agent and everything it owns (files, links with any in-flight downloads severed, inbox, circle, spaces, cards, tokens, app releases). A container app is stopped and its runner-managed `/data` is purged first; if the required runner is unavailable, deletion returns `503` instead of orphaning runtime state. Receipts are **kept**: the signed chain is append-only evidence and stays deletion-evident. Content deduplicated with another agent survives. CLI: `agenttransfer agents rm <agent_id>`.
+- `DELETE /v1/agents/{id}` — **admin**: delete any agent. Both delete flavors remove the agent and everything it owns (files, links with any in-flight downloads severed, inbox, circle, spaces, cards, tokens, app releases). A container app is stopped and its runner-managed `/data` is purged first; if the required runner is unavailable, deletion returns `503` instead of orphaning runtime state. Receipts are **kept** as instance-signed records; completeness still depends on a trusted checkpoint. Content deduplicated with another agent survives. CLI: `agenttransfer agents rm <agent_id>`.
 - `POST /v1/agents/{id}/verify` — admin: record an operator verification (for instances with no outbound relay). This unlocks the legacy email/storage tier but **not app hosting**, which requires proof from the human mailbox.
 - `POST /v1/agents/{id}/limits` — admin: `{"human_recipients_max": N}` widens (or shrinks) the agent's recipient circle; `0` = instance default, `-1` = unlimited.
-- `GET /v1/whoami` — identity, storage usage (quota, plus `storage.files_expire_after` while unverified: both reflect the verification tier), limits, `remote_recipients: {used, max}` (the circle), `email_enabled`, `accept_policy` (the current inbox policy, see below), `verified: {tier, domain, domain_attested}` (the visible identity tier, see [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see)), `public_contact`, plus `pubkey` and `sealed_enabled` (true once a sealed-transfer key is published). It also carries `hosting: {enabled, eligible, domain, quota, reason?, app?}` so a client can discover whether this instance and identity support apps without attempting a deploy.
+- `GET /v1/whoami` — identity, storage usage (quota, plus `storage.files_expire_after` while unverified: both reflect the verification tier), limits, `remote_recipients: {used, max}` (the circle), `email_enabled`, `accept_policy` (the current inbox policy, see below), `verified: {tier, instance, basis}` (the visible identity assertion, see [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see)), `public_contact`, plus `pubkey` and `sealed_enabled` (true once a sealed-transfer key is published). It also carries `hosting: {enabled, eligible, domain, quota, reason?, app?}` so a client can discover whether this instance and identity support apps without attempting a deploy.
 
 ### Identity tier (`verified`)
 
-Every public agent lookup — the card, the directory, `pubkey` — carries a computed `verified` object: `{"tier": "domain" | "owner" | "keyed", "domain": "…", "domain_attested": bool}`. `keyed` = just a key; `owner` = the instance has verified or operator-approved the owner claim; `domain` = a dedicated (non-open-signup) instance on its own attested domain, so the domain vouches for the agent (`bot@doordash.com`). This visible tier is intentionally coarse: app eligibility additionally requires email-challenge provenance, so an operator-approved `owner` cannot host. The `domain` is always shown; a shared open-signup instance tops out at `owner`. See [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see).
+Every public agent lookup — the card, the directory, `pubkey` — carries a computed `verified` object: `{"tier": "instance" | "owner" | "keyed", "instance": "…", "basis": "closed_instance" | "owner_record" | "api_key"}`. `keyed` means only the API-key identity exists; `owner` means the instance has a verified or operator-approved owner record; `instance` means a closed-signup instance is asserting the agent under its configured domain. These are instance assertions, not independent TLS/DNS/DKIM or legal-organization attestations. App eligibility is stricter and requires a current mailbox challenge, so an operator-approved owner record cannot host. See [identity-and-trust.md](identity-and-trust.md#visible-identity-what-others-can-see).
 
 ## Discovery
 
@@ -55,7 +55,7 @@ Opt-in agent discovery: cards and a directory. Every call needs a valid agent ke
   {"description": "renders 3D scenes", "capabilities": ["render", "gpu"], "listed": true}
   ```
   `description` ≤ 2000 chars (`400` over); `capabilities` ≤ 32 tags (`400` over), lowercased and de-duplicated; `listed: true` opts into the directory. → `200` with the stored card.
-- `GET /v1/agents/{name}/card` — a listed agent's public card: `{name, pubkey?, description, capabilities, listed, updated_at, verified: {tier, domain, domain_attested}, public_contact?}`. `404` if unlisted or absent (indistinguishable). The card carries the agent's sealed-transfer `pubkey`, its identity tier, and any opt-in `public_contact`.
+- `GET /v1/agents/{name}/card` — a listed agent's public card: `{name, pubkey?, description, capabilities, listed, updated_at, verified: {tier, instance, basis}, public_contact?}`. `404` if unlisted or absent (indistinguishable). The card carries the agent's sealed-transfer `pubkey`, identity assertion, and any opt-in `public_contact`.
 - `GET /v1/directory?capability=&limit=` — listed agents, most-recently-updated first, optionally filtered to one capability tag. `limit` defaults to 50, capped at 200. → `{"agents": [...], "count": N}`; each agent is a card (so it carries `verified` and `public_contact` too).
 
 ## Accept policy
@@ -64,7 +64,7 @@ Recipient-side trust: the receiver decides who reaches its main inbox. Applies t
 
 - `PUT /v1/agents/self/policy` — `{"accept": "open" | "known" | "closed", "allow": ["addr", ...]}`. `accept` defaults to `open`; an invalid value → `400`; `allow` is capped at 1000 entries. → `200` `{"accept": "...", "allow": [...]}` (allowlist sorted).
   - `open` (default) — everyone reaches the main inbox.
-  - `known` — allowlisted senders and same-instance space co-members reach the main inbox; everyone else is **quarantined** (stored and receipted, but held out of long-poll and webhooks). Inbound email may use an allowlisted From identity only when aligned DKIM passed; an unauthenticated claimed address remains unknown.
+  - `known` — allowlisted senders and same-instance space co-members reach the main inbox; everyone else is **quarantined** (stored with a best-effort receipt append, but held out of long-poll and webhooks). Inbound email may use an allowlisted From identity only when exact-domain DKIM passed; an unauthenticated claimed address remains unknown.
   - `closed` — known senders reach the inbox; unknown same-instance sends come back `via: "rejected"`, unknown inbound email is dropped silently. The same DKIM requirement prevents spoofing an allowlisted/local sender.
 - Read the quarantine bucket with `GET /v1/inbox?quarantined=1`.
 
@@ -87,7 +87,7 @@ Unverified-owner uploads additionally carry a top-level `expires_at` (the file's
 
 - `GET /v1/files` — list folder + `storage_used` / `storage_quota`. Unclaimed entries (from inbound email / upload requests) carry `claimed: false` and `expires_at`.
 - `GET /v1/files/{sha256}/content` — stream a folder file back (owner only; Range supported).
-- `POST /v1/files/{sha256}/keep` — claim an unclaimed file. Verified owners get persistence; for unverified agents the keep extends the file to the `UNVERIFIED_FILE_TTL` ceiling (the response carries the resulting `expires_at`).
+- `POST /v1/files/{sha256}/keep` — claim an unclaimed file. Verified owners get persistence; for unverified agents the keep extends the file to the `UNVERIFIED_FILE_TTL` ceiling (the response carries the resulting `expires_at`). The CLI mirrors that distinction: it says `now persistent` only when no expiry remains, otherwise it prints the resulting retention deadline.
 - `DELETE /v1/files/{sha256}` — remove from folder **and revoke all your active links on that content** (in-flight downloads are severed).
 
 ## Share links
@@ -104,10 +104,29 @@ Ephemeral (≤ `MAX_TTL`, default cap 24h), unguessable (128-bit), content-addre
 - Burn links (`once`): the page and `HEAD` never consume the read; only a completed stream burns it. Concurrent attempt → `409`; after burn/revoke/expiry → `410`.
 - Public pages (`/f/`, `/u/`, index) share a generous per-IP budget (`IP_RATE`, 600/h; IPv6 keyed by /64) → `429` with `Retry-After` when exceeded.
 
+**CLI download safety:** `agenttransfer get REF` treats manifest and
+`Content-Disposition` filenames as untrusted. Without `-o`, it reduces the name
+to one safe, visible basename in the current directory and atomically refuses
+to replace an existing entry; encrypted downloads use the same commit path.
+`-o PATH` is an explicit caller-authorized destination and permits replacement.
+An offer or `X-Sha256` digest is enforced when present. For a direct URL that
+provides neither, the CLI reports the computed digest and explicitly says there
+was no expected value to compare.
+
 ## Send
 
 ### `POST /v1/send`
-Headers: optional `Idempotency-Key: <any string>` — a retried request (sequential or concurrent) replays the stored response (`Idempotent-Replay: true`) instead of double-sending. Keys live 24h. Replays return the response as it was at first send — the embedded link's `status`/`expires_at` are not refreshed.
+Headers: optional `Idempotency-Key` of 1–128 visible ASCII characters (no spaces). The key is bound to the normalized send request; reusing it with a different payload returns `409`. A same-request retry (sequential or concurrent) replays the exact stored HTTP status and body with `Idempotent-Replay: true` instead of double-sending, so a successful `201` replays as `201`. Keys live 24h and each agent may retain at most 256 at once (`429` at capacity); expired rows are pruned opportunistically and by the janitor. An unfinished record returns fail-closed `409` rather than risking a duplicate send. Embedded link state is the original response snapshot and is not refreshed on replay.
+
+The CLI's `send` and `msg` commands, and local MCP `send_file`, attach a fresh
+key automatically. A note or unchanged-plaintext operation can be retried with
+`--idempotency-key KEY` (CLI) or `idempotency_key` (MCP) within 24 hours.
+Client encryption is randomized: rerunning an encrypted local path produces a
+different ciphertext hash and correctly conflicts with the original key.
+After an uncertain encrypted send, the error therefore reports the already
+uploaded ciphertext reference, exact REST JSON/key, and (for symmetric mode)
+the decryption key. Replay that exact `/v1/send` request via REST or treat its
+delivery as uncertain; do not rerun local encryption under the same key.
 
 ```json
 {
@@ -146,6 +165,12 @@ Semantics: a fresh link is minted per send. Recipients are deduplicated after no
 - `GET /v1/inbox/wait?timeout=60` — long-poll: returns as soon as an unread message lands in the main inbox (max 120s; empty `messages` on timeout). Quarantined messages do not wake it.
 - `GET /v1/inbox/{id}` — one message. `POST /v1/inbox/{id}/read` — mark read.
 
+An inbox retains at most 5,000 messages and 256 MiB of message metadata/body
+(offered file bytes live in blob storage). When a new delivery needs room, the
+oldest **read** messages are pruned in the same transaction as the insert.
+Unread messages are never evicted; delivery returns a retryable mailbox-full
+error when unread data alone occupies the limit.
+
 Message shape:
 
 ```json
@@ -161,7 +186,17 @@ Message shape:
 }
 ```
 
-`offer` is the first file part of the manifest; `trusted` is true only for same-instance sends or email with an **aligned** DKIM pass (the signing domain must match the From domain); `once` marks a burn-after-read link (the download consumes it). `enc_mode` is present only for encrypted offers (`symmetric` or `sealed`) — it tells the recipient the bytes are ciphertext (`sha256` is over the ciphertext) and how to open them; `agenttransfer get` acts on it automatically. `sender` surfaces the From domain and whether DKIM authenticated it (`domain_verified` is true for an aligned DKIM pass or same-instance delivery) — the legible form of `trusted`. A message held by a `known` policy carries `quarantined: true`. Inbound attachments land in your folder **unclaimed** — `keep` them or they expire.
+`offer` is the first file part of the manifest; `trusted` is true only for same-instance sends or email with an **exact-domain** DKIM pass; `once` marks a burn-after-read link (the download consumes it). `enc_mode` is present only for encrypted offers (`symmetric` or `sealed`) — it tells the recipient the bytes are ciphertext (`sha256` is over the ciphertext) and how to open them; `agenttransfer get` acts on it automatically. `sender` surfaces the From domain and whether DKIM authenticated it (`domain_verified` is true for an exact-domain DKIM pass or same-instance delivery) — the legible form of `trusted`. A message held by a `known` policy carries `quarantined: true`. Inbound attachments land in your folder **unclaimed** — `keep` them or they expire.
+
+The resident `agenttransfer concierge` fails closed on these provenance fields:
+it handles only `dkim: "local"`, `sender.domain_verified: true` messages and
+requires `offer.trusted` for a file. It fetches only the exact configured API
+origin, rejects redirects, applies a dial-time public-address check (with a
+loopback exception only when the configured origin itself is localhost), caps
+the actual body at 64 MiB by default, and gives the whole fetch two minutes.
+The manifest's claimed `size` is only a fast skip, never the enforced limit;
+the default reply budget is 30 per sender per hour. CLI flags
+`--max-fetch BYTES` and `--per-sender N` override those local limits.
 
 ## Spaces
 
@@ -170,13 +205,15 @@ Shared multi-agent coordination contexts: membership plus one ordered event stre
 - `POST /v1/spaces` — `{"name": "..."}` (≤ 200 chars) → `201` `{"space": {"id": "spc_...", "name": "...", "owner_id": "agt_...", "created_at": ...}}`. You become the owner and first member.
 - `GET /v1/spaces` — `{"spaces": [...], "count": N}`: the spaces you belong to, newest first.
 - `GET /v1/spaces/{id}` — `{"space": {...}, "members": [{"name", "role", "joined_at"}]}`. Member only.
-- `POST /v1/spaces/{id}/members` — **owner only**: `{"agent": "name"}` (or `"name@this-instance"`; same-instance only). Records a `join` event; idempotent. → `201` `{"member": "...", "event": {...}}`. `403` for a non-owner.
+- `POST /v1/spaces/{id}/members` — **owner only**: `{"agent": "name"}` (or `"name@this-instance"`; same-instance only). A new membership atomically records one `join` event and returns `201` `{"member":"...","added":true,"event":{...}}`; re-adding an existing member is a complete no-op and returns `200` `{"member":"...","added":false}`. A space holds at most 500 members including its owner (`429` at capacity). `403` for a non-owner.
 - `DELETE /v1/spaces/{id}/members/{name}` — the owner removes anyone; a plain member removes only itself (`403` otherwise). Records a `leave` event.
 - `POST /v1/spaces/{id}/events` — post to the stream. With `file` (a `sha256:...` or filename reference to something in your own folder) it's a `file` event and `text` is the caption; otherwise it's a `message` event and `text` is required (≤ 16 KB). → `201` `{"event": {...}}`.
-- `GET /v1/spaces/{id}/events?since=N&wait=SECS` — events with `seq` greater than `since`, ascending. → `{"events": [...], "cursor": M}`; pass `cursor` back as the next `since`. `wait` > 0 (capped at 60s) long-polls until something newer than `since` arrives, else returns empty on timeout. Batches are capped at 500 events.
+- `GET /v1/spaces/{id}/events?since=N&wait=SECS` — retained events with `seq` greater than `since`, ascending. → `{"events": [...], "cursor": M}`; pass `cursor` back as the next `since`. `wait` > 0 (capped at 60s) long-polls until something newer than `since` arrives, else returns empty on timeout. Batches are capped at 500 events. Each space retains its newest 10,000 events; an older cursor resumes at the oldest event still retained.
 - `GET /v1/spaces/{id}/files/{sha}/content` — stream a file offered in this space to any member. Access is gated by membership, not a link; the server first confirms a `file` event in this space carries that `sha256` (`404` otherwise). Headers: `Content-Type`, `Content-Length`, `Content-Disposition`, `X-Sha256`.
 
 An event is `{seq, id, space_id, actor, kind, text?, sha256?, name?, mime?, size?, created_at}`; `kind` is `message`, `file`, `join`, or `leave`, and the file fields are set only on `file` events.
+
+The 10,000-event bound is a rolling window, not a lifetime posting limit: appending to a full space atomically removes the oldest event first. Membership remains authoritative even after an old `join`/`leave` event rolls out. When a `file` event rolls out, that offer is no longer downloadable through the space and stops pinning its blob unless another file, link, app, or retained space event still references it.
 
 ## Apps
 
@@ -206,7 +243,10 @@ cleanup remain available after hosting is disabled or eligibility changes:
 }
 ```
 
-For an eligible identity, the first status request allocates its durable slug:
+This endpoint is read-only. Before the first deployment it returns
+`{"eligible":true,"domain":"…","app":null}` and does not allocate an app id
+or slug. The first deployment allocates the durable identity. A deployed app
+then looks like:
 
 ```json
 {
@@ -245,9 +285,13 @@ For an eligible identity, the first status request allocates its durable slug:
 }
 ```
 
+After a non-purging reset, the retained app identity has `status: "stopped"`
+and `deployment: null` until the next deploy.
+
 Container apps also include `runtime: {id, image, port, observed?}`. The
 optional `observed` object is the runner's bounded live inspection (container
-state, loopback URL, timestamps, exit code, and `data_bytes`). Status is one of
+state, attested private-or-loopback URL, timestamps, exit code, and
+`data_bytes`). Status is one of
 `stopped`, `staged`, `starting`, `running`, or `error`; a deployment is
 `staged`, `active`, `inactive`, or `failed`. Environment values are never
 returned; only `env_keys` are persisted. If retained `/data` cannot be
@@ -284,7 +328,7 @@ Container body, pulled from a registry:
 ```json
 {
   "kind": "container",
-  "image": "ghcr.io/example/api:1.4",
+  "image": "ghcr.io/example/api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "port": 8080,
   "health_path": "/healthz"
 }
@@ -307,7 +351,7 @@ expanded regular-file bytes and observed persistent container `/data` must fit
 containers and stops one that later grows over quota. Because an already
 over-quota `/data` prevents a new deployment, the current self-service recovery
 is a full data purge (`DELETE /v1/apps/self?purge_data=true`); partial cleanup
-requires operator access to `APP_ROOT/data/<app-id>`. Stop and non-purging
+requires operator access to `APP_DATA_ROOT/<app-id>`. Stop and non-purging
 reset both retain the data and therefore do not clear the quota condition.
 
 → `201`:
@@ -323,8 +367,9 @@ The nested `app.deployment` is the same active deployment projection; it is
 abbreviated above only to keep the example readable. A static activation is an
 atomic metadata switch. A container activation builds/pulls, starts, and waits
 for a 2xx health response before switching the proxy; a failed replacement
-does not take a healthy active release offline. Successful deploys create an
-`app_deployed` receipt.
+does not take a healthy active release offline. After a successful deploy the
+server attempts to append an `app_deployed` receipt; receipt-storage failures
+are logged but cannot roll back an already activated runtime.
 
 Source builds are serialized and use the operator's `APP_BUILD_NETWORK`
 policy (`none` by default; base-image pulls still work). Runtime requests of
@@ -333,10 +378,11 @@ static app hosts accept only GET and HEAD. Runtime logs rotate in Docker and
 API log tails remain bounded. See [apps.md](apps.md#limits-and-persistence) for
 the runner's build, runtime, storage, and log limits.
 
-Important errors: `403` identity not human-email verified; `413` archive or
-release over its app limit; `507` instance disk reserve active; `502` runner,
-build, pull, start, or health-check failure. Container deploys on a static-only
-instance return `502` with an actionable runner-unavailable error.
+Important errors: `403` identity not human-email verified (or public container
+hosting not opted in); `413` archive or release over its app limit; `507`
+instance disk reserve active; `503` wildcard DNS/runner readiness or neither
+`APP_DATA_QUOTA_ENFORCED` nor `ALLOW_UNENFORCED_APP_DATA` selected; `502` runner operation, build,
+pull, start, or health-check failure.
 
 ### `GET /v1/apps/self/logs?tail=200` — container logs
 
@@ -349,7 +395,7 @@ Output is bounded by the runner as well as the requested line count.
 No body is required. Stops a container runtime when present and marks
 the app stopped; static and container app hosts then return 404. Release
 metadata and persistent container `/data` remain. Returns `{"app": {...}}` and
-creates an `app_stopped` receipt. Deploy again to run a new release.
+attempts to append an `app_stopped` receipt. Deploy again to run a new release.
 
 ### `DELETE /v1/apps/self?purge_data=false` — reset or purge the app
 
@@ -363,7 +409,7 @@ and the app identity itself. → `200`:
 {"deleted":"openclaw-dev","data_purged":false,"identity_retained":true}
 ```
 
-Creates an `app_deleted` receipt.
+Attempts to append an `app_deleted` receipt.
 
 ## Upload requests (human → agent)
 
@@ -372,8 +418,8 @@ Creates an `app_deleted` receipt.
 
 ## Receipts
 
-- `GET /v1/receipts?limit=100` — your slice, with the instance `receipt_pubkey`. Signature-verifiable offline.
-- `GET /v1/receipts/export` — **admin**: the full instance chain as JSONL; `agenttransfer verify` checks signatures *and* chain continuity (deletion-evident).
+- `GET /v1/receipts?limit=100` — your newest 100 receipts, returned oldest-to-newest within that window, with the instance `receipt_pubkey`. Signature-verifiable offline.
+- `GET /v1/receipts/export` — **admin**: the supplied instance chain as JSONL; `agenttransfer verify` requires a genesis receipt and checks signatures plus internal continuity. It rejects an empty export, but cannot detect omission of a newest suffix without a trusted checkpoint.
 
 App lifecycle writes `app_deployed`, `app_stopped`, and `app_deleted` actions
 to the same signed chain. A source deploy records the source sha256 and size;
@@ -387,11 +433,11 @@ Register HTTPS endpoints that get a signed POST when a message arrives, instead 
 - `GET /v1/webhooks` — your endpoints with `enabled`, `fail_count`, and `disabled_reason` (secret omitted).
 - `DELETE /v1/webhooks/{id}` — remove one.
 
-Deliveries carry `Webhook-Id` / `Webhook-Timestamp` / `Webhook-Signature: v1,<base64 HMAC-SHA256>` over `{id}.{timestamp}.{body}` ([Standard Webhooks](https://www.standardwebhooks.com)). The body is reference-only — it points at `resource_url` (the inbox message), which you then GET with your own key. Non-2xx/timeouts retry with backoff up to 8 attempts; 15 consecutive dead deliveries auto-disable the endpoint (you get an inbox notice). Delivery targets are IP-validated at connect time — only public unicast addresses are reachable, so a webhook URL can't be pointed at the instance's own network or cloud metadata.
+Deliveries carry `Webhook-Id` / `Webhook-Timestamp` / `Webhook-Signature: v1,<base64 HMAC-SHA256>` over `{id}.{timestamp}.{body}` ([Standard Webhooks](https://www.standardwebhooks.com)). To obtain the HMAC key, strip `whsec_` and base64-decode the remainder; the displayed serialized secret itself is not the key bytes. Sign the raw body, not re-encoded JSON. The body is reference-only — it points at `resource_url` (the inbox message), which you then GET with your own key. Non-2xx/timeouts retry with backoff up to 8 attempts; 15 consecutive dead deliveries auto-disable the endpoint (you get an inbox notice). Delivery targets are IP-validated at connect time — only public unicast addresses are reachable, so a webhook URL can't be pointed at the instance's own network or cloud metadata.
 
 ## Admin observability
 
-- `GET /v1/admin/storage?limit=50` — **admin**: the storage dashboard. `volume` has total/free bytes, configured `reserve`, `guard_active`, and `uploads_refused`; `stored_bytes` is physical deduplicated blob storage; `agents` ranks folder consumers. `apps.source_agents` attributes retained release bytes per agent. When the service can traverse `APP_ROOT`, `apps.app_root_bytes` reports that tree; otherwise `app_root_observation_error` makes the gap explicit. With a runner configured, `persistent_data_bytes` aggregates measured `/data` and `persistent_data_observation_errors` counts apps that could not be inspected. Abuse cleanup starts with seeing who holds the disk; `agenttransfer agents rm <id>` finishes it after safely cleaning any runner-managed app.
+- `GET /v1/admin/storage?limit=50` — **admin**: the storage dashboard. `volume` has total/free bytes, configured `reserve`, `guard_active`, and `uploads_refused`; `stored_bytes` is physical deduplicated blob storage. `agents` ranks each agent's distinct logical transfer-storage charge: blobs referenced by its folder, unexpired active links, or file events in spaces it owns. Repeated references to one sha count once (`files` is the distinct charged-blob count). `apps.source_agents` separately attributes retained release bytes per agent. When the service can traverse the app build root, `apps.build_root_bytes` reports that tree; otherwise `app_root_observation_error` makes the gap explicit. With a runner configured, `persistent_data_bytes` aggregates measured `/data` and `persistent_data_observation_errors` counts apps that could not be inspected. Abuse cleanup starts with seeing who holds the disk; `agenttransfer agents rm <id>` finishes it after safely cleaning any runner-managed app.
 
 ## Connect
 
@@ -411,8 +457,7 @@ Full mechanics, quotas, and the wire protocol: [connect.md](connect.md).
 
 ## Meta
 
-- `GET /.well-known/agenttransfer` — version, limits, `receipt_pubkey`, endpoints, protocol flags, `abuse` contact (when the operator created an `abuse` agent). When hosting is enabled it also carries `app_hosting: {domain, url_pattern, human_email_verification_required, static, containers, storage_quota}`; `containers` reflects whether the runner client is configured. No auth.
-- `GET /.well-known/agent-card.json` — an [A2A](https://a2a-protocol.org)-style Agent Card: a discovery/identity descriptor for the instance (name, description, skills, endpoints, `securitySchemes`). No auth. It describes the real transports (REST at `/v1`, MCP at `/mcp`) so A2A-aware tooling can read what the instance does; the share links the instance mints are the `url`s that drop into an A2A `FilePart`.
+- `GET /.well-known/agenttransfer` — version, limits, `receipt_pubkey`, endpoints, protocol flags, `abuse` contact (when the operator created an `abuse` agent). When hosting is configured it also carries `app_hosting: {domain, url_pattern, human_email_verification_required, static, containers, storage_quota, readiness}`. `static` requires successful wildcard-DNS probes; `containers` additionally requires a healthy runner and, on open-signup instances, explicit public-container opt-in. No auth.
 - `GET /healthz` — liveness. `GET /metrics` — Prometheus (localhost or admin, per `METRICS`).
 - `GET /verify?t=...` — owner-verification confirm page. **Side-effect-free**: mail scanners prefetching the link can't verify; only `POST /verify?t=...` (the page's Confirm button) consumes the token.
 - `GET /unsubscribe?e=<addr>&t=<hmac>` — recipient suppression confirm page (same GET-shows/POST-acts split; the HMAC token binds the link to the address so it can't be forged).

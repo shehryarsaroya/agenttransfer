@@ -1,14 +1,14 @@
-FROM golang:1.25-alpine AS build
+FROM golang:1.26.5-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=0.6.0-docker
+ARG VERSION=0.7.0-docker
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X github.com/shehryarsaroya/agenttransfer/internal/server.Version=${VERSION}" \
       -o /agenttransfer .
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates \
  && adduser -D -H -u 65532 agenttransfer \
  && mkdir /data && chown agenttransfer:agenttransfer /data

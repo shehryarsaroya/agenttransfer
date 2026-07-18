@@ -167,6 +167,9 @@ func (ss *smtpSession) Data(r io.Reader) error {
 			}
 			if err := ss.s.ingestInbound(agent, from, in, dkimResult); err != nil {
 				log.Printf("smtp: ingest for %s failed: %v", agent.Email, err)
+				if errors.Is(err, store.ErrInboxFull) {
+					return &gosmtp.SMTPError{Code: 452, EnhancedCode: gosmtp.EnhancedCode{4, 2, 2}, Message: "mailbox full, retry later"}
+				}
 				return &gosmtp.SMTPError{Code: 451, Message: "temporary ingest failure"}
 			}
 		}
@@ -272,11 +275,6 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — instance storage full]", a.Name)
 			continue
 		}
-		used, _ := s.st.StorageUsed(agent.ID)
-		if used+int64(len(a.Data)) > s.quotaFor(agent) {
-			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — storage quota exceeded]", a.Name)
-			continue
-		}
 		sha, size, err := s.st.PutBlob(bytes.NewReader(a.Data), s.cfg.MaxFileSize)
 		if errors.Is(err, store.ErrDiskReserve) {
 			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — instance storage reserve reached]", a.Name)
@@ -284,6 +282,18 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 		}
 		if err != nil {
 			return err
+		}
+		used, err := s.st.StorageUsed(agent.ID)
+		if err != nil {
+			return fmt.Errorf("read storage usage: %w", err)
+		}
+		alreadyCharged, err := s.st.AgentUsesStorageBlob(agent.ID, sha)
+		if err != nil {
+			return fmt.Errorf("inspect storage references: %w", err)
+		}
+		if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(agent)) {
+			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — storage quota exceeded]", a.Name)
+			continue
 		}
 		expires := time.Now().Add(s.cfg.DefaultTTL).Unix()
 		preexisting := s.st.AgentHasFile(agent.ID, sha, a.Name)
@@ -333,6 +343,6 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 	if agentMsgID == "" {
 		agentMsgID = msg.ID
 	}
-	_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionReceived, sha, size, from, agentMsgID)
+	s.appendReceipt(agent.Email, receipt.ActionReceived, sha, size, from, agentMsgID)
 	return nil
 }

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -32,6 +33,10 @@ func (s *Server) createPersonAgent(w http.ResponseWriter, r *http.Request, name,
 		errJSON(w, http.StatusBadRequest, `person-owned signup needs both "as" (your handle) and "name" (this agent's tag, e.g. laptop)`)
 		return
 	}
+	if !store.ValidAgentName(tag) || strings.Contains(tag, "+") {
+		errJSON(w, http.StatusBadRequest, "invalid agent name: use 3-64 chars of a-z 0-9 . _ -")
+		return
+	}
 	if reservedNames[as] && !isAdmin {
 		errJSON(w, http.StatusBadRequest, "the handle %q is reserved on this instance", as)
 		return
@@ -39,6 +44,8 @@ func (s *Server) createPersonAgent(w http.ResponseWriter, r *http.Request, name,
 
 	person, err := s.st.PersonByHandle(as)
 	newPerson := false
+	var agent store.Agent
+	var key string
 	switch {
 	case err == nil:
 		// Joining an existing person. The signup itself proves nothing —
@@ -57,7 +64,8 @@ func (s *Server) createPersonAgent(w http.ResponseWriter, r *http.Request, name,
 			errJSON(w, http.StatusForbidden, "the handle %q belongs to a different owner email", as)
 			return
 		}
-	default:
+		agent, key, err = s.st.CreateAgentForPersonLimited(person, tag, 0)
+	case errors.Is(err, store.ErrNotFound):
 		// New person: the handle is born with this first agent. owner_email
 		// is the person's email and is required — a person IS a verified
 		// address; without one there is nothing to verify against.
@@ -65,22 +73,14 @@ func (s *Server) createPersonAgent(w http.ResponseWriter, r *http.Request, name,
 			errJSON(w, http.StatusBadRequest, `creating the handle %q needs "owner_email" — the person is that address`, as)
 			return
 		}
-		person, err = s.st.CreatePerson(as, ownerEmail)
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, "%v", err)
-			return
+		person, agent, key, err = s.st.CreatePersonWithAgent(as, ownerEmail, tag, 0)
+		if err == nil {
+			newPerson = true
 		}
-		newPerson = true
+	default:
+		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
 	}
-
-	if max := s.cfg.MaxAgentsPerOwner; max > 0 && !isAdmin {
-		if n, err := s.st.CountAgentsByOwner(person.Email); err == nil && n >= max {
-			errJSON(w, http.StatusForbidden, "this owner already has %d agents (max %d)", n, max)
-			return
-		}
-	}
-
-	agent, key, err := s.st.CreateAgentForPerson(person, tag)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "%v", err)
 		return

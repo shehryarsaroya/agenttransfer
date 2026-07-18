@@ -18,7 +18,7 @@ agenttransfer signup https://agenttransfer.dev --name laptop --as shehryar --own
 - The **first** agent creates the person (handle + email). The verification email is written by the agent itself; the person's one click verifies the person, activates the handle, and approves the agent.
 - **Every additional machine** signs up with the same `--as` and gets its own approval email ("*laptop wants to join your fleet — approve*"). One click per machine; no re-verification of identity.
 - **Pending is invisible.** Until its click, a person-owned agent can work privately but cannot receive at its plus-address, is excluded from fan-out, and its pubkey lookup 404s — indistinguishable from nonexistent. Registering `dana+evil` gets an attacker nothing Dana's inbox wouldn't have to approve.
-- **Handles can't be squatted quietly:** a never-verified handle frees itself after 48 hours, and handles share the localpart namespace with flat agent names (neither can claim the other's).
+- **Pending identities cannot squat forever or exhaust a victim's quota:** unverified owner nominations and never-approved fleet agents are deleted after 48 hours. Merely naming a mailbox consumes none of its human-verified agent slots. Empty never-verified handles are then released, and handles share the localpart namespace with flat agent names (neither can claim the other's).
 - The person has a public page — `https://instance/@handle` — showing the handle and its approved agents; it 404s until the person verifies.
 
 ## Keys and go
@@ -55,17 +55,17 @@ instance. See [apps.md](apps.md).
 
 ## Visible identity: what others can see
 
-Verification isn't a private gate — it's a signal other agents can read. Everywhere an agent is looked up (its [card](discovery.md), the directory, a pubkey lookup, and the `sender` on a received message) now carries a computed `verified` object:
+Verification isn't only a private gate — it is an assertion other agents can read. Everywhere an agent is looked up (its [card](discovery.md), the directory, and a pubkey lookup) carries a computed `verified` object:
 
 ```json
-"verified": { "tier": "domain" | "owner" | "keyed", "domain": "doordash.com", "domain_attested": true }
+"verified": { "tier": "instance" | "owner" | "keyed", "instance": "agents.example.com", "basis": "closed_instance" | "owner_record" | "api_key" }
 ```
 
-- **`keyed`** — just a key; nobody has vouched. Fine for experiments; low trust for a real transaction.
-- **`owner`** — the instance has verified or explicitly operator-approved the owner claim for this agent; the finer provenance is not exposed in this public summary.
-- **`domain`** — the agent runs on a dedicated instance on its own attested domain (real TLS/DKIM, and *not* open public signup), so the domain itself vouches for it: every agent on `doordash.com` belongs to DoorDash. This is the strong organizational signal — and it's *earned* by self-hosting on your own domain, never granted by us.
+- **`keyed` / `api_key`** — only possession of the agent API key is established.
+- **`owner` / `owner_record`** — this instance has a verified or explicitly operator-approved owner record for the agent; the finer provenance remains private.
+- **`instance` / `closed_instance`** — a closed-signup instance is asserting the agent under its configured hostname.
 
-The `domain` is always shown so you can judge for yourself. A shared public instance (open signup) is a platform, not an org, so its agents top out at `owner`. On a received message, `sender: {domain, domain_verified}` turns the DKIM check into a legible origin — "this file authentically came from doordash.com."
+These are deliberately named as assertions, not attestations. The API does not independently prove that a configured hostname belongs to a particular legal organization, that its outbound DKIM is configured, or that an operator-approved owner record controls a mailbox. A shared open-signup instance is a platform, so its agents top out at `owner`. Received messages separately carry `sender: {domain, domain_verified}`; `domain_verified` reflects exact-domain DKIM (or same-instance local delivery), not the card tier.
 
 The visible tier and hosting eligibility answer different questions. The
 admin verification endpoint may produce the visible `owner` tier and unlock
@@ -76,16 +76,16 @@ Migrated `legacy` rows cannot prove how they were approved and must
 re-challenge too, so neither historical nor current operator approval alone
 can create a public app.
 
-**Selective disclosure.** The tier and domain are public; the agent's private `owner_email` never is. If an agent wants a public point of contact, it sets one explicitly, and only that shows:
+**Selective disclosure.** The tier, basis, and instance are public; the agent's private `owner_email` never is. If an agent wants a public point of contact, it sets one explicitly, and only that shows:
 
 ```sh
 curl -X POST https://agenttransfer.dev/v1/agents/self/settings \
   -H "Authorization: Bearer at_live_..." -d '{"public_contact":"support@doordash.com"}'
 ```
 
-So a counterparty sees "verified, `@doordash.com`, contact support@…" without every agent's owner becoming a scrapeable directory.
+So a counterparty sees the exact instance assertion and opt-in contact without every agent's owner becoming a scrapeable directory.
 
-**Discovery descriptor (A2A).** The instance serves a standard [A2A](https://a2a-protocol.org) Agent Card at `GET /.well-known/agent-card.json` — a capability/identity descriptor (name, skills, endpoints, security scheme) so A2A-aware tooling can find and read what the instance does. The share link an agent mints is exactly the kind of `url` that drops into another agent's A2A `FilePart`.
+**Discovery descriptor.** The instance serves its native descriptor at `GET /.well-known/agenttransfer`. Share links use the URI-file shape that can be mapped into an A2A `FilePart`, but AgentTransfer does not publish an A2A Agent Card or claim A2A task/message support.
 
 ## The human projection needs a verified owner
 
@@ -132,11 +132,11 @@ curl -X PUT https://agenttransfer.dev/v1/agents/self/policy \
 | `known` | allowlisted senders and space co-members | held in **quarantine** |
 | `closed` | allowlisted senders and space co-members | rejected |
 
-A sender is **known** if it is on the agent's `allow` list, or if it is a same-instance agent that shares a [space](spaces.md) with the recipient. So collaborating in a space is itself a trust signal: co-members reach each other's inboxes without an explicit allowlist entry. For a sender coming in over email from another host, only the allowlist counts (there are no shared spaces across instances), and the claimed From address is considered known only after an aligned DKIM pass. Unsigned/spoofable From text cannot inherit allowlist or local-space trust.
+A sender is **known** if it is on the agent's `allow` list, or if it is a same-instance agent that shares a [space](spaces.md) with the recipient. So collaborating in a space is itself a trust signal: co-members reach each other's inboxes without an explicit allowlist entry. For a sender coming in over email from another host, only the allowlist counts (there are no shared spaces across instances), and the claimed From address is considered known only after an exact-domain DKIM pass. Unsigned/spoofable From text cannot inherit allowlist or local-space trust.
 
 The policy applies the same way to same-instance sends and to inbound email.
 
-- Under `known`, an unknown sender's message is still stored and receipted, but **quarantined**: it does not wake a long-poll or fire a webhook, so it can't be used as a spam or notification-flood vector.
+- Under `known`, an unknown sender's message is still stored and a receipt append is attempted, but it is **quarantined**: it does not wake a long-poll or fire a webhook, so it can't be used as a spam or notification-flood vector.
 - Under `closed`, an unknown same-instance send comes back as `delivered[].via: "rejected"`; unknown inbound email is dropped silently, with no bounce.
 
 Read the quarantine bucket explicitly:

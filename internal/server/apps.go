@@ -121,12 +121,19 @@ func (s *Server) appEligibility(agent store.Agent) (bool, string) {
 }
 
 func (s *Server) appView(ctx context.Context, agent store.Agent, app store.App) map[string]any {
-	active, _ := s.st.ActiveAppDeployment(agent.ID)
-	usage, _ := s.st.ActiveAppUsage(agent.ID)
+	var active any
+	if deployment, err := s.st.ActiveAppDeployment(agent.ID); err == nil {
+		active = deployment
+	}
+	usage, usageErr := s.st.ActiveAppUsage(agent.ID)
 	var dataBytes int64
 	var runtimeStatus any
 	var observationErr string
-	if s.appRunner != nil {
+	dataKnown := !app.EverContainer
+	if app.EverContainer && s.appRunner == nil {
+		observationErr = "container runner unavailable; retained data cannot be measured"
+		runtimeStatus = map[string]any{"observation_error": observationErr}
+	} else if app.EverContainer {
 		var statusErr error
 		var status apphost.AppStatus
 		if app.RuntimeID != "" {
@@ -136,6 +143,7 @@ func (s *Server) appView(ctx context.Context, agent store.Agent, app store.App) 
 		}
 		if statusErr == nil {
 			dataBytes = status.DataBytes
+			dataKnown = true
 			runtimeStatus = status
 		} else {
 			observationErr = statusErr.Error()
@@ -144,18 +152,37 @@ func (s *Server) appView(ctx context.Context, agent store.Agent, app store.App) 
 	}
 	envKeys := []string{}
 	_ = json.Unmarshal([]byte(app.EnvKeysJSON), &envKeys)
-	storage := map[string]any{
-		"source_bytes": usage.SourceBytes,
-		"file_bytes":   usage.FileBytes,
-		"data_bytes":   dataBytes,
-		"used":         usage.TotalBytes + dataBytes,
-		"quota":        s.cfg.AppStorageQuota,
+	storage := map[string]any{"quota": s.cfg.AppStorageQuota, "data_bytes": nil, "used": nil}
+	if usageErr != nil {
+		storage["source_bytes"] = nil
+		storage["file_bytes"] = nil
+		storage["observation_error"] = "release storage inspection failed: " + usageErr.Error()
+	} else {
+		storage["source_bytes"] = usage.SourceBytes
+		storage["file_bytes"] = usage.FileBytes
 	}
-	if observationErr != "" && app.EverContainer {
+	if dataKnown {
+		storage["data_bytes"] = dataBytes
+	}
+	if usageErr == nil && dataKnown {
+		if total, ok := addStorageBytes(usage.TotalBytes, dataBytes); ok {
+			storage["used"] = total
+		} else {
+			storage["data_bytes"] = nil
+			observationErr = "invalid or overflowing runtime storage observation"
+		}
+	}
+	if observationErr != "" {
 		storage["data_bytes"] = nil
 		storage["used"] = nil
-		storage["known_release_bytes"] = usage.TotalBytes
-		storage["observation_error"] = observationErr
+		if usageErr == nil {
+			storage["known_release_bytes"] = usage.TotalBytes
+		}
+		if prior, ok := storage["observation_error"].(string); ok && prior != "" {
+			storage["observation_error"] = prior + "; " + observationErr
+		} else {
+			storage["observation_error"] = observationErr
+		}
 	}
 	view := map[string]any{
 		"id":          app.ID,
@@ -187,14 +214,13 @@ func (s *Server) appView(ctx context.Context, agent store.Agent, app store.App) 
 func (s *Server) handleAppStatus(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	eligible, reason := s.appEligibility(agent)
 	app, err := s.st.AppByAgentID(agent.ID)
-	if errors.Is(err, store.ErrNotFound) && eligible {
-		app, err = s.st.EnsureApp(agent.ID, agent.Name)
-	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"eligible": false, "reason": reason, "domain": s.cfg.AppDomain,
-			})
+			out := map[string]any{"eligible": eligible, "domain": s.cfg.AppDomain, "app": nil}
+			if reason != "" {
+				out["reason"] = reason
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		}
 		errJSON(w, http.StatusInternalServerError, "app identity: %v", err)
@@ -261,6 +287,40 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 	if req.Kind != store.AppKindStatic && req.Kind != store.AppKindContainer {
 		return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusBadRequest, "kind must be static or container")
 	}
+	if req.Kind == store.AppKindContainer && s.cfg.OpenSignup && !s.cfg.AllowPublicContainers {
+		return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusForbidden,
+			"container deployment is disabled for OPEN_SIGNUP instances unless ALLOW_PUBLIC_CONTAINERS=true")
+	}
+	if req.Kind == store.AppKindContainer && !s.cfg.AppDataQuotaEnforced && !s.cfg.AllowUnenforcedAppData {
+		return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusServiceUnavailable,
+			"container deployment is disabled until APP_DATA_QUOTA_ENFORCED=true declares a filesystem quota or ALLOW_UNENFORCED_APP_DATA=true explicitly accepts watchdog-only limits")
+	}
+	readiness := s.appHostingStatus(ctx)
+	if !readiness.WildcardDNSReady {
+		return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusServiceUnavailable,
+			"app deployment is unavailable because wildcard DNS is not ready")
+	}
+	if req.Kind == store.AppKindContainer && !readiness.RunnerReady {
+		if s.appRunner == nil {
+			return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusServiceUnavailable,
+				"container deployment is unavailable because the runner is not configured")
+		}
+		runnerReadiness, probeErr := s.appRunner.Readiness(ctx)
+		if probeErr != nil || !runnerReadiness.DockerHealthy {
+			return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusServiceUnavailable,
+				"container deployment is unavailable because the runner or Docker engine is not ready")
+		}
+		if !runnerReadiness.ContainerReady && runnerReadiness.ContainerState != "unknown" {
+			message := "container deployment is unavailable because the runner network is not ready"
+			if runnerReadiness.ContainerState == "unsupported" {
+				message = "container deployment is unavailable because the Docker bridge is not host-routable; set APP_RUNTIME_EGRESS=true to permit loopback-published containers"
+			}
+			return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusServiceUnavailable, "%s", message)
+		}
+		// An internal bridge is intentionally unproven until the first tenant
+		// runtime exposes its private endpoint. Permit that deployment to perform
+		// the capability probe; advertising remains disabled until it succeeds.
+	}
 	if len(req.Env) > 64 {
 		return store.App{}, store.AppDeployment{}, appDeployFail(http.StatusBadRequest, "at most 64 environment variables are allowed")
 	}
@@ -297,9 +357,9 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 			return app, store.AppDeployment{}, appDeployFail(http.StatusBadGateway, "measure retained app data: %v", statusErr)
 		}
 		retainedData = status.DataBytes
-		if retainedData > s.cfg.AppStorageQuota {
+		if !storageAdditionFits(0, retainedData, s.cfg.AppStorageQuota) {
 			return app, store.AppDeployment{}, appDeployFail(http.StatusRequestEntityTooLarge,
-				"retained app data uses %d bytes (quota %d); purge data before deploying", retainedData, s.cfg.AppStorageQuota)
+				"retained app data reports %d bytes (quota %d); purge or repair data before deploying", retainedData, s.cfg.AppStorageQuota)
 		}
 	}
 
@@ -314,11 +374,13 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 			return app, store.AppDeployment{}, appDeployFail(http.StatusRequestEntityTooLarge,
 				"deployment archive is %d bytes (max %d)", source.Size, s.cfg.AppBundleSize)
 		}
-		expandedBudget := s.cfg.AppStorageQuota - source.Size - retainedData
-		if expandedBudget < 0 {
+		baseUsage, ok := addStorageBytes(source.Size, retainedData)
+		if !ok || baseUsage > s.cfg.AppStorageQuota {
 			return app, store.AppDeployment{}, appDeployFail(http.StatusRequestEntityTooLarge,
-				"source plus retained data uses %d bytes (quota %d)", source.Size+retainedData, s.cfg.AppStorageQuota)
+				"source plus retained data exceeds quota (source %d + retained %d; quota %d)",
+				source.Size, retainedData, s.cfg.AppStorageQuota)
 		}
+		expandedBudget := s.cfg.AppStorageQuota - baseUsage
 		files, err = s.readAppArchive(source, expandedBudget)
 		if err != nil {
 			if errors.Is(err, store.ErrDiskReserve) {
@@ -340,14 +402,22 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 	var expanded int64
 	hasIndex, hasDockerfile := false, false
 	for _, f := range files {
-		expanded += f.Size
+		var ok bool
+		expanded, ok = addStorageBytes(expanded, f.Size)
+		if !ok {
+			return app, store.AppDeployment{}, appDeployFail(http.StatusInternalServerError, "deployment release byte count is invalid or overflowing")
+		}
 		hasIndex = hasIndex || f.Path == "index.html"
 		hasDockerfile = hasDockerfile || f.Path == "Dockerfile"
 	}
-	if source.Size+expanded+retainedData > s.cfg.AppStorageQuota {
+	releaseBytes, ok := addStorageBytes(source.Size, expanded)
+	if !ok {
+		return app, store.AppDeployment{}, appDeployFail(http.StatusInternalServerError, "deployment release byte count is invalid or overflowing")
+	}
+	if !storageAdditionFits(releaseBytes, retainedData, s.cfg.AppStorageQuota) {
 		return app, store.AppDeployment{}, appDeployFail(http.StatusRequestEntityTooLarge,
-			"app would use %d bytes (source/release %d + retained data %d; quota %d)",
-			source.Size+expanded+retainedData, source.Size+expanded, retainedData, s.cfg.AppStorageQuota)
+			"app would exceed quota (source/release %d + retained data %d; quota %d)",
+			releaseBytes, retainedData, s.cfg.AppStorageQuota)
 	}
 	if req.Kind == store.AppKindStatic && !hasIndex {
 		return app, store.AppDeployment{}, appDeployFail(http.StatusBadRequest, "static source needs index.html at its root")
@@ -363,6 +433,7 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 		if err == nil {
 			app, deployment, err = s.st.ActivateAppDeployment(agent.ID, deployment.ID)
 			if err == nil && app.EverContainer && s.appRunner != nil {
+				s.forgetRuntimeTarget(app.ID)
 				// Traffic already points at the immutable static release. Remove any
 				// old/stale containers as a second idempotent phase while preserving
 				// the app's /data for a future container deploy.
@@ -382,7 +453,7 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 		return app, deployment, appDeployFail(status, "deploy failed: %v", err)
 	}
 	_, _ = s.st.PruneInactiveAppDeployments(agent.ID, 1)
-	_, _ = s.st.AppendReceipt(agent.Email, "app_deployed", source.SHA256, source.Size, s.appURL(app.Slug), "")
+	s.appendReceipt(agent.Email, "app_deployed", source.SHA256, source.Size, s.appURL(app.Slug), "")
 	return app, deployment, nil
 }
 
@@ -407,7 +478,7 @@ func (s *Server) stopAgentApp(ctx context.Context, agent store.Agent) (store.App
 	if err != nil {
 		return app, err
 	}
-	_, _ = s.st.AppendReceipt(agent.Email, "app_stopped", "", 0, s.appURL(app.Slug), "")
+	s.appendReceipt(agent.Email, "app_stopped", "", 0, s.appURL(app.Slug), "")
 	return app, nil
 }
 
@@ -454,7 +525,9 @@ func (s *Server) handleAppDelete(w http.ResponseWriter, r *http.Request, agent s
 			return
 		}
 	}
-	_, _ = s.st.AppendReceipt(agent.Email, "app_deleted", "", 0, s.appURL(app.Slug), "")
+	s.appProxyAppSlots.Delete(app.ID)
+	s.forgetRuntimeTarget(app.ID)
+	s.appendReceipt(agent.Email, "app_deleted", "", 0, s.appURL(app.Slug), "")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"deleted": app.Slug, "data_purged": purgeData, "identity_retained": !purgeData,
 	})
@@ -468,7 +541,7 @@ func (s *Server) handleAppLogs(w http.ResponseWriter, r *http.Request, agent sto
 	if tail > 2000 {
 		tail = 2000
 	}
-	logs, status, err := s.appRuntimeLogs(r.Context(), agent.ID, tail)
+	logs, status, err := s.appRuntimeLogResult(r.Context(), agent.ID, tail)
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no container app")
 		return
@@ -477,7 +550,9 @@ func (s *Server) handleAppLogs(w http.ResponseWriter, r *http.Request, agent sto
 		errJSON(w, http.StatusBadGateway, "logs failed: %v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"logs": logs, "status": status})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"logs": logs.Output, "status": status, "truncated": logs.Truncated,
+	})
 }
 
 func (s *Server) stopAppRuntime(ctx context.Context, agent store.Agent) (store.App, error) {
@@ -488,7 +563,11 @@ func (s *Server) stopAppRuntime(ctx context.Context, agent store.Agent) (store.A
 	if err := s.stopAllAppRuntimes(ctx, app); err != nil {
 		return app, err
 	}
-	return s.st.StopApp(agent.ID)
+	app, err = s.st.StopApp(agent.ID)
+	if err == nil {
+		s.forgetRuntimeTarget(app.ID)
+	}
+	return app, err
 }
 
 func (s *Server) readAppArchive(source store.File, maxExpanded int64) ([]store.AppFileSpec, error) {
@@ -593,7 +672,11 @@ func directoryBytes(root string) (int64, error) {
 			if err != nil {
 				return err
 			}
-			total += info.Size()
+			var ok bool
+			total, ok = addStorageBytes(total, info.Size())
+			if !ok {
+				return errors.New("directory byte count is invalid or overflowing")
+			}
 		}
 		return nil
 	})

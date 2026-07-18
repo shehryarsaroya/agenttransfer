@@ -40,7 +40,7 @@ type Card struct {
 	// OwnerVerified is carried for the server to compute the visible identity
 	// tier; it is not itself serialized.
 	OwnerVerified bool `json:"-"`
-	// Verified is the computed identity tier ({tier, domain, domain_attested}),
+	// Verified is the computed identity tier ({tier, instance, basis}),
 	// filled in by the server layer (which knows the instance config) before the
 	// card is returned. The store leaves it nil.
 	Verified any `json:"verified,omitempty"`
@@ -87,7 +87,8 @@ func (s *Store) CardByName(name string) (Card, error) {
 	c, caps, err := s.scanCard(s.DB.QueryRow(
 		`SELECT a.name, a.pubkey, a.owner_verified, a.public_contact, c.description, c.capabilities, c.listed, c.updated_at
 		 FROM cards c JOIN agents a ON a.id=c.agent_id
-		 WHERE a.name=? AND c.listed=1`, name))
+		 WHERE a.name=? AND c.listed=1
+		   AND NOT (a.person_id<>'' AND a.owner_verified=0)`, name))
 	if err != nil {
 		return c, err
 	}
@@ -111,14 +112,22 @@ func (s *Store) CardOf(agentID string) (Card, error) {
 // Directory lists agents that opted into discovery, most-recently-updated first,
 // optionally filtered to those advertising a capability tag.
 func (s *Store) Directory(capability string, limit int) ([]Card, error) {
-	if limit <= 0 || limit > 200 {
+	if limit <= 0 {
 		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
 	}
 	capability = strings.ToLower(strings.TrimSpace(capability))
 	rows, err := s.DB.Query(
 		`SELECT a.name, a.pubkey, a.owner_verified, a.public_contact, c.description, c.capabilities, c.listed, c.updated_at
 		 FROM cards c JOIN agents a ON a.id=c.agent_id
-		 WHERE c.listed=1 ORDER BY c.updated_at DESC LIMIT ?`, limit)
+		 WHERE c.listed=1
+		   AND NOT (a.person_id<>'' AND a.owner_verified=0)
+		   AND (?='' OR EXISTS (
+		     SELECT 1 FROM json_each(c.capabilities) tag WHERE tag.value=?
+		   ))
+		 ORDER BY c.updated_at DESC LIMIT ?`, capability, capability, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -130,9 +139,7 @@ func (s *Store) Directory(capability string, limit int) ([]Card, error) {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(caps), &c.Capabilities)
-		if capability == "" || containsTag(c.Capabilities, capability) {
-			out = append(out, c)
-		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
@@ -148,13 +155,4 @@ func (s *Store) scanCard(row interface{ Scan(...any) error }) (Card, string, err
 	c.Listed = listed == 1
 	c.OwnerVerified = ownerVerified == 1
 	return c, caps, err
-}
-
-func containsTag(tags []string, want string) bool {
-	for _, t := range tags {
-		if t == want {
-			return true
-		}
-	}
-	return false
 }

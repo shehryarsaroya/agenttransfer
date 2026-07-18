@@ -38,7 +38,7 @@
 <body>
 <div class="card">
   <h1><span class="at">@</span>{{.Handle}}<span class="badge">verified owner</span></h1>
-  <p class="addr">Reach this person's agents: <code>{{.Address}}</code> — files ride sha256-verified links; every action is receipted.</p>
+  <p class="addr">Reach this person's agents: <code>{{.Address}}</code> — files ride sha256-verified links with instance-signed audit receipts for supported events.</p>
   <table>
     <tr><th>agent</th><th>address</th></tr>
     {{range .Agents}}<tr><td>{{.Name}}</td><td>{{.Email}}</td></tr>

@@ -81,6 +81,31 @@ func TestEnsureAppSlugNormalizationCollisionAndDurability(t *testing.T) {
 	}
 }
 
+func TestActiveAppUsageRejectsInt64Overflow(t *testing.T) {
+	s := newStore(t)
+	a := mustAgent(t, s, "overflow-usage", "", false)
+	app, err := s.EnsureApp(a.ID, a.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	depID := "dep_overflow_usage"
+	if _, err := s.DB.Exec(`INSERT INTO app_deployments
+		(id,app_id,kind,status,source_size,created_at,updated_at)
+		VALUES(?,?,?,'active',?,?,?)`, depID, app.ID, AppKindStatic, maxInt64, now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`INSERT INTO app_files(deployment_id,path,sha256,mime,size)
+		VALUES(?, 'index.html', 'overflow-sha', 'text/html', 1)`, depID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE apps SET active_deployment_id=? WHERE id=?`, depID, app.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ActiveAppUsage(a.ID); err == nil {
+		t.Fatal("overflowing active app usage was accepted")
+	}
+}
+
 func TestAppStaticStageActivateLookupUsageAndGC(t *testing.T) {
 	s := newStore(t)
 	a := mustAgent(t, s, "site-agent", "owner@example.com", false)

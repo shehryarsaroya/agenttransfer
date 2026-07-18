@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -108,6 +109,31 @@ type severReader struct {
 	severed bool
 }
 
+// downloadWriter records what ServeContent actually put on the wire. This
+// keeps conditional requests, invalid ranges, and disconnected partial
+// responses from becoming successful download audit events.
+type downloadWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *downloadWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *downloadWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
 func (r *severReader) Read(p []byte) (int, error) {
 	if r.s.isSevered(r.token) {
 		r.severed = true
@@ -127,16 +153,25 @@ func (s *Server) streamNormal(w http.ResponseWriter, r *http.Request, l store.Li
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", l.Name))
 	w.Header().Set("X-Sha256", l.SHA256)
 	sr := &severReader{ReadSeeker: blob, s: s, token: l.Token}
-	http.ServeContent(w, r, l.Name, time.Unix(l.CreatedAt, 0), sr)
+	dw := &downloadWriter{ResponseWriter: w}
+	http.ServeContent(dw, r, l.Name, time.Unix(l.CreatedAt, 0), sr)
 	if sr.severed {
 		return // revoked mid-stream: not a download, and the revoker receipted it
 	}
-	// Counted after serving; a partial range fetch still counts as one
-	// download event.
+	if dw.status != http.StatusOK && dw.status != http.StatusPartialContent {
+		return
+	}
+	want, err := strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64)
+	if err != nil || want < 0 || dw.bytes != want {
+		return
+	}
 	_ = s.st.CountDownload(l.Token)
 	s.metrics.downloads.Add(1)
 	actor := s.agentEmailByID(l.AgentID)
-	_, _ = s.st.AppendReceipt(actor, receipt.ActionDownloaded, l.SHA256, l.Size, "link:"+l.Token, "")
+	// A 206 receipt describes the bytes actually transferred, not the size of
+	// the underlying object. Full responses naturally record l.Size because the
+	// completed-body check above requires every byte to have been written.
+	s.appendReceipt(actor, receipt.ActionDownloaded, l.SHA256, dw.bytes, "link:"+l.Token, "")
 }
 
 func (s *Server) streamBurn(w http.ResponseWriter, r *http.Request, l store.Link) {
@@ -201,8 +236,8 @@ func (s *Server) streamBurn(w http.ResponseWriter, r *http.Request, l store.Link
 		_ = s.st.CountDownload(l.Token)
 		s.metrics.downloads.Add(1)
 		actor := s.agentEmailByID(l.AgentID)
-		_, _ = s.st.AppendReceipt(actor, receipt.ActionDownloaded, l.SHA256, l.Size, "link:"+l.Token, "")
-		_, _ = s.st.AppendReceipt(actor, receipt.ActionBurned, l.SHA256, l.Size, "link:"+l.Token, "")
+		s.appendReceipt(actor, receipt.ActionDownloaded, l.SHA256, l.Size, "link:"+l.Token, "")
+		s.appendReceipt(actor, receipt.ActionBurned, l.SHA256, l.Size, "link:"+l.Token, "")
 	}
 }
 
@@ -292,30 +327,39 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	lock := s.uploadLock(agent.ID)
 	lock.Lock()
-	used, _ := s.st.StorageUsed(agent.ID)
-	if !s.st.AgentHasFile(agent.ID, sha, name) && used+size > s.quotaFor(agent) {
+	used, err := s.st.StorageUsed(agent.ID)
+	if err != nil {
+		lock.Unlock()
+		http.Error(w, "storage accounting unavailable — the link is still valid, try later", http.StatusInternalServerError)
+		return
+	}
+	alreadyCharged, err := s.st.AgentUsesStorageBlob(agent.ID, sha)
+	if err != nil {
+		lock.Unlock()
+		http.Error(w, "storage accounting unavailable — the link is still valid, try later", http.StatusInternalServerError)
+		return
+	}
+	if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(agent)) {
 		lock.Unlock()
 		http.Error(w, "the agent's storage quota is exhausted", http.StatusInsufficientStorage)
 		return
 	}
 
-	// Now consume the one-time token; the winner's file goes through.
-	won, err := s.st.UseUploadRequest(token)
-	if err != nil || !won {
-		lock.Unlock()
-		http.Error(w, "this upload link was just used", http.StatusConflict)
-		return
-	}
 	if ctype == "" {
 		ctype = "application/octet-stream"
 	}
 
-	// Arrives unclaimed: the agent keeps it or it expires with DEFAULT_TTL.
+	// Consume the token and add the folder row atomically. Arrives unclaimed:
+	// the agent keeps it or it expires with DEFAULT_TTL.
 	expires := time.Now().Add(s.cfg.DefaultTTL).Unix()
-	f, err := s.st.AddFile(agent.ID, sha, name, ctype, size, "request", false, expires)
+	f, won, err := s.st.UseUploadRequestWithFile(token, agent.ID, sha, name, ctype, size, expires)
 	lock.Unlock()
 	if err != nil {
 		http.Error(w, "upload failed", http.StatusInternalServerError)
+		return
+	}
+	if !won {
+		http.Error(w, "this upload link was just used", http.StatusConflict)
 		return
 	}
 
@@ -323,7 +367,7 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 	if u.Note != "" {
 		subject = u.Note
 	}
-	dropMsg, _ := s.st.AddMessage(store.Message{
+	dropMsg, msgErr := s.st.AddMessage(store.Message{
 		AgentID: agent.ID,
 		From:    "upload-request@" + s.st.Instance(),
 		To:      []string{agent.Email},
@@ -334,10 +378,14 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 		Attachments: []store.Attachment{{SHA256: sha, Name: f.Name, MIME: ctype, Size: size}},
 		DKIM:        "local", SPF: "local",
 	})
-	s.hub.notify(agent.ID)
-	s.enqueueWebhooks(agent.ID, "message.received", dropMsg.ID, "upload-request@"+s.st.Instance())
+	if msgErr == nil {
+		s.hub.notify(agent.ID)
+		s.enqueueWebhooks(agent.ID, "message.received", dropMsg.ID, "upload-request@"+s.st.Instance())
+	} else {
+		log.Printf("upload request: file %s stored for %s but inbox notification failed: %v", f.ID, agent.Email, msgErr)
+	}
 	s.metrics.uploads.Add(1)
-	_, _ = s.st.AppendReceipt(agent.Email, receipt.ActionReceived, sha, size, "upload-request:"+token, "")
+	s.appendReceipt(agent.Email, receipt.ActionReceived, sha, size, "upload-request:"+token, "")
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.tmpl.ExecuteTemplate(w, "uploaded.html", map[string]any{

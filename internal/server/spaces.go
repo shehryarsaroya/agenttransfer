@@ -68,7 +68,11 @@ func (s *Server) handleCreateSpace(w http.ResponseWriter, r *http.Request, agent
 	}
 	sp, err := s.st.CreateSpace(agent.ID, name)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "%v", err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrLimit) {
+			status = http.StatusTooManyRequests
+		}
+		errJSON(w, status, "%v", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"space": sp})
@@ -106,7 +110,7 @@ func (s *Server) handleGetSpace(w http.ResponseWriter, r *http.Request, agent st
 
 // handleAddSpaceMember (POST /v1/spaces/{id}/members) enrolls a local agent and
 // records a "join" event. Owner-only: membership grants read access to every
-// file and message ever shared in the space, so widening it is a privileged act
+// file and message in the retained space history, so widening it is privileged
 // — otherwise one compromised or prompt-injected member could pull in an
 // accomplice and expose the whole history, and no non-owner could evict them.
 func (s *Server) handleAddSpaceMember(w http.ResponseWriter, r *http.Request, agent store.Agent) {
@@ -136,16 +140,20 @@ func (s *Server) handleAddSpaceMember(w http.ResponseWriter, r *http.Request, ag
 		errJSON(w, http.StatusNotFound, "no agent %q on this instance", name)
 		return
 	}
-	if err := s.st.AddSpaceMember(spaceID, target.ID, "member"); err != nil {
-		errJSON(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	ev, err := s.st.AddSpaceEvent(spaceID, target.Email, "join", "", "", "", "", 0)
+	ev, added, err := s.st.AddSpaceMember(spaceID, target.ID, "member", target.Email)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "%v", err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrLimit) {
+			status = http.StatusTooManyRequests
+		}
+		errJSON(w, status, "%v", err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"member": target.Name, "event": ev})
+	if !added {
+		writeJSON(w, http.StatusOK, map[string]any{"member": target.Name, "added": false})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"member": target.Name, "added": true, "event": ev})
 }
 
 // handleRemoveSpaceMember (DELETE /v1/spaces/{id}/members/{name}) removes a
@@ -171,16 +179,12 @@ func (s *Server) handleRemoveSpaceMember(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusConflict, "the owner cannot leave and orphan a space")
 		return
 	}
-	if err := s.st.RemoveSpaceMember(spaceID, target.ID); err != nil {
+	ev, err := s.st.RemoveSpaceMember(spaceID, target.ID, target.Email)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "no such member")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	ev, err := s.st.AddSpaceEvent(spaceID, target.Email, "leave", "", "", "", "", 0)
-	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -220,7 +224,41 @@ func (s *Server) handlePostSpaceEvent(w http.ResponseWriter, r *http.Request, ag
 			errJSON(w, http.StatusNotFound, "%v", ferr)
 			return
 		}
+		sp, serr := s.st.SpaceByID(spaceID)
+		if serr != nil {
+			errJSON(w, http.StatusNotFound, "no such space")
+			return
+		}
+		owner, oerr := s.st.AgentByID(sp.OwnerID)
+		if oerr != nil {
+			errJSON(w, http.StatusNotFound, "no such space")
+			return
+		}
+		// Every durable space file is charged to its owner. Serialize the
+		// owner's quota read with their normal uploads and all member posts so
+		// concurrent members cannot each spend the same remaining headroom.
+		ownerMu := s.uploadLock(owner.ID)
+		ownerMu.Lock()
+		used, uerr := s.st.StorageUsed(owner.ID)
+		if uerr != nil {
+			ownerMu.Unlock()
+			errJSON(w, http.StatusInternalServerError, "%v", uerr)
+			return
+		}
+		alreadyCharged, chargeErr := s.st.AgentUsesStorageBlob(owner.ID, f.SHA256)
+		if chargeErr != nil {
+			ownerMu.Unlock()
+			errJSON(w, http.StatusInternalServerError, "%v", chargeErr)
+			return
+		}
+		if !alreadyCharged && !storageAdditionFits(used, f.Size, s.quotaFor(owner)) {
+			ownerMu.Unlock()
+			errJSON(w, http.StatusInsufficientStorage,
+				"space owner's storage quota exceeded: %d used + %d new > %d", used, f.Size, s.quotaFor(owner))
+			return
+		}
 		ev, err = s.st.AddSpaceEvent(spaceID, agent.Email, "file", text, f.SHA256, f.Name, f.MIME, f.Size)
+		ownerMu.Unlock()
 	} else {
 		if text == "" {
 			errJSON(w, http.StatusBadRequest, "text is required for a message")
@@ -229,7 +267,11 @@ func (s *Server) handlePostSpaceEvent(w http.ResponseWriter, r *http.Request, ag
 		ev, err = s.st.AddSpaceEvent(spaceID, agent.Email, "message", text, "", "", "", 0)
 	}
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "%v", err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrLimit) {
+			status = http.StatusTooManyRequests
+		}
+		errJSON(w, status, "%v", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"event": ev})

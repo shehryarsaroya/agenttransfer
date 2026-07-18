@@ -1,8 +1,8 @@
 // Command agenttransfer gives AI agents a small home on the internet: an
 // email address, API key, folder, inbox, and—after human email verification—
 // a stable subdomain for a static site or containerized app. Email carries
-// handoffs, HTTPS carries content-addressed bytes, and every action leaves a
-// signed receipt.
+// handoffs, HTTPS carries content-addressed bytes, and transfer/lifecycle
+// events can leave instance-signed audit receipts.
 //
 // One binary contains the server (`agenttransfer serve`), the client CLI, the
 // local MCP bridge, the Docker-facing app runner (`agenttransfer app-runner`),
@@ -13,9 +13,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -59,20 +59,33 @@ func main() {
 // for dynamic apps. The public API service talks to it over an authenticated
 // Unix socket and never receives direct Docker access.
 func runAppRunner() error {
-	root := strings.TrimSpace(os.Getenv("APP_ROOT"))
-	if root == "" {
-		root = filepath.Join(envDefault("DATA_DIR", "./data"), "apps")
+	if strings.TrimSpace(os.Getenv("APP_ROOT")) != "" {
+		return fmt.Errorf("APP_ROOT is unsafe and no longer supported; set distinct APP_BUILD_ROOT and APP_DATA_ROOT")
 	}
 	cfg := apphost.RunnerConfig{
 		SocketPath:   strings.TrimSpace(os.Getenv("APP_RUNNER_SOCKET")),
 		AuthToken:    strings.TrimSpace(os.Getenv("APP_RUNNER_TOKEN")),
-		AppRoot:      root,
+		BuildRoot:    strings.TrimSpace(os.Getenv("APP_BUILD_ROOT")),
+		DataRoot:     strings.TrimSpace(os.Getenv("APP_DATA_ROOT")),
+		SnapshotRoot: strings.TrimSpace(os.Getenv("APP_SNAPSHOT_ROOT")),
 		DockerPath:   strings.TrimSpace(os.Getenv("APP_DOCKER_PATH")),
 		ImagePrefix:  strings.TrimSpace(os.Getenv("APP_IMAGE_PREFIX")),
 		BuildNetwork: strings.ToLower(strings.TrimSpace(os.Getenv("APP_BUILD_NETWORK"))),
+		AllowedRegistries: strings.FieldsFunc(envDefault("APP_ALLOWED_REGISTRIES", "docker.io,ghcr.io"), func(r rune) bool {
+			return r == ','
+		}),
+	}
+	if cfg.BuildRoot == "" {
+		return fmt.Errorf("APP_BUILD_ROOT is required")
+	}
+	if cfg.DataRoot == "" {
+		return fmt.Errorf("APP_DATA_ROOT is required and must be separate from APP_BUILD_ROOT")
+	}
+	if cfg.SnapshotRoot == "" {
+		return fmt.Errorf("APP_SNAPSHOT_ROOT is required and must be separate from durable APP_DATA_ROOT")
 	}
 	if cfg.SocketPath == "" {
-		cfg.SocketPath = filepath.Join(root, "runner.sock")
+		return fmt.Errorf("APP_RUNNER_SOCKET is required")
 	}
 	if cfg.AuthToken == "" {
 		return fmt.Errorf("APP_RUNNER_TOKEN is required (use a shared random value of at least 32 bytes)")
@@ -94,7 +107,28 @@ func runAppRunner() error {
 	if cfg.TmpfsSizeBytes, err = sizeEnv("APP_TMPFS_SIZE", "256MB"); err != nil {
 		return err
 	}
+	if cfg.MaxBuildContextBytes, err = sizeEnv("APP_MAX_BUILD_CONTEXT", "10GB"); err != nil {
+		return err
+	}
+	if cfg.MaxImageBytes, err = sizeEnv("APP_MAX_IMAGE_SIZE", "10GB"); err != nil {
+		return err
+	}
 	if cfg.PIDsLimit, err = intEnv("APP_PIDS_LIMIT", 256); err != nil {
+		return err
+	}
+	if cfg.ContainerUID, err = boundedIntEnv("APP_CONTAINER_UID", 65532, math.MaxInt32); err != nil {
+		return err
+	}
+	if cfg.ContainerGID, err = boundedIntEnv("APP_CONTAINER_GID", 65532, math.MaxInt32); err != nil {
+		return err
+	}
+	if cfg.MaxBuildQueue, err = boundedIntEnv("APP_BUILD_QUEUE", 8, math.MaxInt); err != nil {
+		return err
+	}
+	if cfg.RuntimeEgress, err = boolEnv("APP_RUNTIME_EGRESS", false); err != nil {
+		return err
+	}
+	if cfg.AllowSourceBuilds, err = boolEnv("APP_ALLOW_SOURCE_BUILDS", false); err != nil {
 		return err
 	}
 	if maxLogLines, err := intEnv("APP_MAX_LOG_LINES", 2000); err != nil {
@@ -115,10 +149,8 @@ func runAppRunner() error {
 	if cfg.HealthTimeout, err = durationEnv("APP_HEALTH_TIMEOUT", "60s"); err != nil {
 		return err
 	}
-	if port, err := intEnv("APP_CONTAINER_PORT", 8080); err != nil {
+	if cfg.ContainerPort, err = boundedIntEnv("APP_CONTAINER_PORT", 8080, 65535); err != nil {
 		return err
-	} else {
-		cfg.ContainerPort = int(port)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -157,10 +189,22 @@ func floatEnv(key string, fallback float64) (float64, error) {
 		return fallback, nil
 	}
 	n, err := strconv.ParseFloat(value, 64)
-	if err != nil || n <= 0 {
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
 		return 0, fmt.Errorf("%s must be a positive number", key)
 	}
 	return n, nil
+}
+
+func boolEnv(key string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
+	return b, nil
 }
 
 func intEnv(key string, fallback int64) (int64, error) {
@@ -173,6 +217,17 @@ func intEnv(key string, fallback int64) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", key)
 	}
 	return n, nil
+}
+
+func boundedIntEnv(key string, fallback, max int64) (int, error) {
+	n, err := intEnv(key, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if n > max {
+		return 0, fmt.Errorf("%s must be at most %d", key, max)
+	}
+	return int(n), nil
 }
 
 // defaultConnectHost is the public connect host `serve --connect` uses when

@@ -4,24 +4,44 @@ Documentation=https://github.com/shehryarsaroya/agenttransfer/blob/main/docs/app
 After=docker.service network-online.target agenttransfer.service
 Requires=docker.service
 Wants=agenttransfer.service
+# Server and runner share one installed binary and a private protocol. A public
+# service restart after an in-place upgrade must replace the runner process too.
+PartOf=agenttransfer.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'test -d "$APP_ROOT"'
+# Type=simple marks the public service started before its Go initialization has
+# necessarily created APP_BUILD_ROOT. Wait a bounded interval on clean boot;
+# Restart=on-failure will retry if initialization takes longer or fails.
+ExecStartPre=/bin/sh -c 'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do test -d "$APP_BUILD_ROOT" && test -d "$APP_DATA_ROOT" && exit 0; sleep 1; done; echo "APP_BUILD_ROOT or APP_DATA_ROOT was not created within 30s" >&2; exit 1'
 ExecStart=/usr/local/bin/agenttransfer app-runner
 EnvironmentFile=/etc/agenttransfer/apps.env
-Environment=APP_ROOT=/var/lib/agenttransfer/apps
+Environment=APP_BUILD_ROOT=/var/lib/agenttransfer/app-builds
+Environment=APP_DATA_ROOT=/var/lib/agenttransfer-app-data
+# Build contexts can be gigabytes; keep transient snapshots on durable disk,
+# not RuntimeDirectory's commonly-tmpfs /run filesystem. Startup clears it.
+Environment=APP_SNAPSHOT_ROOT=/var/lib/agenttransfer-app-snapshots
+Environment=APP_ALLOWED_REGISTRIES=docker.io,ghcr.io
+Environment=APP_ALLOW_SOURCE_BUILDS=false
+Environment=APP_RUNTIME_EGRESS=false
+Environment=APP_MAX_BUILD_CONTEXT=10GB
+Environment=APP_MAX_IMAGE_SIZE=10GB
+Environment=APP_CONTAINER_UID=65532
+Environment=APP_CONTAINER_GID=65532
 Environment=APP_RUNNER_SOCKET=/run/agenttransfer-app-runner/runner.sock
 # Buildx otherwise falls back to /root/.docker, which ProtectHome correctly
 # makes unavailable. Keep its transient client state inside RuntimeDirectory.
 Environment=DOCKER_CONFIG=/run/agenttransfer-app-runner/docker-config
 # The control plane uses systemd DynamicUser, so its numeric uid is not stable.
-# The socket carries a mandatory 256-bit bearer token and is not mounted into
+# The socket carries a mandatory random bearer token of at least 32 bytes
+# (the setup command generates 256 random bits) and is not mounted into
 # apps; world-connectable is therefore safe while still keeping Docker itself
 # completely out of the public service.
 Environment=APP_RUNNER_SOCKET_MODE=0666
 RuntimeDirectory=agenttransfer-app-runner
 RuntimeDirectoryMode=0755
+StateDirectory=agenttransfer-app-data agenttransfer-app-snapshots
+StateDirectoryMode=0700
 UMask=0077
 
 NoNewPrivileges=yes
@@ -40,12 +60,20 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# The runner needs only app contexts and persistent /data. Hide the public
+# The runner reads public-service-owned build contexts but writes only its
+# separate root-owned persistent /data tree. Hide the public
 # service's environment, SQLite control plane, transfer blobs, and TLS state;
 # systemd reads apps.env before constructing this namespace.
-# If APP_ROOT moves, replace the first path here with its resolved host path;
+# If either root moves, replace these paths with their resolved host paths;
 # environment variables are not expanded by systemd's ReadWritePaths= parser.
-ReadWritePaths=/var/lib/private/agenttransfer/apps /run/agenttransfer-app-runner /var/run/docker.sock
+# The optional prefix lets the namespace be constructed before the public
+# service creates this first-boot subdirectory. ProtectSystem=strict already
+# keeps it read-only; once created it remains visible in this mount namespace.
+ReadOnlyPaths=-/var/lib/private/agenttransfer/app-builds
+# This runner is not DynamicUser=yes, so its StateDirectory is the direct
+# /var/lib path (only the public service's DynamicUser state lives under
+# /var/lib/private).
+ReadWritePaths=/var/lib/agenttransfer-app-data /var/lib/agenttransfer-app-snapshots /run/agenttransfer-app-runner /var/run/docker.sock
 InaccessiblePaths=-/etc/agenttransfer
 InaccessiblePaths=-/var/lib/private/agenttransfer/agenttransfer.db
 InaccessiblePaths=-/var/lib/private/agenttransfer/agenttransfer.db-wal

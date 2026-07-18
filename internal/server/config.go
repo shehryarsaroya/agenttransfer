@@ -1,7 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -54,10 +58,29 @@ type Config struct {
 	// Static hosting works without a runner; container deploys do not.
 	AppRunnerSocket string
 	AppRunnerToken  string
-	// AppRoot is shared with the separate runner for materialized build
-	// contexts and persistent container data. It defaults beneath DATA_DIR so
-	// normal backups capture it.
-	AppRoot string
+	// AllowPublicContainers is an explicit high-risk opt-in for instances
+	// where OPEN_SIGNUP lets any email-verified user obtain an identity.
+	AllowPublicContainers bool
+	// AllowUnenforcedAppData explicitly acknowledges that APP_STORAGE_QUOTA is
+	// observed by the watchdog, not a kernel filesystem quota. Containers are
+	// disabled by default until the operator provides isolation or accepts it.
+	AllowUnenforcedAppData bool
+	// AppDataQuotaEnforced declares that APP_DATA_ROOT has an operator-managed
+	// filesystem/project quota at least as strict as APP_STORAGE_QUOTA.
+	AppDataQuotaEnforced bool
+	// AppBuildRoot is public-service-owned scratch space for materialized build
+	// contexts. Persistent container data lives in the runner-only
+	// APP_DATA_ROOT and must never be nested here.
+	AppBuildRoot string
+	// AppProxyBodySize and AppProxyConcurrency bound public traffic forwarded
+	// into untrusted app runtimes. AppProxyBodyTimeout limits slow uploads;
+	// AppProxyResponseHeaderTimeout limits an upstream that accepts a request
+	// but never starts a response.
+	AppProxyBodySize              int64
+	AppProxyConcurrency           int
+	AppProxyPerAppConcurrency     int
+	AppProxyBodyTimeout           time.Duration
+	AppProxyResponseHeaderTimeout time.Duration
 
 	// Connect (client side): URL of a connect host to borrow a public
 	// subdomain and email service from, e.g. "https://agenttransfer.dev".
@@ -96,8 +119,8 @@ type Config struct {
 	// Applied only when set — FromEnv defaults it to "10%"; hand-built configs
 	// (tests, demo) leave it off unless they opt in.
 	DiskReserve string
-	// MaxAgentsPerOwner caps how many agents one owner_email can register via
-	// open signup — identities must not be free in bulk. <0 disables.
+	// MaxAgentsPerOwner caps how many agents one mailbox may human-verify.
+	// Unproven nominations do not count; operator assertions bypass it. <0 disables.
 	MaxAgentsPerOwner int64
 	// IPRate is the per-IP hourly request budget on the public unauthenticated
 	// pages (/f/, /u/, index). IPv4 keys per address, IPv6 per /64. <=0
@@ -118,6 +141,9 @@ type Config struct {
 
 // FromEnv builds a Config from the environment.
 func FromEnv() (Config, error) {
+	if strings.TrimSpace(os.Getenv("APP_ROOT")) != "" {
+		return Config{}, fmt.Errorf("APP_ROOT is unsafe and no longer supported; set distinct APP_BUILD_ROOT and APP_DATA_ROOT")
+	}
 	c := Config{
 		Domain:      strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAIN")), ".")),
 		DataDir:     envOr("DATA_DIR", "./data"),
@@ -131,10 +157,13 @@ func FromEnv() (Config, error) {
 		BehindProxy: envBool("BEHIND_PROXY"),
 		Metrics:     envOr("METRICS", "localhost"),
 
-		AppDomain:       strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("APP_DOMAIN")), ".")),
-		AppRunnerSocket: strings.TrimSpace(os.Getenv("APP_RUNNER_SOCKET")),
-		AppRunnerToken:  strings.TrimSpace(os.Getenv("APP_RUNNER_TOKEN")),
-		AppRoot:         strings.TrimSpace(os.Getenv("APP_ROOT")),
+		AppDomain:              strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("APP_DOMAIN")), ".")),
+		AppRunnerSocket:        strings.TrimSpace(os.Getenv("APP_RUNNER_SOCKET")),
+		AppRunnerToken:         strings.TrimSpace(os.Getenv("APP_RUNNER_TOKEN")),
+		AppBuildRoot:           strings.TrimSpace(os.Getenv("APP_BUILD_ROOT")),
+		AllowPublicContainers:  envBool("ALLOW_PUBLIC_CONTAINERS"),
+		AllowUnenforcedAppData: envBool("ALLOW_UNENFORCED_APP_DATA"),
+		AppDataQuotaEnforced:   envBool("APP_DATA_QUOTA_ENFORCED"),
 
 		Connect:       strings.TrimRight(strings.TrimSpace(os.Getenv("CONNECT")), "/"),
 		ConnectDomain: strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("CONNECT_DOMAIN")), ".")),
@@ -146,6 +175,29 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	if c.AppBundleSize, err = parseSizeEnv("APP_BUNDLE_SIZE", "500MB"); err != nil {
+		return c, err
+	}
+	if c.AppProxyBodySize, err = parseSizeEnv("APP_PROXY_BODY_SIZE", "100MB"); err != nil {
+		return c, err
+	}
+	if appProxyConcurrency, parseErr := parseIntEnv("APP_PROXY_CONCURRENCY", 128); parseErr != nil {
+		return c, parseErr
+	} else if appProxyConcurrency < 1 || appProxyConcurrency > 10000 {
+		return c, fmt.Errorf("APP_PROXY_CONCURRENCY must be between 1 and 10000")
+	} else {
+		c.AppProxyConcurrency = int(appProxyConcurrency)
+	}
+	if perApp, parseErr := parseIntEnv("APP_PROXY_PER_APP_CONCURRENCY", 16); parseErr != nil {
+		return c, parseErr
+	} else if perApp < 1 || perApp > 10000 {
+		return c, fmt.Errorf("APP_PROXY_PER_APP_CONCURRENCY must be between 1 and 10000")
+	} else {
+		c.AppProxyPerAppConcurrency = int(perApp)
+	}
+	if c.AppProxyBodyTimeout, err = parseDurationEnv("APP_PROXY_BODY_TIMEOUT", "15m"); err != nil {
+		return c, err
+	}
+	if c.AppProxyResponseHeaderTimeout, err = parseDurationEnv("APP_PROXY_RESPONSE_HEADER_TIMEOUT", "30s"); err != nil {
 		return c, err
 	}
 	if c.ConnectSendRate, err = parseIntEnv("CONNECT_SEND_RATE", 50); err != nil {
@@ -231,8 +283,23 @@ func (c *Config) ApplyDefaults() {
 	if c.AppBundleSize == 0 {
 		c.AppBundleSize = 500 << 20
 	}
-	if c.AppRoot == "" {
-		c.AppRoot = filepath.Join(c.DataDir, "apps")
+	if c.AppProxyBodySize == 0 {
+		c.AppProxyBodySize = 100 << 20
+	}
+	if c.AppProxyConcurrency == 0 {
+		c.AppProxyConcurrency = 128
+	}
+	if c.AppProxyPerAppConcurrency == 0 {
+		c.AppProxyPerAppConcurrency = min(c.AppProxyConcurrency, 16)
+	}
+	if c.AppProxyBodyTimeout == 0 {
+		c.AppProxyBodyTimeout = 15 * time.Minute
+	}
+	if c.AppProxyResponseHeaderTimeout == 0 {
+		c.AppProxyResponseHeaderTimeout = 30 * time.Second
+	}
+	if c.AppBuildRoot == "" {
+		c.AppBuildRoot = filepath.Join(c.DataDir, "app-builds")
 	}
 	if c.HumanRecipientsMax == 0 {
 		c.HumanRecipientsMax = 3
@@ -266,6 +333,22 @@ func (c *Config) Validate() error {
 	if c.Domain != "" && !validDNSName(c.Domain) {
 		return fmt.Errorf("DOMAIN must be a valid DNS name")
 	}
+	_, httpPort, err := net.SplitHostPort(c.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("HTTP_ADDR must be a TCP listen address: %w", err)
+	}
+	if c.Domain != "" && !c.BehindProxy && httpPort != "443" {
+		return fmt.Errorf("HTTP_ADDR must use port 443 when DOMAIN enables built-in TLS")
+	}
+	if c.PublicURL != "" {
+		u, err := parseBaseOrigin(c.PublicURL)
+		if err != nil {
+			return fmt.Errorf("PUBLIC_URL: %w", err)
+		}
+		if u.Scheme != "https" && !loopbackURLHost(u.Hostname()) {
+			return fmt.Errorf("PUBLIC_URL must use https (plain HTTP is allowed only on loopback for development)")
+		}
+	}
 	if c.AppDomain != "" {
 		if !validDNSName(c.AppDomain) {
 			return fmt.Errorf("APP_DOMAIN must be a valid DNS name")
@@ -280,19 +363,76 @@ func (c *Config) Validate() error {
 	if (c.AppRunnerSocket == "") != (c.AppRunnerToken == "") {
 		return fmt.Errorf("APP_RUNNER_SOCKET and APP_RUNNER_TOKEN must be set together")
 	}
-	if c.Connect != "" && !strings.HasPrefix(strings.ToLower(c.Connect), "https://") &&
-		!strings.HasPrefix(strings.ToLower(c.Connect), "http://127.0.0.1:") &&
-		!strings.HasPrefix(strings.ToLower(c.Connect), "http://localhost:") &&
-		!strings.HasPrefix(strings.ToLower(c.Connect), "http://[::1]:") {
-		return fmt.Errorf("CONNECT must use https:// (plain HTTP is allowed only on loopback for development)")
+	if c.AppProxyBodySize < 1 {
+		return fmt.Errorf("APP_PROXY_BODY_SIZE must be positive")
 	}
-	if c.ConnectDomain != "" && (c.Domain == "" || !strings.HasSuffix(c.ConnectDomain, c.Domain)) {
+	if c.AppProxyConcurrency < 1 || c.AppProxyConcurrency > 10000 {
+		return fmt.Errorf("APP_PROXY_CONCURRENCY must be between 1 and 10000")
+	}
+	if c.AppProxyPerAppConcurrency < 1 || c.AppProxyPerAppConcurrency > c.AppProxyConcurrency {
+		return fmt.Errorf("APP_PROXY_PER_APP_CONCURRENCY must be between 1 and APP_PROXY_CONCURRENCY")
+	}
+	if c.AppProxyBodyTimeout <= 0 || c.AppProxyResponseHeaderTimeout <= 0 {
+		return fmt.Errorf("app proxy timeouts must be positive")
+	}
+	if c.Connect != "" {
+		u, err := parseBaseOrigin(c.Connect)
+		if err != nil {
+			return fmt.Errorf("CONNECT: %w", err)
+		}
+		if u.Scheme != "https" && !loopbackURLHost(u.Hostname()) {
+			return fmt.Errorf("CONNECT must use https:// (plain HTTP is allowed only on loopback for development)")
+		}
+	}
+	if c.ConnectDomain != "" && !sameOrSubdomain(c.ConnectDomain, c.Domain) {
 		return fmt.Errorf("CONNECT_DOMAIN must be DOMAIN or one of its subdomains")
 	}
 	if c.DefaultTTL > c.MaxTTL {
 		return fmt.Errorf("DEFAULT_TTL must be <= MAX_TTL")
 	}
 	return nil
+}
+
+func sameOrSubdomain(name, parent string) bool {
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	parent = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(parent), "."))
+	return parent != "" && (name == parent || strings.HasSuffix(name, "."+parent))
+}
+
+// parseBaseOrigin accepts only an absolute HTTP(S) origin. Control-plane base
+// URLs are concatenated with fixed paths and used for trust decisions, so
+// credentials, paths, queries, and fragments must never be smuggled into one.
+func parseBaseOrigin(raw string) (*url.URL, error) {
+	if raw == "" || strings.TrimSpace(raw) != raw {
+		return nil, errors.New("must be a non-empty URL without surrounding whitespace")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" {
+		return nil, errors.New("must be an absolute http(s) origin")
+	}
+	if u.User != nil || u.Opaque != "" || u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errors.New("must not contain credentials, a path, query, or fragment")
+	}
+	return u, nil
+}
+
+func loopbackURLHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (c *Config) builtInTLS() bool {
+	if c.Domain == "" || c.BehindProxy {
+		return false
+	}
+	_, port, err := net.SplitHostPort(c.HTTPAddr)
+	return err == nil && port == "443"
 }
 
 func validDNSName(s string) bool {
@@ -400,7 +540,7 @@ func ParseDiskReserve(s string, total int64) (int64, error) {
 	}
 	if pctStr, ok := strings.CutSuffix(s, "%"); ok {
 		pct, err := strconv.ParseFloat(strings.TrimSpace(pctStr), 64)
-		if err != nil || pct <= 0 || pct >= 100 {
+		if err != nil || math.IsNaN(pct) || math.IsInf(pct, 0) || pct <= 0 || pct >= 100 {
 			return 0, fmt.Errorf("bad DISK_RESERVE percentage %q", s)
 		}
 		return int64(float64(total) * pct / 100), nil
@@ -418,7 +558,7 @@ func ParseTTL(s string) (time.Duration, error) {
 	var d time.Duration
 	if strings.HasSuffix(s, "d") {
 		n, err := strconv.ParseFloat(strings.TrimSuffix(s, "d"), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
 			return 0, fmt.Errorf("bad duration %q", s)
 		}
 		d = time.Duration(n * 24 * float64(time.Hour))
@@ -461,8 +601,10 @@ func ParseSize(s string) (int64, error) {
 		s = strings.TrimSuffix(s, "B")
 	}
 	n, err := strconv.ParseFloat(s, 64)
-	if err != nil || n < 0 {
+	bytes := n * float64(mult)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 ||
+		math.IsNaN(bytes) || math.IsInf(bytes, 0) || bytes >= math.Ldexp(1, 63) {
 		return 0, fmt.Errorf("bad size %q", s)
 	}
-	return int64(n * float64(mult)), nil
+	return int64(bytes), nil
 }

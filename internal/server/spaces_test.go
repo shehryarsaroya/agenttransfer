@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/store"
@@ -44,6 +46,16 @@ func TestSpaces(t *testing.T) {
 	code = e.doJSON("POST", "/v1/spaces/"+spaceID+"/members", aliceKey, map[string]any{"agent": "bob@local"}, nil)
 	if code != 201 {
 		t.Fatalf("add member: HTTP %d", code)
+	}
+	var readded struct {
+		Member string            `json:"member"`
+		Added  bool              `json:"added"`
+		Event  *store.SpaceEvent `json:"event"`
+	}
+	code = e.doJSON("POST", "/v1/spaces/"+spaceID+"/members", aliceKey,
+		map[string]any{"agent": "bob"}, &readded)
+	if code != http.StatusOK || readded.Member != "bob" || readded.Added || readded.Event != nil {
+		t.Fatalf("idempotent re-add: HTTP %d response=%+v", code, readded)
 	}
 
 	// Alice uploads a file, then offers it into the space with a caption.
@@ -129,5 +141,159 @@ func TestSpaces(t *testing.T) {
 	code = e.doJSON("GET", "/v1/spaces/"+spaceID, aliceKey, nil, &got)
 	if code != 200 || len(got.Members) != 2 {
 		t.Fatalf("get space: HTTP %d members=%+v", code, got.Members)
+	}
+}
+
+func TestConcurrentSpaceMemberAddsStayIdempotentAndOwnerOnly(t *testing.T) {
+	e := newEnv(t)
+	_, ownerKey := e.createAgent("member-race-owner")
+	_, targetKey := e.createAgent("member-race-target")
+	e.createAgent("member-race-outsider")
+
+	var created struct {
+		Space store.Space `json:"space"`
+	}
+	if code := e.doJSON("POST", "/v1/spaces", ownerKey, map[string]any{"name": "membership race"}, &created); code != http.StatusCreated {
+		t.Fatalf("create space: HTTP %d", code)
+	}
+
+	const attempts = 12
+	start := make(chan struct{})
+	statuses := make(chan int, attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			<-start
+			statuses <- e.doJSON("POST", "/v1/spaces/"+created.Space.ID+"/members", ownerKey,
+				map[string]any{"agent": "member-race-target"}, nil)
+		}()
+	}
+	close(start)
+	counts := map[int]int{}
+	for i := 0; i < attempts; i++ {
+		counts[<-statuses]++
+	}
+	if counts[http.StatusCreated] != 1 || counts[http.StatusOK] != attempts-1 || len(counts) != 2 {
+		t.Fatalf("concurrent add statuses=%v, want one 201 and %d idempotent 200s", counts, attempts-1)
+	}
+
+	start = make(chan struct{})
+	statuses = make(chan int, attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			<-start
+			statuses <- e.doJSON("POST", "/v1/spaces/"+created.Space.ID+"/members", targetKey,
+				map[string]any{"agent": "member-race-outsider"}, nil)
+		}()
+	}
+	close(start)
+	for i := 0; i < attempts; i++ {
+		if status := <-statuses; status != http.StatusForbidden {
+			t.Fatalf("concurrent non-owner add: HTTP %d, want 403", status)
+		}
+	}
+	outsider, err := e.srv.st.AgentByName("member-race-outsider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, member := e.srv.st.SpaceMemberRole(created.Space.ID, outsider.ID); member {
+		t.Fatal("non-owner concurrent requests added the outsider")
+	}
+	var joins int
+	if err := e.srv.st.DB.QueryRow(`SELECT COUNT(*) FROM space_events WHERE space_id=? AND kind='join'`, created.Space.ID).Scan(&joins); err != nil {
+		t.Fatal(err)
+	}
+	if joins != 1 {
+		t.Fatalf("join events=%d, want exactly one", joins)
+	}
+}
+
+func TestConcurrentMemberPostsCannotOversubscribeSpaceOwnerQuota(t *testing.T) {
+	e := newEnvCfg(t, Config{StorageQuota: 50, MaxFileSize: 1024})
+	_, ownerKey := e.createAgent("quota-owner")
+	_, bobKey := e.createAgent("quota-bob")
+	_, carolKey := e.createAgent("quota-carol")
+
+	var created struct {
+		Space store.Space `json:"space"`
+	}
+	if code := e.doJSON("POST", "/v1/spaces", ownerKey, map[string]any{"name": "quota"}, &created); code != 201 {
+		t.Fatalf("create space: %d", code)
+	}
+	for _, member := range []string{"quota-bob", "quota-carol"} {
+		if code := e.doJSON("POST", "/v1/spaces/"+created.Space.ID+"/members", ownerKey,
+			map[string]any{"agent": member}, nil); code != 201 {
+			t.Fatalf("add %s: %d", member, code)
+		}
+	}
+	e.upload(bobKey, "bob.bin", bytes.Repeat([]byte("b"), 30), "")
+	e.upload(carolKey, "carol.bin", bytes.Repeat([]byte("c"), 30), "")
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var wg sync.WaitGroup
+	for _, tc := range []struct {
+		key, file string
+	}{{bobKey, "bob.bin"}, {carolKey, "carol.bin"}} {
+		wg.Add(1)
+		go func(key, file string) {
+			defer wg.Done()
+			<-start
+			statuses <- e.doJSON("POST", "/v1/spaces/"+created.Space.ID+"/events", key,
+				map[string]any{"file": file}, nil)
+		}(tc.key, tc.file)
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	if counts[http.StatusCreated] != 1 || counts[http.StatusInsufficientStorage] != 1 {
+		t.Fatalf("concurrent post statuses=%v, want one 201 and one 507", counts)
+	}
+	owner, err := e.srv.st.AgentByName("quota-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used, err := e.srv.st.StorageUsed(owner.ID); err != nil || used != 30 {
+		t.Fatalf("owner usage=%d err=%v, want 30", used, err)
+	}
+}
+
+func TestSpaceMemberCapacityReturns429(t *testing.T) {
+	e := newEnv(t)
+	_, ownerKey := e.createAgent("member-limit-owner")
+	e.createAgent("member-limit-candidate")
+	owner, err := e.srv.st.AgentByName("member-limit-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := e.srv.st.CreateSpace(owner.ID, "full membership")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := e.srv.st.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < store.MaxMembersPerSpace-1; i++ {
+		id := fmt.Sprintf("http-member-id-%03d", i)
+		name := fmt.Sprintf("http-member-%03d", i)
+		if _, err := tx.Exec(`INSERT INTO agents(id,name,email,key_hash,created_at) VALUES(?,?,?,?,?)`,
+			id, name, name+"@local", "key-"+name, i+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO space_members(space_id,agent_id,role,joined_at)
+			VALUES(?,?,'member',?)`, sp.ID, id, i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if code := e.doJSON("POST", "/v1/spaces/"+sp.ID+"/members", ownerKey,
+		map[string]any{"agent": "member-limit-candidate"}, nil); code != http.StatusTooManyRequests {
+		t.Fatalf("add member at capacity: HTTP %d, want 429", code)
 	}
 }

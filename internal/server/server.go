@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -42,7 +43,14 @@ type Server struct {
 	tmpl     *template.Template
 	// appRunner is the narrow Unix-socket client for dynamic OCI apps. It is
 	// nil when the instance offers static hosting only.
-	appRunner *apphost.Client
+	appRunner         *apphost.Client
+	appReadyMu        sync.Mutex
+	appProbeMu        sync.Mutex
+	appReady          appHostingReadiness
+	appProxySlots     chan struct{}
+	appProxyAppSlots  sync.Map // app id -> chan struct{}
+	appRuntimeTargets sync.Map // app id -> runner-attested runtimeTarget
+	appProxyTransport *http.Transport
 
 	// stats backs the public landing-page counter strip (GET /v1/stats).
 	stats statsCache
@@ -95,6 +103,11 @@ func (s *Server) uploadLock(agentID string) *sync.Mutex {
 	return mu.(*sync.Mutex)
 }
 
+func (s *Server) appProxySlot(appID string) chan struct{} {
+	slot, _ := s.appProxyAppSlots.LoadOrStore(appID, make(chan struct{}, s.cfg.AppProxyPerAppConcurrency))
+	return slot.(chan struct{})
+}
+
 // New opens the store and builds a Server. If no admin token was configured
 // and none exists yet, the generated one is returned once via firstBootAdmin.
 func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
@@ -108,19 +121,19 @@ func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 	}
 	st.SetInstance(cfg.Instance())
 	// The unprivileged public service owns build-context materialization. Make
-	// APP_ROOT before the root runner starts so a DynamicUser deployment never
+	// APP_BUILD_ROOT before the root runner starts so a DynamicUser deployment never
 	// inherits a root:root 0700 directory it cannot write. The runner is ordered
 	// after this service in the shipped units and root can still access it.
 	if cfg.AppDomain != "" || cfg.AppRunnerSocket != "" {
-		if err := os.MkdirAll(cfg.AppRoot, 0o700); err != nil {
+		if err := os.MkdirAll(cfg.AppBuildRoot, 0o700); err != nil {
 			st.Close()
-			return nil, "", fmt.Errorf("create APP_ROOT: %w", err)
+			return nil, "", fmt.Errorf("create APP_BUILD_ROOT: %w", err)
 		}
 		// Build contexts are derived scratch copies, never durable state. A
 		// process/host crash can bypass the normal per-deploy defer, so reclaim
 		// stale contexts before accepting another deployment. Persistent app
 		// data lives under the sibling data/ directory.
-		if err := os.RemoveAll(filepath.Join(cfg.AppRoot, "contexts")); err != nil {
+		if err := os.RemoveAll(filepath.Join(cfg.AppBuildRoot, "contexts")); err != nil {
 			st.Close()
 			return nil, "", fmt.Errorf("clean stale app build contexts: %w", err)
 		}
@@ -150,7 +163,15 @@ func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 		severed:       map[string]bool{},
 		idemFlight:    map[string]chan struct{}{},
 		signupLimiter: newIPLimiter(10, time.Hour),
+		appProxySlots: make(chan struct{}, cfg.AppProxyConcurrency),
 	}
+	appProxyTransport := http.DefaultTransport.(*http.Transport).Clone()
+	appProxyTransport.Proxy = nil
+	appProxyTransport.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	appProxyTransport.MaxConnsPerHost = cfg.AppProxyConcurrency
+	appProxyTransport.MaxIdleConnsPerHost = min(cfg.AppProxyConcurrency, 32)
+	appProxyTransport.ResponseHeaderTimeout = cfg.AppProxyResponseHeaderTimeout
+	srv.appProxyTransport = appProxyTransport
 	if cfg.AppRunnerSocket != "" {
 		srv.appRunner, err = apphost.NewClient(apphost.ClientConfig{
 			SocketPath: cfg.AppRunnerSocket,
@@ -164,6 +185,12 @@ func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 	}
 	if cfg.IPRate > 0 {
 		srv.unauthLimiter = newIPLimiter(int(cfg.IPRate), time.Hour)
+	}
+	if cfg.OpenSignup && cfg.AllowPublicContainers {
+		log.Printf("agenttransfer: WARNING: public container deployment is enabled for email-verified open signups")
+	}
+	if cfg.AllowUnenforcedAppData {
+		log.Printf("agenttransfer: WARNING: container /data limits are watchdog-observed, not kernel-enforced")
 	}
 	// Resolve the disk reserve against the volume that actually holds the
 	// data. Unresolvable (odd platform) degrades to guard-off with a warning
@@ -208,6 +235,9 @@ func (s *Server) BaseURL() string {
 func (s *Server) Close() error {
 	if s.appRunner != nil {
 		s.appRunner.Close()
+	}
+	if s.appProxyTransport != nil {
+		s.appProxyTransport.CloseIdleConnections()
 	}
 	return s.st.Close()
 }
@@ -307,17 +337,15 @@ func (s *Server) Handler() http.Handler {
 
 	// Meta.
 	mux.HandleFunc("GET /.well-known/agenttransfer", s.handleWellKnown)
-	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard) // A2A-style discovery descriptor
-	mux.HandleFunc("GET /v1/stats", s.unauthLimited(s.handleStats))       // public aggregate counters (landing page strip)
-	mux.HandleFunc("GET /llms.txt", s.unauthLimited(s.handleLLMs))        // llms.txt convention: agent-readable overview
+	mux.HandleFunc("GET /v1/stats", s.unauthLimited(s.handleStats)) // public aggregate counters (landing page strip)
+	mux.HandleFunc("GET /llms.txt", s.unauthLimited(s.handleLLMs))  // llms.txt convention: agent-readable overview
 	mux.HandleFunc("GET /robots.txt", s.unauthLimited(s.handleRobots))
 	mux.HandleFunc("GET /sitemap.xml", s.unauthLimited(s.handleSitemap))
 	mux.HandleFunc("GET /launch", s.unauthLimited(s.handleLaunch))
 	mux.HandleFunc("GET /static/launch/{name}", s.handleLaunchAsset)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /{$}", s.unauthLimited(s.handleIndex))
 
 	// Connect host endpoints (served on the apex domain).
@@ -342,7 +370,12 @@ func (s *Server) withCommon(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		if r.TLS != nil {
+		secureRequest := r.TLS != nil
+		if s.cfg.BehindProxy {
+			parts := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+			secureRequest = strings.EqualFold(strings.TrimSpace(parts[len(parts)-1]), "https")
+		}
+		if secureRequest {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		// App hosts are a disjoint wildcard namespace and never fall through to
@@ -396,18 +429,23 @@ func (s *Server) Run(ctx context.Context) error {
 	// Connect client: created before any listener serves traffic (handlers
 	// read s.client), started after they're up.
 	if s.cfg.Connect != "" {
-		s.client = newConnectClient(s)
+		var err error
+		s.client, err = newConnectClient(s)
+		if err != nil {
+			return fmt.Errorf("apply saved connect identity: %w", err)
+		}
 	}
 
 	httpSrv := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 		// No WriteTimeout: large downloads stream for a long time.
 	}
 
 	var tlsCfg *tls.Config
-	if s.cfg.Domain != "" && !s.cfg.BehindProxy && s.cfg.HTTPAddr == ":443" {
+	if s.cfg.builtInTLS() {
 		certmagic.DefaultACME.Agreed = true
 		if s.cfg.ACMEEmail != "" {
 			certmagic.DefaultACME.Email = s.cfg.ACMEEmail
@@ -474,7 +512,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 			http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 		}))
-		redirectSrv := &http.Server{Addr: ":80", Handler: challenge, ReadHeaderTimeout: 10 * time.Second}
+		redirectSrv := &http.Server{Addr: ":80", Handler: challenge, ReadHeaderTimeout: 10 * time.Second, MaxHeaderBytes: 64 << 10}
 		go func() { errCh <- redirectSrv.ListenAndServe() }()
 		defer redirectSrv.Close()
 	} else {
@@ -494,6 +532,9 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	go s.janitorLoop(ctx)
+	if s.appRunner != nil {
+		go s.appWatchdogLoop(ctx)
+	}
 	go s.webhookWorker(ctx)
 
 	// Connect host: reap dead registrations.
@@ -512,7 +553,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shctx)
 		return nil
@@ -541,6 +582,30 @@ func (s *Server) janitorLoop(ctx context.Context) {
 	}
 }
 
+func (s *Server) appWatchdogLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileContainerApps()
+		}
+	}
+}
+
+func (s *Server) reconcileContainerApps() {
+	apps, err := s.st.AppsWithContainerHistory()
+	if err != nil {
+		log.Printf("apphost: list container apps: %v", err)
+		return
+	}
+	for _, candidate := range apps {
+		s.reconcileAppQuota(candidate.AgentID)
+	}
+}
+
 // JanitorOnce runs one janitor sweep: expire links, expire unclaimed files,
 // GC orphan blobs, prune bookkeeping. Exported for tests and the demo.
 func (s *Server) JanitorOnce() error {
@@ -551,7 +616,7 @@ func (s *Server) JanitorOnce() error {
 	}
 	for _, l := range links {
 		actor := s.agentEmailByID(l.AgentID)
-		_, _ = s.st.AppendReceipt(actor, receipt.ActionExpired, l.SHA256, l.Size, "link:"+l.Token, "")
+		s.appendReceipt(actor, receipt.ActionExpired, l.SHA256, l.Size, "link:"+l.Token, "")
 	}
 	files, err := s.st.ExpireFiles(now)
 	if err != nil {
@@ -559,7 +624,7 @@ func (s *Server) JanitorOnce() error {
 	}
 	for _, f := range files {
 		actor := s.agentEmailByID(f.AgentID)
-		_, _ = s.st.AppendReceipt(actor, receipt.ActionExpired, f.SHA256, f.Size, "file:"+f.Name, "")
+		s.appendReceipt(actor, receipt.ActionExpired, f.SHA256, f.Size, "file:"+f.Name, "")
 	}
 	if _, err := s.st.DeleteOrphanBlobs(); err != nil {
 		return err
@@ -581,20 +646,27 @@ func (s *Server) JanitorOnce() error {
 	_ = s.st.ReclaimStuckDeliveries(now - 300)
 	_ = s.st.PruneWebhookDeliveries(now - 24*3600)
 
-	// Release handles squatted by never-verified person signups (48 h): a
-	// pending person grants nothing, but it does hold the handle — this
-	// returns it to the pool.
+	// Unproven owner nominations expire after 48 h. This prevents abandoned
+	// flat/fleet signups from accumulating while ensuring that merely naming a
+	// victim mailbox never consumes its verified-agent cap.
+	staleAgents, err := s.st.SweepStaleUnverifiedOwnerAgents(48 * 3600)
+	if err != nil {
+		return err
+	}
+	for _, stale := range staleAgents {
+		for _, token := range stale.ActiveTokens {
+			s.sever(token)
+		}
+		s.appendReceipt(stale.Agent.Email, receipt.ActionDeleted, "", 0, "agent:"+stale.Agent.Name, "")
+	}
+	// Release handles left empty by the fleet-agent sweep.
 	_, _ = s.st.SweepStalePendingPersons(48 * 3600)
 
 	// Writable container data does not pass through PutBlob, so the runner
 	// measures it directly. Stop an app that grows beyond its combined
 	// release+data quota; its data is retained for the owner to inspect/purge.
 	if s.appRunner != nil {
-		if apps, err := s.st.AppsWithContainerHistory(); err == nil {
-			for _, candidate := range apps {
-				s.reconcileAppQuota(candidate.AgentID)
-			}
-		}
+		s.reconcileContainerApps()
 	}
 
 	return s.st.Prune()
@@ -615,6 +687,19 @@ func (s *Server) reconcileAppQuota(agentID string) {
 		return
 	}
 	if app.Status != store.AppStatusRunning || app.ActiveDeploymentID == "" {
+		s.forgetRuntimeTarget(app.ID)
+		if app.ActiveDeploymentID == "" {
+			// A crash before the first DB activation can leave an untracked
+			// container/image/network. With no desired runtime, remove all runtime
+			// resources while preserving runner-owned /data.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, cleanupErr := s.appRunner.RemoveApp(cleanupCtx, app.ID)
+			cleanupCancel()
+			if cleanupErr != nil {
+				log.Printf("apphost: remove unactivated app %s resources: %v", app.ID, cleanupErr)
+			}
+			return
+		}
 		// Error/stopped apps are not publicly routed, but Docker may still be
 		// running after a transient stop failure. Retry every sweep until every
 		// managed runtime converges to stopped.
@@ -627,6 +712,7 @@ func (s *Server) reconcileAppQuota(agentID string) {
 		return
 	}
 	if app.Kind == store.AppKindStatic {
+		s.forgetRuntimeTarget(app.ID)
 		// A transient cleanup failure during container→static switching must not
 		// leave the old container writing/egressing forever. This is idempotent
 		// and preserves persistent /data.
@@ -636,13 +722,40 @@ func (s *Server) reconcileAppQuota(agentID string) {
 		if cleanupErr != nil {
 			log.Printf("apphost: reconcile static app %s runtimes: %v", app.ID, cleanupErr)
 		}
+		// A static release has no writable runtime whose retained /data can grow;
+		// activation already quota-checked that retained data plus the immutable
+		// release bytes. The remaining reconciliation is container-only, so stop
+		// here rather than validating a health path the static deployment lacks.
+		return
 	} else if app.RuntimeID != "" {
 		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, reconcileErr := s.appRunner.ReconcileApp(reconcileCtx, app.ID, app.RuntimeID)
 		reconcileCancel()
 		if reconcileErr != nil {
-			log.Printf("apphost: reconcile container app %s runtime: %v", app.ID, reconcileErr)
+			if appObservationMustFailClosed(reconcileErr) {
+				s.stopAppForSafety(app, fmt.Sprintf("desired runtime reconciliation failed: %v", reconcileErr))
+				return
+			}
+			inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_, inspectErr := s.appRunner.RuntimeStatus(inspectCtx, app.RuntimeID)
+			inspectCancel()
+			if inspectErr != nil && appObservationMustFailClosed(inspectErr) {
+				s.stopAppForSafety(app, fmt.Sprintf("desired runtime reconciliation failed: %v", inspectErr))
+			} else {
+				log.Printf("apphost: reconcile container app %s runtime: %v", app.ID, reconcileErr)
+			}
+			return
 		}
+	}
+	deployment, err := s.st.ActiveAppDeployment(app.AgentID)
+	if err != nil {
+		s.stopAppForSafety(app, fmt.Sprintf("active deployment inspection failed: %v", err))
+		return
+	}
+	var runtimeConfig containerAppConfig
+	if err := json.Unmarshal([]byte(deployment.Config), &runtimeConfig); err != nil || validateAppHealthPath(runtimeConfig.HealthPath) != nil {
+		s.stopAppForSafety(app, "active deployment has an invalid health check")
+		return
 	}
 
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -666,8 +779,16 @@ func (s *Server) reconcileAppQuota(agentID string) {
 		return
 	}
 	if !observed.Running || observed.URL == "" {
-		s.stopAppForSafety(app, "active runtime is no longer running or published")
-		return
+		restartCtx, restartCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		observed, err = s.appRunner.StartRuntime(restartCtx, app.RuntimeID)
+		if err == nil {
+			err = probeRuntimeHealth(restartCtx, observed.URL, runtimeConfig.HealthPath)
+		}
+		restartCancel()
+		if err != nil {
+			s.stopAppForSafety(app, fmt.Sprintf("active runtime restart failed: %v", err))
+			return
+		}
 	}
 	if observed.URL != app.Upstream {
 		if err := s.st.RefreshAppRuntimeUpstream(app.AgentID, app.RuntimeID, observed.URL); err != nil {
@@ -675,25 +796,44 @@ func (s *Server) reconcileAppQuota(agentID string) {
 			return
 		}
 	}
+	healthCtx, healthCancel := context.WithTimeout(context.Background(), 7*time.Second)
+	healthErr := probeRuntimeHealth(healthCtx, observed.URL, runtimeConfig.HealthPath)
+	healthCancel()
+	if healthErr != nil {
+		s.stopAppForSafety(app, fmt.Sprintf("runtime health check failed: %v", healthErr))
+		return
+	}
+	s.rememberRuntimeTarget(app.ID, app.RuntimeID, observed.URL)
 	usage, err := s.st.ActiveAppUsage(app.AgentID)
 	if err != nil {
 		s.stopAppForSafety(app, fmt.Sprintf("release storage inspection failed: %v", err))
 		return
 	}
-	if usage.TotalBytes+observed.DataBytes <= s.cfg.AppStorageQuota {
+	if storageAdditionFits(usage.TotalBytes, observed.DataBytes, s.cfg.AppStorageQuota) {
 		return
 	}
-	s.stopAppForSafety(app, fmt.Sprintf("storage usage %d exceeds quota %d",
-		usage.TotalBytes+observed.DataBytes, s.cfg.AppStorageQuota))
+	s.stopAppForSafety(app, fmt.Sprintf("storage usage exceeds quota or is invalid (release %d + data %d; quota %d)",
+		usage.TotalBytes, observed.DataBytes, s.cfg.AppStorageQuota))
 }
 
 func appObservationMustFailClosed(err error) bool {
 	var apiErr *apphost.APIError
-	return errors.As(err, &apiErr) &&
-		(apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity)
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity {
+		return true
+	}
+	message := strings.ToLower(apiErr.Message)
+	return apiErr.StatusCode == http.StatusBadGateway &&
+		(strings.Contains(message, "refusing to manage") || strings.Contains(message, "mismatched") ||
+			strings.Contains(message, "unsafe") || strings.Contains(message, "not a private ipv4") ||
+			strings.Contains(message, "outside its private ipam") || strings.Contains(message, "not attached exclusively") ||
+			strings.Contains(message, "invalid port label"))
 }
 
 func (s *Server) stopAppForSafety(app store.App, reason string) {
+	s.forgetRuntimeTarget(app.ID)
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	stopErr := s.stopAllAppRuntimes(stopCtx, app)
 	stopCancel()
@@ -768,12 +908,24 @@ func (s *Server) isSevered(token string) bool {
 // ---- metrics ----
 
 type metrics struct {
-	httpRequests    atomic.Int64
-	uploads         atomic.Int64
-	downloads       atomic.Int64
-	sends           atomic.Int64
-	inboundMail     atomic.Int64
-	diskFullRejects atomic.Int64
+	httpRequests          atomic.Int64
+	uploads               atomic.Int64
+	downloads             atomic.Int64
+	sends                 atomic.Int64
+	inboundMail           atomic.Int64
+	diskFullRejects       atomic.Int64
+	receiptAppendFailures atomic.Int64
+}
+
+// appendReceipt deliberately keeps the action's established best-effort
+// semantics while making any audit-storage failure observable. Many callers
+// invoke this only after bytes, email, or runtime state have already crossed an
+// irreversible boundary, so returning an error would falsely imply rollback.
+func (s *Server) appendReceipt(actor, action, sha string, size int64, target, messageID string) {
+	if _, err := s.st.AppendReceipt(actor, action, sha, size, target, messageID); err != nil {
+		s.metrics.receiptAppendFailures.Add(1)
+		log.Printf("receipt append failed: actor=%q action=%q: %v", actor, action, err)
+	}
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -805,6 +957,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE agenttransfer_sends_total counter\nagenttransfer_sends_total %d\n", s.metrics.sends.Load())
 	fmt.Fprintf(w, "# TYPE agenttransfer_inbound_mail_total counter\nagenttransfer_inbound_mail_total %d\n", s.metrics.inboundMail.Load())
 	fmt.Fprintf(w, "# TYPE agenttransfer_disk_full_rejects_total counter\nagenttransfer_disk_full_rejects_total %d\n", s.metrics.diskFullRejects.Load())
+	fmt.Fprintf(w, "# TYPE agenttransfer_receipt_append_failures_total counter\nagenttransfer_receipt_append_failures_total %d\n", s.metrics.receiptAppendFailures.Load())
 }
 
 // ---- per-IP limiter ----
@@ -938,8 +1091,10 @@ func (s *Server) clientIP(r *http.Request) string {
 			// an attacker can't supply; XFF[0] is client-controlled, and
 			// trusting it would let every request claim a fresh IP.
 			parts := strings.Split(xf, ",")
-			if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
-				return ip
+			if raw := strings.TrimSpace(parts[len(parts)-1]); raw != "" {
+				if ip, err := netip.ParseAddr(raw); err == nil {
+					return ip.Unmap().String()
+				}
 			}
 		}
 	}

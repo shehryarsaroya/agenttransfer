@@ -34,10 +34,10 @@ Every email an AgentTransfer agent sends carries a normal human-readable body pl
 
 Design rules:
 
-- **`parts` aligns field-for-field with A2A** (`TextPart`, `FilePart` with `FileWithUri`): `kind`, `text`, `file.name`, `file.mimeType`, `file.uri`, `metadata`. An A2A agent can lift `parts` straight into an A2A message. AgentTransfer extensions live only in namespaced `metadata` keys (`agenttransfer.*`), which A2A tolerates.
+- **`parts` is intentionally easy to map to A2A** (`TextPart`, `FilePart` with a URI file): `kind`, `text`, `file.name`, `file.mimeType`, `file.uri`, `metadata`. AgentTransfer extensions live only in namespaced `metadata` keys (`agenttransfer.*`). The MIME manifest remains an AgentTransfer envelope; the service does not claim to implement A2A task/message operations or publish an A2A Agent Card.
 - **Bytes never ride in the manifest.** `file.uri` points at an HTTPS share link; `agenttransfer.sha256` lets any receiver verify what it fetched. Links expire (`agenttransfer.expiresAt`, ≤ 24h on default configs) — fetch promptly or ask again.
 - **Encryption is optional and client-side.** When a file is encrypted (see [encryption.md](encryption.md)), the linked bytes are [age](https://age-encryption.org) ciphertext, `agenttransfer.sha256` is the hash of *that ciphertext*, and one extra key marks it: `"agenttransfer.encMode": "symmetric" | "sealed"`. The protocol carries only this tag — never a key. A receiver without the tag still verifies integrity via the sha256; a receiver that has the key (symmetric) or is the sealed recipient decrypts locally. Instances relaying the manifest see ciphertext and metadata only.
-- **Authenticity = aligned DKIM.** A receiving instance records the DKIM verdict of the carrying email and marks the parsed offer `trusted` only on `pass` (or same-instance delivery). `pass` requires a valid signature whose `d=` domain **aligns with the From domain** — equal, or parent/subdomain on a label boundary, as in DMARC relaxed alignment. A valid signature from an unrelated domain proves nothing about the claimed sender and is recorded as `fail`. Consumers should not auto-fetch untrusted offers.
+- **Authenticity = exact-domain DKIM.** A receiving instance records the DKIM verdict of the carrying email and marks the parsed offer `trusted` only on `pass` (or same-instance delivery). `pass` requires a valid signature whose `d=` domain exactly equals the From domain after normalization. This is deliberately stricter than DMARC relaxed parent/subdomain alignment. A valid signature from any other domain is recorded as `fail`. Consumers should not auto-fetch untrusted offers.
 - **Receivers must not auto-fetch at ingest.** Fetching URLs out of inbound mail server-side is SSRF; AgentTransfer stores the reference and lets the recipient agent download explicitly.
 - Versioning: `v` bumps only on breaking changes; unknown fields must be ignored.
 
@@ -67,9 +67,10 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
 ```
 
 - `action` ∈ `uploaded | sent | received | downloaded | revoked | burned | expired | deleted | app_deployed | app_stopped | app_deleted`.
-- **Canonical form**: the signature covers the JSON object *minus `sig`*, serialized with keys sorted alphabetically, no whitespace, integers in decimal, and zero-value optional fields (`sha256`, `size`, `target`, `message_id`) omitted. This exact byte string is also what `prev` hashes (sha256, hex).
+- `sha256` identifies the underlying blob. For `downloaded`, `size` is the response-body bytes actually written; a successful range request therefore records the transferred range/body size rather than the full blob size.
+- **Canonical form**: the signature covers the JSON object *minus `sig`*, serialized with keys sorted alphabetically, no whitespace, integers in decimal, and zero-value optional fields (`sha256`, `size`, `target`, `message_id`) omitted. Strings use Go `encoding/json` escaping (including HTML-safe escaping). This exact byte string is also what `prev` hashes (sha256, lowercase hex). The frozen interoperability vector in `internal/receipt/receipt_test.go` must pass in every implementation.
 - The first receipt has `prev: "genesis"`.
-- **Signatures prove who did what; the chain proves nothing was deleted.** Verifying a full export (`GET /v1/receipts/export`, JSONL, oldest first) checks both. An agent's own slice (`GET /v1/receipts`) is signature-verifiable but not gap-checkable — chain verification needs the export.
+- **Verification proves only what it is given.** A genesis-to-head export (`GET /v1/receipts/export`, JSONL, oldest first) verifies signatures, ordering, and adjacency, exposing modifications or internal gaps. An empty full export is rejected. An agent's own slice (`GET /v1/receipts`) is signature-verifiable but not gap-checkable. Without an independently witnessed head hash/count, verification cannot detect omission of a newest suffix; an operator holding the signing seed can rewrite and re-sign history. Treat this as a tamper-evident instance audit chain, not an externally anchored transparency log.
 - The signing public key is published at `/.well-known/agenttransfer` as `ed25519:<base64url raw key>`. Reference verifier: `agenttransfer verify <instance-url>` (fetches the export with `AGENTTRANSFER_ADMIN_TOKEN`) or `agenttransfer verify export.jsonl` with `AGENTTRANSFER_PUBKEY=ed25519:...` set. Exports are in chain order — verifiers must not re-sort them (timestamps are wall-clock, not monotonic).
 
 ## 3. Instance discovery — `/.well-known/agenttransfer`
@@ -77,7 +78,7 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
 ```json
 {
   "name": "agenttransfer",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "instance": "agents.example.com",
   "receipt_pubkey": "ed25519:...",
   "max_file_size": 5368709120,
@@ -85,7 +86,7 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
   "max_ttl": "24h0m0s",
   "open_signup": false,
   "email_enabled": true,
-  "protocols": { "manifest": 1, "a2a_parts": true },
+  "protocols": { "manifest": 1, "uri_file_parts": true },
   "endpoints": { "api": "https://agents.example.com/v1", "mcp": "https://agents.example.com/mcp" },
   "app_hosting": {
     "domain": "agents.example.com",
@@ -93,14 +94,18 @@ An instance maintains one append-only receipt chain signed with its ed25519 key.
     "human_email_verification_required": true,
     "static": true,
     "containers": true,
-    "storage_quota": 10737418240
+    "storage_quota": 10737418240,
+    "readiness": { "runner": true, "wildcard_dns": true }
   }
 }
 ```
 
-`app_hosting` is omitted when `APP_DOMAIN` is disabled. `containers` reports
-whether the separate runner client is configured; it does not weaken the
-per-agent human-email gate.
+`app_hosting` is omitted when `APP_DOMAIN` is disabled. `static` is true only
+after randomized wildcard-DNS probes succeed. `containers` additionally
+requires a healthy runner/Docker engine and, on open-signup instances, the
+operator's explicit `ALLOW_PUBLIC_CONTAINERS=true` opt-in. The `readiness`
+object exposes the underlying checks; none of them weakens the per-agent
+human-email gate.
 
 Clients use it for limit discovery; verifiers use it for the public key; other instances use it to learn your endpoints. **Email is the federation** — there is no registry, no handshake, no shared infrastructure. If your agent can receive email at its address, it participates.
 
@@ -110,6 +115,6 @@ Clients use it for limit discovery; verifiers use it for the public key; other i
 2. A `send`s to `b@β`: α mints a fresh ≤24h link, emails β a human body + manifest, DKIM-signed via α's relay.
 3. β's port-25 listener accepts (it knows agent `b`), verifies DKIM, stores the manifest as a structured offer, notifies `b`'s long-poll.
 4. `b` downloads `file.uri` over HTTPS, hashes it, compares with `agenttransfer.sha256`.
-5. Both instances hold signed receipts (`sent` at α, `received`/`downloaded` at β) that anyone can verify against each instance's published key.
+5. Each instance normally appends its supported signed receipts (`sent` at α, `received`/`downloaded` at β), whose signatures can be checked against that instance's published key.
 
 No part of this requires the two operators to know each other.

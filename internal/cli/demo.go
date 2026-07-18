@@ -182,7 +182,7 @@ func Demo(out io.Writer) error {
 	if err := receipt.VerifyChain(rs, pub, true); err != nil {
 		return fmt.Errorf("receipt chain verification failed: %w", err)
 	}
-	step("✓ receipt chain verified: %d signed receipts, no gaps, no tampering", len(rs))
+	step("✓ provided receipt export has %d valid signatures and no internal gaps (completeness needs a trusted checkpoint)", len(rs))
 	for _, r := range rs {
 		step("    %s", formatReceiptLine(r))
 	}

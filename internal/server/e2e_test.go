@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,14 +182,19 @@ func TestFullHandoffFlow(t *testing.T) {
 		MessageID string `json:"message_id"`
 	}
 	code = e.doJSON("POST", "/v1/send", aliceKey, send, &replay, "Idempotency-Key", "k1")
-	if code != 200 || replay.MessageID != sent.MessageID {
+	if code != 201 || replay.MessageID != sent.MessageID {
 		t.Fatalf("idempotent replay failed: HTTP %d %q vs %q", code, replay.MessageID, sent.MessageID)
 	}
 	replayRequest, _ := json.Marshal(send)
 	replayResp, replayRaw := e.do("POST", "/v1/send", aliceKey, bytes.NewReader(replayRequest), "application/json", "Idempotency-Key", "k1")
-	if replayResp.StatusCode != http.StatusOK || replayResp.Header.Get("Cache-Control") != "no-store" {
+	if replayResp.StatusCode != http.StatusCreated || replayResp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("idempotent replay headers/status: HTTP %d Cache-Control=%q body=%s",
 			replayResp.StatusCode, replayResp.Header.Get("Cache-Control"), replayRaw)
+	}
+	if code := e.doJSON("POST", "/v1/send", aliceKey,
+		map[string]any{"to": []string{bobEmail}, "file": "sha256:" + wantHex, "note": "different"},
+		nil, "Idempotency-Key", "k1"); code != http.StatusConflict {
+		t.Fatalf("idempotency key reused with different payload: HTTP %d, want 409", code)
 	}
 
 	// Bob's inbox has exactly one message with a trusted offer.
@@ -270,6 +277,110 @@ func TestFullHandoffFlow(t *testing.T) {
 	}
 }
 
+func TestSendIdempotencyBindsNormalizedRequestAndReplaysExactResponse(t *testing.T) {
+	e := newEnv(t)
+	_, senderKey := e.createAgent("idem-sender")
+	recipient, recipientKey := e.createAgent("idem-recipient")
+
+	firstBody := []byte(`{"to":["IDEM-RECIPIENT@LOCAL"],"note":"  hello  "}`)
+	firstResp, firstRaw := e.do("POST", "/v1/send", senderKey, bytes.NewReader(firstBody), "application/json",
+		"Idempotency-Key", "normalized-key")
+	if firstResp.StatusCode != http.StatusCreated {
+		t.Fatalf("first keyed send: HTTP %d %s", firstResp.StatusCode, firstRaw)
+	}
+	normalizedBody := []byte(`{"note":"hello","to":["idem-recipient@local","IDEM-RECIPIENT@LOCAL"]}`)
+	replayResp, replayRaw := e.do("POST", "/v1/send", senderKey, bytes.NewReader(normalizedBody), "application/json",
+		"Idempotency-Key", "normalized-key")
+	if replayResp.StatusCode != http.StatusCreated || replayResp.Header.Get("Idempotent-Replay") != "true" || !bytes.Equal(replayRaw, firstRaw) {
+		t.Fatalf("normalized replay: HTTP %d replay=%q same_body=%v body=%s",
+			replayResp.StatusCode, replayResp.Header.Get("Idempotent-Replay"), bytes.Equal(replayRaw, firstRaw), replayRaw)
+	}
+	conflictResp, _ := e.do("POST", "/v1/send", senderKey,
+		strings.NewReader(`{"to":["`+recipient+`"],"note":"different"}`), "application/json",
+		"Idempotency-Key", "normalized-key")
+	if conflictResp.StatusCode != http.StatusConflict {
+		t.Fatalf("different request reused key: HTTP %d, want 409", conflictResp.StatusCode)
+	}
+	tooLongResp, _ := e.do("POST", "/v1/send", senderKey, bytes.NewReader(firstBody), "application/json",
+		"Idempotency-Key", strings.Repeat("x", store.MaxIdempotencyKeyBytes+1))
+	if tooLongResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized idempotency key: HTTP %d, want 400", tooLongResp.StatusCode)
+	}
+	var rows int
+	if err := e.srv.st.DB.QueryRow(`SELECT COUNT(*) FROM idempotency`).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("idempotency rows=%d err=%v, want 1", rows, err)
+	}
+
+	// Concurrent twins all receive the original 201/body and create one inbox
+	// message, not one delivery per request.
+	concurrentBody := []byte(`{"to":["idem-recipient@local"],"note":"concurrent"}`)
+	type result struct {
+		status int
+		body   []byte
+	}
+	results := make(chan result, 8)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, body := e.do("POST", "/v1/send", senderKey, bytes.NewReader(concurrentBody), "application/json",
+				"Idempotency-Key", "concurrent-key")
+			results <- result{status: resp.StatusCode, body: body}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var canonical []byte
+	for result := range results {
+		if result.status != http.StatusCreated {
+			t.Fatalf("concurrent keyed send status=%d body=%s", result.status, result.body)
+		}
+		if canonical == nil {
+			canonical = result.body
+		} else if !bytes.Equal(canonical, result.body) {
+			t.Fatalf("concurrent replay body mismatch:\n%s\n%s", canonical, result.body)
+		}
+	}
+	var inbox struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if code := e.doJSON("GET", "/v1/inbox", recipientKey, nil, &inbox); code != http.StatusOK || len(inbox.Messages) != 2 {
+		t.Fatalf("recipient inbox after two unique keys: HTTP %d messages=%d", code, len(inbox.Messages))
+	}
+}
+
+func TestSendIdempotencyCompletionFailureIsFailClosed(t *testing.T) {
+	e := newEnv(t)
+	_, senderKey := e.createAgent("idem-fail-sender")
+	_, recipientKey := e.createAgent("idem-fail-recipient")
+	if _, err := e.srv.st.DB.Exec(`CREATE TRIGGER fail_idempotency_completion
+		BEFORE UPDATE OF status ON idempotency WHEN NEW.status<>0
+		BEGIN SELECT RAISE(ABORT,'forced idempotency completion failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"to":["idem-fail-recipient@local"],"note":"deliver once"}`)
+	resp, _ := e.do("POST", "/v1/send", senderKey, bytes.NewReader(body), "application/json",
+		"Idempotency-Key", "fail-closed")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("completion failure: HTTP %d, want 500", resp.StatusCode)
+	}
+	retry, _ := e.do("POST", "/v1/send", senderKey, bytes.NewReader(body), "application/json",
+		"Idempotency-Key", "fail-closed")
+	if retry.StatusCode != http.StatusConflict {
+		t.Fatalf("pending retry: HTTP %d, want fail-closed 409", retry.StatusCode)
+	}
+	var inbox struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if code := e.doJSON("GET", "/v1/inbox", recipientKey, nil, &inbox); code != http.StatusOK || len(inbox.Messages) != 1 {
+		t.Fatalf("completion failure duplicated delivery: HTTP %d messages=%d", code, len(inbox.Messages))
+	}
+}
+
 func TestLongPollDelivers(t *testing.T) {
 	e := newEnv(t)
 	_, aliceKey := e.createAgent("alice")
@@ -336,6 +447,99 @@ func TestBurnAfterRead(t *testing.T) {
 	if link["once"] != true {
 		t.Fatalf("once=true link is not burn-after-read: %v", link)
 	}
+}
+
+func TestDownloadAccountingOnlyCountsSuccessfulBodies(t *testing.T) {
+	e := newEnv(t)
+	email, key := e.createAgent("alice")
+	up := e.upload(key, "range.bin", []byte("0123456789"), "?share=1")
+	link := up["link"].(map[string]any)
+	token := link["token"].(string)
+	path := strings.TrimPrefix(link["url"].(string), e.ts.URL) + "?dl=1"
+
+	resp, _ := e.do("GET", path, "", nil, "", "If-Modified-Since", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional request: got %d, want 304", resp.StatusCode)
+	}
+	resp, _ = e.do("GET", path, "", nil, "", "Range", "bytes=999-1000")
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("invalid range: got %d, want 416", resp.StatusCode)
+	}
+	stored, err := e.srv.Store().GetLink(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Downloads != 0 {
+		t.Fatalf("non-download responses incremented counter to %d", stored.Downloads)
+	}
+
+	resp, body := e.do("GET", path, "", nil, "", "Range", "bytes=2-4")
+	if resp.StatusCode != http.StatusPartialContent || string(body) != "234" {
+		t.Fatalf("valid range: HTTP %d body %q", resp.StatusCode, body)
+	}
+	stored, err = e.srv.Store().GetLink(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Downloads != 1 {
+		t.Fatalf("successful range count = %d, want 1", stored.Downloads)
+	}
+	receipts, err := e.srv.Store().ListReceipts(email, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var downloaded *receipt.Receipt
+	for i := range receipts {
+		if receipts[i].Action == receipt.ActionDownloaded && receipts[i].Target == "link:"+token {
+			downloaded = &receipts[i]
+		}
+	}
+	if downloaded == nil || downloaded.Size != int64(len(body)) {
+		t.Fatalf("range receipt = %+v, want transferred size %d", downloaded, len(body))
+	}
+}
+
+func TestZeroByteDownloadIsAccountedButHEADIsNot(t *testing.T) {
+	e := newEnv(t)
+	email, key := e.createAgent("empty-download")
+	up := e.upload(key, "empty.bin", nil, "?share=1")
+	link := up["link"].(map[string]any)
+	token := link["token"].(string)
+	path := strings.TrimPrefix(link["url"].(string), e.ts.URL) + "?dl=1"
+
+	resp, body := e.do(http.MethodHead, path, "", nil, "")
+	if resp.StatusCode != http.StatusOK || len(body) != 0 {
+		t.Fatalf("HEAD: HTTP %d body=%q", resp.StatusCode, body)
+	}
+	stored, err := e.srv.Store().GetLink(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Downloads != 0 {
+		t.Fatalf("HEAD incremented counter to %d", stored.Downloads)
+	}
+
+	resp, body = e.do(http.MethodGet, path, "", nil, "")
+	if resp.StatusCode != http.StatusOK || len(body) != 0 {
+		t.Fatalf("GET: HTTP %d body=%q", resp.StatusCode, body)
+	}
+	stored, err = e.srv.Store().GetLink(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Downloads != 1 {
+		t.Fatalf("zero-byte GET count=%d, want 1", stored.Downloads)
+	}
+	receipts, err := e.srv.Store().ListReceipts(email, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range receipts {
+		if got.Action == receipt.ActionDownloaded && got.Target == "link:"+token && got.Size == 0 {
+			return
+		}
+	}
+	t.Fatal("zero-byte GET did not append a zero-size download receipt")
 }
 
 func TestRevokeKillsLink(t *testing.T) {
@@ -703,24 +907,24 @@ func TestSendRejectsBadRecipient(t *testing.T) {
 }
 
 // Visible identity: the computed tier + selectively-disclosed public_contact show
-// up on whoami / card / pubkey, and the A2A Agent Card is served and well-formed.
-func TestVisibleIdentityAndAgentCard(t *testing.T) {
+// up on whoami, cards, and pubkey lookups.
+func TestVisibleIdentity(t *testing.T) {
 	e := newEnv(t) // no DOMAIN → not domain-attested; createAgent is admin → owner-verified
 	_, aliceKey := e.createAgent("alice")
 
 	var who struct {
 		Verified struct {
-			Tier           string `json:"tier"`
-			Domain         string `json:"domain"`
-			DomainAttested bool   `json:"domain_attested"`
+			Tier     string `json:"tier"`
+			Instance string `json:"instance"`
+			Basis    string `json:"basis"`
 		} `json:"verified"`
 		PublicContact string `json:"public_contact"`
 	}
 	if code := e.doJSON("GET", "/v1/whoami", aliceKey, nil, &who); code != 200 {
 		t.Fatalf("whoami: %d", code)
 	}
-	if who.Verified.Tier != "owner" || who.Verified.DomainAttested {
-		t.Fatalf("tier=%q domain_attested=%v, want owner/false", who.Verified.Tier, who.Verified.DomainAttested)
+	if who.Verified.Tier != "owner" || who.Verified.Basis != "owner_record" || who.Verified.Instance != "local" {
+		t.Fatalf("verified=%+v, want owner/owner_record/local", who.Verified)
 	}
 
 	// public_contact round-trips (selective disclosure); owner_email never appears.
@@ -748,18 +952,9 @@ func TestVisibleIdentityAndAgentCard(t *testing.T) {
 		t.Fatalf("pubkey verified: %d %q", code, pk.Verified.Tier)
 	}
 
-	// The A2A Agent Card is public and well-formed.
-	var ac struct {
-		Name            string           `json:"name"`
-		ProtocolVersion string           `json:"protocolVersion"`
-		Skills          []map[string]any `json:"skills"`
-		SecuritySchemes map[string]any   `json:"securitySchemes"`
-	}
-	if code := e.doJSON("GET", "/.well-known/agent-card.json", "", nil, &ac); code != 200 {
-		t.Fatalf("agent-card: %d", code)
-	}
-	if ac.Name != "agenttransfer" || ac.ProtocolVersion == "" || len(ac.Skills) == 0 || ac.SecuritySchemes["bearer"] == nil {
-		t.Fatalf("agent-card malformed: %+v", ac)
+	// Do not publish an A2A Agent Card without implementing A2A operations.
+	if code := e.doJSON("GET", "/.well-known/agent-card.json", "", nil, nil); code != 404 {
+		t.Fatalf("non-existent A2A agent card: got %d, want 404", code)
 	}
 }
 
@@ -805,7 +1000,10 @@ func TestMCPToolFlow(t *testing.T) {
 	if !strings.Contains(up, "sha256") {
 		t.Fatalf("upload_file: %s", up)
 	}
-	sent := call("send", map[string]any{"to": []string{bobEmail}, "file": "notes.txt", "note": "over mcp"})
+	sent := call("send", map[string]any{
+		"to": []string{bobEmail}, "file": "notes.txt", "note": "over mcp",
+		"idempotency_key": "mcp-e2e-send",
+	})
 	if !strings.Contains(sent, "inbox") {
 		t.Fatalf("send: %s", sent)
 	}
@@ -817,6 +1015,44 @@ func TestMCPToolFlow(t *testing.T) {
 	e.doJSON("GET", "/v1/inbox?unread=1", bobKey, nil, &inbox)
 	if len(inbox.Messages) != 1 {
 		t.Fatalf("bob inbox after mcp send: %d", len(inbox.Messages))
+	}
+	callAs := func(key, name string, args any) string {
+		body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+			"params": map[string]any{"name": name, "arguments": args}})
+		resp, data := e.do("POST", "/mcp", key, bytes.NewReader(body), "application/json")
+		if resp.StatusCode != 200 {
+			t.Fatalf("mcp %s: HTTP %d %s", name, resp.StatusCode, data)
+		}
+		var out struct {
+			Result struct {
+				IsError bool `json:"isError"`
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil || out.Result.IsError || len(out.Result.Content) == 0 {
+			t.Fatalf("mcp %s response: %s err=%v", name, data, err)
+		}
+		return out.Result.Content[0].Text
+	}
+	readText := callAs(bobKey, "read_message", map[string]any{"id": inbox.Messages[0]["id"]})
+	var readBack struct {
+		Read bool `json:"read"`
+	}
+	if err := json.Unmarshal([]byte(readText), &readBack); err != nil || !readBack.Read {
+		t.Fatalf("read_message returned stale read state: %s err=%v", readText, err)
+	}
+
+	large := e.upload(key, "large.bin", bytes.Repeat([]byte("L"), (1<<20)+1), "?share=1")
+	shareURL := large["link"].(map[string]any)["url"].(string)
+	downloadText := callAs(bobKey, "download_file", map[string]any{"url": shareURL})
+	var download map[string]any
+	if err := json.Unmarshal([]byte(downloadText), &download); err != nil {
+		t.Fatal(err)
+	}
+	if got := download["url"]; got != shareURL+"?dl=1" || strings.Contains(fmt.Sprint(got), "/v1/files/") {
+		t.Fatalf("large linked MCP download URL=%v, want capability URL", got)
 	}
 
 	// Unauthenticated MCP is rejected.

@@ -3,6 +3,16 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+)
+
+const (
+	// Space metadata and file references are durable, so each dimension has an
+	// explicit bound even for otherwise-unlimited verified accounts. The event
+	// bound is a rolling retention window, not a lifetime append ceiling.
+	MaxSpacesPerOwner  = 100
+	MaxMembersPerSpace = 500
+	MaxEventsPerSpace  = 10_000
 )
 
 // schemaSpaces (migration 3) adds Spaces: a shared coordination context that
@@ -97,6 +107,13 @@ func (s *Store) CreateSpace(ownerID, name string) (Space, error) {
 		return Space{}, err
 	}
 	defer tx.Rollback()
+	var spaces int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM spaces WHERE owner_id=?`, ownerID).Scan(&spaces); err != nil {
+		return Space{}, err
+	}
+	if spaces >= MaxSpacesPerOwner {
+		return Space{}, fmt.Errorf("%w: at most %d spaces per owner", ErrLimit, MaxSpacesPerOwner)
+	}
 	if _, err := tx.Exec(`INSERT INTO spaces(id,name,owner_id,created_at) VALUES(?,?,?,?)`,
 		sp.ID, sp.Name, sp.OwnerID, sp.CreatedAt); err != nil {
 		return Space{}, err
@@ -127,28 +144,71 @@ func (s *Store) SpaceMemberRole(spaceID, agentID string) (string, bool) {
 	return role, true
 }
 
-// AddSpaceMember enrolls an agent in a space. It is idempotent: re-adding an
-// existing member is a no-op that keeps the current role and join time.
-func (s *Store) AddSpaceMember(spaceID, agentID, role string) error {
+// AddSpaceMember enrolls an agent and appends its join event in one
+// transaction. Re-adding an existing member is a complete no-op: it keeps the
+// current role and join time and does not append another event. added reports
+// whether the transaction changed membership; ev is zero when added is false.
+func (s *Store) AddSpaceMember(spaceID, agentID, role, actor string) (SpaceEvent, bool, error) {
 	if role == "" {
 		role = "member"
 	}
-	_, err := s.DB.Exec(`INSERT INTO space_members(space_id,agent_id,role,joined_at) VALUES(?,?,?,?)
-		ON CONFLICT(space_id,agent_id) DO NOTHING`, spaceID, agentID, role, now())
-	return err
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return SpaceEvent{}, false, err
+	}
+	defer tx.Rollback()
+	var exists int
+	err = tx.QueryRow(`SELECT 1 FROM space_members WHERE space_id=? AND agent_id=?`, spaceID, agentID).Scan(&exists)
+	if err == nil {
+		return SpaceEvent{}, false, nil // idempotent even when the space is already at capacity
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return SpaceEvent{}, false, err
+	}
+	var members int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM space_members WHERE space_id=?`, spaceID).Scan(&members); err != nil {
+		return SpaceEvent{}, false, err
+	}
+	if members >= MaxMembersPerSpace {
+		return SpaceEvent{}, false, fmt.Errorf("%w: at most %d members per space", ErrLimit, MaxMembersPerSpace)
+	}
+	if _, err := tx.Exec(`INSERT INTO space_members(space_id,agent_id,role,joined_at) VALUES(?,?,?,?)`,
+		spaceID, agentID, role, now()); err != nil {
+		return SpaceEvent{}, false, err
+	}
+	ev, err := addSpaceEventTx(tx, spaceID, actor, "join", "", "", "", "", 0)
+	if err != nil {
+		return SpaceEvent{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SpaceEvent{}, false, err
+	}
+	return ev, true, nil
 }
 
-// RemoveSpaceMember drops an agent's membership; ErrNotFound if it wasn't a
-// member.
-func (s *Store) RemoveSpaceMember(spaceID, agentID string) error {
-	res, err := s.DB.Exec(`DELETE FROM space_members WHERE space_id=? AND agent_id=?`, spaceID, agentID)
+// RemoveSpaceMember drops an agent's membership and appends its leave event in
+// one transaction; ErrNotFound if it wasn't a member.
+func (s *Store) RemoveSpaceMember(spaceID, agentID, actor string) (SpaceEvent, error) {
+	tx, err := s.DB.Begin()
 	if err != nil {
-		return err
+		return SpaceEvent{}, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM space_members WHERE space_id=? AND agent_id=?`, spaceID, agentID)
+	if err != nil {
+		return SpaceEvent{}, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return SpaceEvent{}, ErrNotFound
 	}
-	return nil
+	ev, err := addSpaceEventTx(tx, spaceID, actor, "leave", "", "", "", "", 0)
+	if err != nil {
+		return SpaceEvent{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SpaceEvent{}, err
+	}
+	return ev, nil
 }
 
 // ListSpaceMembers returns a space's members (name resolved from agents),
@@ -204,14 +264,31 @@ func scanSpaceEvent(row interface{ Scan(...any) error }) (SpaceEvent, error) {
 	return ev, err
 }
 
-// AddSpaceEvent appends one event to a space's stream and returns it with the
-// assigned autoincrement seq (the since cursor).
-func (s *Store) AddSpaceEvent(spaceID, actor, kind, text, sha, name, mime string, size int64) (SpaceEvent, error) {
+// addSpaceEventTx appends within the caller's transaction, including rolling
+// retention. Keeping this helper transaction-agnostic lets membership and its
+// audit event commit or roll back as one state transition.
+func addSpaceEventTx(tx *sql.Tx, spaceID, actor, kind, text, sha, name, mime string, size int64) (SpaceEvent, error) {
 	ev := SpaceEvent{
 		ID: NewID("evt"), SpaceID: spaceID, Actor: actor, Kind: kind,
 		Text: text, SHA256: sha, Name: name, MIME: mime, Size: size, CreatedAt: now(),
 	}
-	res, err := s.DB.Exec(`INSERT INTO space_events(id,space_id,actor,kind,text,sha256,name,mime,size,created_at)
+	var events int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM space_events WHERE space_id=?`, spaceID).Scan(&events); err != nil {
+		return SpaceEvent{}, err
+	}
+	if events >= MaxEventsPerSpace {
+		trim := events - MaxEventsPerSpace + 1
+		res, err := tx.Exec(`DELETE FROM space_events WHERE seq IN (
+			SELECT seq FROM space_events WHERE space_id=? ORDER BY seq LIMIT ?
+		)`, spaceID, trim)
+		if err != nil {
+			return SpaceEvent{}, err
+		}
+		if removed, _ := res.RowsAffected(); removed != int64(trim) {
+			return SpaceEvent{}, fmt.Errorf("trimmed %d space events, want %d", removed, trim)
+		}
+	}
+	res, err := tx.Exec(`INSERT INTO space_events(id,space_id,actor,kind,text,sha256,name,mime,size,created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		ev.ID, ev.SpaceID, ev.Actor, ev.Kind, ev.Text, ev.SHA256, ev.Name, ev.MIME, ev.Size, ev.CreatedAt)
 	if err != nil {
@@ -225,8 +302,30 @@ func (s *Store) AddSpaceEvent(spaceID, actor, kind, text, sha, name, mime string
 	return ev, nil
 }
 
-// ListSpaceEvents returns a space's events with seq strictly greater than
-// sinceSeq, ascending. limit defaults to 200 and is capped at 500.
+// AddSpaceEvent appends one event and returns its global monotonic seq. A space
+// retains only its newest MaxEventsPerSpace entries: when the window is full,
+// the oldest rows are pruned in the same transaction before the append. A
+// failed insert therefore restores the previous window instead of losing
+// history, and removed file events stop pinning their blobs after commit.
+func (s *Store) AddSpaceEvent(spaceID, actor, kind, text, sha, name, mime string, size int64) (SpaceEvent, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return SpaceEvent{}, err
+	}
+	defer tx.Rollback()
+	ev, err := addSpaceEventTx(tx, spaceID, actor, kind, text, sha, name, mime, size)
+	if err != nil {
+		return SpaceEvent{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SpaceEvent{}, err
+	}
+	return ev, nil
+}
+
+// ListSpaceEvents returns retained events with seq strictly greater than
+// sinceSeq, ascending. A cursor older than the rolling retention window begins
+// at the oldest retained event. limit defaults to 200 and is capped at 500.
 func (s *Store) ListSpaceEvents(spaceID string, sinceSeq int64, limit int) ([]SpaceEvent, error) {
 	if limit <= 0 {
 		limit = 200

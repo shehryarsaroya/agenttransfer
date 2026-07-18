@@ -1,10 +1,10 @@
 // Package proto defines the AgentTransfer wire manifest — the machine-readable
 // MIME part attached to every email an agent sends.
 //
-// Parts align field-for-field with the A2A protocol's Part types (TextPart,
-// FilePart with FileWithUri), so A2A agents can consume an AgentTransfer
-// manifest natively. AgentTransfer-specific fields ride in Part.Metadata under
-// namespaced "agenttransfer.*" keys, which A2A permits and ignores.
+// Parts are deliberately shaped for a mechanical mapping to A2A TextPart and
+// URI-backed FilePart values. The enclosing email manifest is AgentTransfer's
+// own protocol; consuming it as A2A still requires an adapter. Extensions live
+// under namespaced "agenttransfer.*" metadata keys.
 package proto
 
 // Filename is the attachment filename of the manifest part, for mail
@@ -24,7 +24,7 @@ type Manifest struct {
 	Parts     []Part `json:"parts"`
 }
 
-// Part mirrors an A2A Part. Kind is "text" or "file".
+// Part is an AgentTransfer text or URI-file part with an A2A-mappable shape.
 type Part struct {
 	Kind     string         `json:"kind"`
 	Text     string         `json:"text,omitempty"`
@@ -32,7 +32,7 @@ type Part struct {
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
-// FileRef mirrors A2A FileWithUri.
+// FileRef describes bytes by URI rather than embedding them in the manifest.
 type FileRef struct {
 	Name     string `json:"name,omitempty"`
 	MIMEType string `json:"mimeType,omitempty"`
@@ -60,10 +60,10 @@ const (
 	EncSealed    = "sealed"
 )
 
-// TextPart builds an A2A text part.
+// TextPart builds an AgentTransfer text part.
 func TextPart(text string) Part { return Part{Kind: "text", Text: text} }
 
-// FilePart builds an A2A file part carrying an AgentTransfer share link plus
+// FilePart builds an AgentTransfer URI-file part carrying a share link and
 // integrity metadata. encMode is "" for plaintext, or proto.EncSymmetric /
 // proto.EncSealed for a client-encrypted file.
 func FilePart(name, mimeType, uri, sha256 string, size int64, expiresAt string, once bool, encMode string) Part {

@@ -35,11 +35,18 @@ curl https://agenttransfer.dev/v1/agents/codex-bot/card -H "Authorization: Beare
   "description": "renders 3D scenes from prompts",
   "capabilities": ["render", "blender", "gpu"],
   "listed": true,
+  "verified": {"tier": "keyed", "instance": "agenttransfer.dev", "basis": "api_key"},
   "updated_at": 1751000000
 }
 ```
 
-A card carries the agent's sealed-transfer `pubkey` when it has published one, so a discovering agent can look up a peer and encrypt to it in the same step (see [encryption.md](encryption.md)).
+A card carries the agent's sealed-transfer `pubkey` when it has published one,
+so a discovering agent can identify a peer that supports sealed transfers.
+Viewing a card does not mutate local trust state. On the first sealed send, the
+CLI fetches the authenticated `pubkey` endpoint, TOFU-pins that value for the
+active sender account, and refuses later changes. The directory and key lookup
+are still operator-served and do not independently authenticate first contact
+(see [encryption.md](encryption.md)).
 
 ## The directory
 
@@ -54,7 +61,9 @@ curl "https://agenttransfer.dev/v1/directory?capability=render&limit=20" \
 {
   "agents": [
     {"name": "codex-bot", "description": "renders 3D scenes from prompts",
-     "capabilities": ["render", "blender", "gpu"], "listed": true, "updated_at": 1751000000}
+     "capabilities": ["render", "blender", "gpu"], "listed": true,
+     "verified": {"tier": "keyed", "instance": "agenttransfer.dev", "basis": "api_key"},
+     "updated_at": 1751000000}
   ],
   "count": 1
 }

@@ -1,6 +1,7 @@
 // Package store is AgentTransfer's persistence layer: one SQLite database plus
-// a sha256-addressed, refcounted blob directory. It also owns the instance
-// ed25519 identity and writes the signed receipt chain.
+// a sha256-addressed blob directory. Database references are evaluated by the
+// orphan collector; there is no mutable blob refcount. The package also owns
+// the instance ed25519 identity and writes the signed receipt chain.
 package store
 
 import (
@@ -45,6 +46,32 @@ var ErrCircleFull = errors.New("recipient circle full")
 
 // ErrNameTaken is returned when an agent name is already registered.
 var ErrNameTaken = errors.New("name taken")
+
+// ErrLimit is returned when a finite durable-metadata or inbox ceiling is hit.
+var ErrLimit = errors.New("resource limit reached")
+
+// ErrInboxFull distinguishes a recipient mailbox ceiling from other store
+// failures so SMTP can return a retryable mailbox-full response.
+var ErrInboxFull = errors.New("inbox storage limit reached")
+
+// ErrIdempotencyConflict means a key was already bound to a different request.
+var ErrIdempotencyConflict = errors.New("idempotency key request conflict")
+
+// ErrOwnerAgentLimit means a mailbox has no remaining human-verified agent
+// slots. Pending, unproven nominations never contribute to this limit.
+var ErrOwnerAgentLimit = errors.New("verified owner agent limit reached")
+
+const (
+	MaxActiveLinksPerAgent     = 1000
+	MaxUploadRequestsPerAgent  = 100
+	MaxInboxMessagesPerAgent   = 5000
+	MaxInboxBytesPerAgent      = 256 << 20
+	DefaultInboxListLimit      = 100
+	MaxInboxListLimit          = 500
+	MaxIdempotencyKeyBytes     = 128
+	MaxIdempotencyRowsPerAgent = 256
+	IdempotencyTTLSeconds      = 24 * 60 * 60
+)
 
 // Agent is one identity: an email address plus an API key.
 type Agent struct {
@@ -174,7 +201,8 @@ type Store struct {
 	DB      *sql.DB
 	dataDir string
 
-	instance string // domain used in receipts and addresses
+	instanceMu sync.RWMutex
+	instance   string // domain used in receipts and addresses
 
 	signKey ed25519.PrivateKey
 	pubKey  ed25519.PublicKey
@@ -184,6 +212,12 @@ type Store struct {
 	// diskReserve is the free-space floor (bytes) on the data-dir volume;
 	// uploads are refused while free space is below it. 0 = guard disabled.
 	diskReserve int64
+	// diskWriteMu protects per-chunk admission. diskPending reserves bytes for
+	// writes admitted after statfs but not yet reflected in filesystem free space,
+	// so concurrent streams cannot spend the same headroom.
+	diskWriteMu sync.Mutex
+	diskPending int64
+	volumeStats func(string) (int64, int64, error)
 
 	chainMu sync.Mutex // serializes receipt appends
 
@@ -213,7 +247,7 @@ func Open(dataDir, adminToken string) (s *Store, firstBootAdminToken string, err
 		return nil, "", fmt.Errorf("migrate: %w", err)
 	}
 
-	s = &Store{DB: db, dataDir: dataDir, instance: "local"}
+	s = &Store{DB: db, dataDir: dataDir, instance: "local", volumeStats: VolumeStats}
 
 	// Instance signing key.
 	seedHex, err := s.getSetting("sign_seed")
@@ -264,13 +298,20 @@ func (s *Store) Close() error { return s.DB.Close() }
 
 // SetInstance sets the domain recorded on receipts and used in addresses.
 func (s *Store) SetInstance(domain string) {
-	if domain != "" {
-		s.instance = domain
+	if domain == "" {
+		return
 	}
+	s.instanceMu.Lock()
+	s.instance = domain
+	s.instanceMu.Unlock()
 }
 
 // Instance returns the instance domain ("local" when unconfigured).
-func (s *Store) Instance() string { return s.instance }
+func (s *Store) Instance() string {
+	s.instanceMu.RLock()
+	defer s.instanceMu.RUnlock()
+	return s.instance
+}
 
 // PublicKey returns the instance receipt-signing public key.
 func (s *Store) PublicKey() ed25519.PublicKey { return s.pubKey }
@@ -422,6 +463,15 @@ CREATE TABLE IF NOT EXISTS counters (
 );
 `
 
+// schemaOwnerPendingV13 timestamps the current unverified mailbox nomination.
+// Agent created_at is insufficient because an old ownerless agent can nominate
+// a mailbox years later and must still receive a fresh 48-hour challenge window.
+const schemaOwnerPendingV13 = `
+ALTER TABLE agents ADD COLUMN owner_pending_at INTEGER NOT NULL DEFAULT 0;
+UPDATE agents SET owner_pending_at=created_at
+WHERE owner_email<>'' AND owner_verified=0;
+`
+
 // migrations is the ordered list of schema versions. Each entry is applied once,
 // in order, inside a transaction; PRAGMA user_version records how many have run.
 // Append new migrations — never edit a shipped one. Index i is "version i+1".
@@ -436,6 +486,9 @@ var migrations = []string{
 	schemaAppsV8,                // v8: per-agent app identity + immutable deployments
 	schemaAppContainerHistoryV9, // v9: retain runner-data history across metadata reset
 	schemaVerifyTokenOwnerV10,   // v10: bind owner challenges to the nominated mailbox
+	schemaLocalNamesV11,         // v11: atomic shared person/agent localpart namespace
+	schemaIdempotencyV12,        // v12: request-bound status/body idempotency records
+	schemaOwnerPendingV13,       // v13: age unverified mailbox nominations independently
 }
 
 // migrate brings db up to len(migrations) via PRAGMA user_version.
@@ -517,13 +570,35 @@ func now() int64 { return time.Now().Unix() }
 // CreateAgent mints an agent and returns it with the plaintext API key
 // (stored only as a hash).
 func (s *Store) CreateAgent(name, ownerEmail string, verified bool) (Agent, string, error) {
+	return s.CreateAgentLimited(name, ownerEmail, verified, 0)
+}
+
+// CreateAgentLimited mints a flat agent. maxAgents is retained in the internal
+// signature for callers compiled against the earlier flow but intentionally is
+// not enforced here: merely typing a victim's mailbox proves nothing and must
+// not consume that mailbox's verified-agent slots. The cap is claimed only by
+// VerifyOwnerTokenLimited after mailbox proof.
+func (s *Store) CreateAgentLimited(name, ownerEmail string, verified bool, _ int64) (Agent, string, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if !validAgentName(name) || strings.Contains(name, "+") {
+	ownerEmail = strings.TrimSpace(ownerEmail)
+	if !ValidAgentName(name) || strings.Contains(name, "+") {
 		return Agent{}, "", errors.New("invalid agent name: use 3-64 chars of a-z 0-9 . _ - (person-owned agents are created via \"as\")")
 	}
+	// Hold the domain snapshot through the insert. RenameInstance takes the
+	// write side across its bulk UPDATE, so a concurrent registration either
+	// updates this new row or this creation observes the new domain.
+	s.instanceMu.RLock()
+	defer s.instanceMu.RUnlock()
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return Agent{}, "", err
+	}
+	defer tx.Rollback()
 	// Flat names share the localpart namespace with person handles.
 	var handleN int
-	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM persons WHERE handle=?`, name).Scan(&handleN); err == nil && handleN > 0 {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM persons WHERE handle=?`, name).Scan(&handleN); err != nil {
+		return Agent{}, "", err
+	} else if handleN > 0 {
 		return Agent{}, "", fmt.Errorf("agent name %q is taken: %w", name, ErrNameTaken)
 	}
 	key := "at_live_" + randToken(32)
@@ -531,7 +606,7 @@ func (s *Store) CreateAgent(name, ownerEmail string, verified bool) (Agent, stri
 		ID:            NewID("agt"),
 		Name:          name,
 		Email:         name + "@" + s.instance,
-		OwnerEmail:    strings.TrimSpace(ownerEmail),
+		OwnerEmail:    ownerEmail,
 		OwnerVerified: verified,
 		CreatedAt:     now(),
 	}
@@ -539,20 +614,27 @@ func (s *Store) CreateAgent(name, ownerEmail string, verified bool) (Agent, stri
 		a.OwnerVerifiedAt = a.CreatedAt
 		a.OwnerVerificationMethod = "operator"
 	}
-	_, err := s.DB.Exec(`INSERT INTO agents(id,name,email,key_hash,owner_email,owner_verified,
-		owner_verified_at,owner_verification_method,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+	ownerPendingAt := int64(0)
+	if a.OwnerEmail != "" && !a.OwnerVerified {
+		ownerPendingAt = a.CreatedAt
+	}
+	_, err = tx.Exec(`INSERT INTO agents(id,name,email,key_hash,owner_email,owner_verified,
+		owner_verified_at,owner_verification_method,owner_pending_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.Email, hashToken(key), a.OwnerEmail, boolInt(a.OwnerVerified),
-		a.OwnerVerifiedAt, a.OwnerVerificationMethod, a.CreatedAt)
+		a.OwnerVerifiedAt, a.OwnerVerificationMethod, ownerPendingAt, a.CreatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return Agent{}, "", fmt.Errorf("agent name %q is taken: %w", name, ErrNameTaken)
 		}
 		return Agent{}, "", err
 	}
+	if err := tx.Commit(); err != nil {
+		return Agent{}, "", err
+	}
 	return a, key, nil
 }
 
-func validAgentName(name string) bool {
+func ValidAgentName(name string) bool {
 	if len(name) < 3 || len(name) > 64 {
 		return false
 	}
@@ -595,12 +677,13 @@ func (s *Store) AgentByID(id string) (Agent, error) {
 	return scanAgent(s.DB.QueryRow(`SELECT `+agentCols+` FROM agents WHERE id=?`, id))
 }
 
-// CountAgentsByOwner counts agents registered to an owner address
-// (case-insensitive) — open signup caps this so identities aren't free in
-// bulk.
+// CountAgentsByOwner counts agents whose nominated mailbox was actually proven
+// by email. Unverified claims and operator assertions do not consume a human
+// mailbox's cap.
 func (s *Store) CountAgentsByOwner(owner string) (int64, error) {
 	var n int64
-	err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE owner_email<>'' AND LOWER(owner_email)=LOWER(?)`,
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE owner_email<>''
+		AND owner_verified=1 AND owner_verification_method='email' AND LOWER(owner_email)=LOWER(?)`,
 		strings.TrimSpace(owner)).Scan(&n)
 	return n, err
 }
@@ -639,7 +722,7 @@ func (s *Store) SetOwnerPending(agentID, email string) error {
 		return err
 	}
 	res, err := tx.Exec(`UPDATE agents SET owner_email=?, owner_verified=0,
-		owner_verified_at=0, owner_verification_method='' WHERE id=?`, email, agentID)
+		owner_verified_at=0, owner_verification_method='', owner_pending_at=? WHERE id=?`, email, now(), agentID)
 	if err != nil {
 		return err
 	}
@@ -666,7 +749,7 @@ func (s *Store) MarkOwnerVerifiedBy(agentID, method string) error {
 	}
 	defer tx.Rollback()
 	res, err := tx.Exec(`UPDATE agents SET owner_verified=1,
-		owner_verified_at=?, owner_verification_method=? WHERE id=?`, now(), method, agentID)
+		owner_verified_at=?, owner_verification_method=?, owner_pending_at=0 WHERE id=?`, now(), method, agentID)
 	if err != nil {
 		return err
 	}
@@ -742,6 +825,106 @@ func (s *Store) DeleteAgent(agentID string) (Agent, []string, error) {
 		return a, nil, err
 	}
 	return a, activeTokens, nil
+}
+
+type StaleAgentDeletion struct {
+	Agent        Agent
+	ActiveTokens []string
+}
+
+// SweepStaleUnverifiedOwnerAgents removes abandoned mailbox nominations after
+// their own pending window. The eligibility predicate is rechecked in the
+// delete transaction, so a verification that commits first always wins. Flat
+// and fleet agents are both covered; a subsequent pending-person sweep releases
+// any now-empty unverified handle.
+func (s *Store) SweepStaleUnverifiedOwnerAgents(ttlSeconds int64) ([]StaleAgentDeletion, error) {
+	cutoff := now() - ttlSeconds
+	rows, err := s.DB.Query(`SELECT id FROM agents WHERE owner_email<>'' AND owner_verified=0
+		AND owner_pending_at>0 AND owner_pending_at<=?`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	var deleted []StaleAgentDeletion
+	for _, id := range ids {
+		tx, err := s.DB.Begin()
+		if err != nil {
+			return deleted, err
+		}
+		a, err := scanAgent(tx.QueryRow(`SELECT `+agentCols+` FROM agents WHERE id=?
+			AND owner_email<>'' AND owner_verified=0 AND owner_pending_at>0 AND owner_pending_at<=?`, id, cutoff))
+		if errors.Is(err, ErrNotFound) {
+			tx.Rollback()
+			continue
+		}
+		if err != nil {
+			tx.Rollback()
+			return deleted, err
+		}
+		lrows, err := tx.Query(`SELECT token FROM links WHERE agent_id=? AND status='active'`, id)
+		if err != nil {
+			tx.Rollback()
+			return deleted, err
+		}
+		var tokens []string
+		for lrows.Next() {
+			var token string
+			if err := lrows.Scan(&token); err != nil {
+				lrows.Close()
+				tx.Rollback()
+				return deleted, err
+			}
+			tokens = append(tokens, token)
+		}
+		if err := lrows.Err(); err != nil {
+			lrows.Close()
+			tx.Rollback()
+			return deleted, err
+		}
+		if err := lrows.Close(); err != nil {
+			tx.Rollback()
+			return deleted, err
+		}
+		for _, q := range []string{
+			`DELETE FROM counters WHERE agent_id=?`,
+			`DELETE FROM verify_tokens WHERE agent_id=?`,
+		} {
+			if _, err := tx.Exec(q, id); err != nil {
+				tx.Rollback()
+				return deleted, err
+			}
+		}
+		res, err := tx.Exec(`DELETE FROM agents WHERE id=? AND owner_verified=0
+			AND owner_pending_at>0 AND owner_pending_at<=?`, id, cutoff)
+		if err != nil {
+			tx.Rollback()
+			return deleted, err
+		}
+		if changed, _ := res.RowsAffected(); changed != 1 {
+			tx.Rollback()
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, StaleAgentDeletion{Agent: a, ActiveTokens: tokens})
+	}
+	return deleted, nil
 }
 
 // SetAlwaysCC sets the per-agent "always CC my owner" flag.
@@ -879,33 +1062,78 @@ func boolInt(b bool) int {
 	return 0
 }
 
+const maxInt64 = int64(^uint64(0) >> 1)
+
+func addStorageBytes(a, b int64) (int64, error) {
+	if a < 0 || b < 0 || a > maxInt64-b {
+		return 0, fmt.Errorf("invalid or overflowing storage byte count: %d + %d", a, b)
+	}
+	return a + b, nil
+}
+
+func storageBytesExceed(used, additional, limit int64) bool {
+	if used < 0 || additional < 0 || limit < 0 || used > limit {
+		return true
+	}
+	return additional > limit-used
+}
+
 // ---- disk guard ----
 
 // SetDiskReserve sets the free-space floor (bytes) below which DiskFull
 // reports true. 0 disables the guard.
-func (s *Store) SetDiskReserve(bytes int64) { s.diskReserve = bytes }
+func (s *Store) SetDiskReserve(bytes int64) {
+	s.diskWriteMu.Lock()
+	s.diskReserve = bytes
+	s.diskWriteMu.Unlock()
+}
+
+func (s *Store) currentVolumeStats() (int64, int64, error) {
+	return s.volumeStatsAt(s.dataDir)
+}
+
+func (s *Store) volumeStatsAt(path string) (int64, int64, error) {
+	stats := s.volumeStats
+	if stats == nil {
+		stats = VolumeStats
+	}
+	return stats(path)
+}
 
 // DiskFull reports whether the volume holding the data dir is below the
 // configured free-space reserve — the global backstop that keeps the disk
 // from ever reaching 100% (where SQLite writes start failing and the whole
 // instance falls over). Callers refuse new uploads while it holds.
 func (s *Store) DiskFull() bool {
-	if s.diskReserve <= 0 {
+	s.diskWriteMu.Lock()
+	reserve := s.diskReserve
+	pending := s.diskPending
+	s.diskWriteMu.Unlock()
+	if reserve <= 0 {
 		return false
 	}
-	free, _, err := VolumeStats(s.dataDir)
+	free, _, err := s.currentVolumeStats()
 	if err != nil {
 		return false // can't measure — never lock the instance out on that
 	}
-	return free < s.diskReserve
+	return free-pending < reserve
 }
 
 // DiskStats returns the data-dir volume's free and total bytes plus the
 // configured reserve (0 = guard disabled). free/total are 0 when the
 // platform can't report them.
 func (s *Store) DiskStats() (free, total, reserve int64) {
-	free, total, _ = VolumeStats(s.dataDir)
-	return free, total, s.diskReserve
+	return s.DiskStatsAt(s.dataDir)
+}
+
+// DiskStatsAt is DiskStats for another service-owned path. It is used for
+// derived app build contexts, which operators may place on a separate volume.
+func (s *Store) DiskStatsAt(path string) (free, total, reserve int64) {
+	free, total, _ = s.volumeStatsAt(path)
+	s.diskWriteMu.Lock()
+	reserve = s.diskReserve
+	s.diskWriteMu.Unlock()
+	return free, total, reserve
 }
 
 // ---- blobs ----
@@ -971,19 +1199,53 @@ type diskGuardBlobWriter struct {
 }
 
 func (w *diskGuardBlobWriter) Write(p []byte) (int, error) {
-	if w.s.diskReserve > 0 {
-		free, _, statErr := VolumeStats(w.s.dataDir)
-		if statErr == nil && free-w.s.diskReserve < int64(len(p)) {
-			return 0, ErrDiskReserve
-		}
-	}
-	n, err := w.file.Write(p)
+	n, err := w.s.WriteWithDiskReserve(w.s.dataDir, w.file, p)
 	if n > 0 {
 		if _, hashErr := w.hash.Write(p[:n]); err == nil && hashErr != nil {
 			err = hashErr
 		}
 	}
 	return n, err
+}
+
+// WriteWithDiskReserve admits and performs one filesystem write without
+// allowing concurrent blob or build-context streams to spend the same free
+// headroom. path identifies the volume containing dst.
+func (s *Store) WriteWithDiskReserve(path string, dst io.Writer, p []byte) (int, error) {
+	release, err := s.admitDiskWriteAt(path, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return dst.Write(p)
+}
+
+// admitDiskWrite reserves one pending filesystem write against the measured
+// free-space floor. The reservation spans the unlocked Write call and is
+// released only afterward, when allocation is observable to the next statfs.
+func (s *Store) admitDiskWrite(size int64) (func(), error) {
+	return s.admitDiskWriteAt(s.dataDir, size)
+}
+
+func (s *Store) admitDiskWriteAt(path string, size int64) (func(), error) {
+	noop := func() {}
+	s.diskWriteMu.Lock()
+	if s.diskReserve <= 0 {
+		s.diskWriteMu.Unlock()
+		return noop, nil
+	}
+	free, _, statErr := s.volumeStatsAt(path)
+	if statErr == nil && free-s.diskReserve-s.diskPending < size {
+		s.diskWriteMu.Unlock()
+		return nil, ErrDiskReserve
+	}
+	s.diskPending += size
+	s.diskWriteMu.Unlock()
+	return func() {
+		s.diskWriteMu.Lock()
+		s.diskPending -= size
+		s.diskWriteMu.Unlock()
+	}, nil
 }
 
 // OpenBlob opens a blob for reading.
@@ -1016,11 +1278,18 @@ const blobReferencedSQL = `EXISTS (SELECT 1 FROM files WHERE files.sha256=blobs.
 // (or refreshes) the row moments before its first file/link reference lands, so
 // a fresh created_at keeps a not-yet-referenced blob out of GC. The row DELETE
 // re-checks the reference predicate AND age, so a blob referenced or re-put
-// since the scan is left alone. And each delete + unlink pair runs under blobMu
-// so it can't interleave with PutBlob's row-write + byte-write pair — without
-// the lock, a dedup upload could see the bytes on disk, skip writing them, and
-// then lose them to the unlink.
+// since the scan is left alone. Each candidate is rechecked in a transaction
+// and atomically renamed to a same-filesystem tomb before metadata is deleted.
+// A failed DB delete/commit renames it back; after commit the tomb is unlinked.
+// Tombs left by a crash are reconciled on the next run (restored when their DB
+// row remains, removed otherwise). blobMu prevents PutBlob from interleaving.
 func (s *Store) DeleteOrphanBlobs() (int, error) {
+	s.blobMu.Lock()
+	tombErr := s.reconcileBlobTombs()
+	s.blobMu.Unlock()
+	if tombErr != nil {
+		return 0, tombErr
+	}
 	grace := now() - 300
 	rows, err := s.DB.Query(`SELECT sha256 FROM blobs WHERE created_at<=? AND NOT (`+blobReferencedSQL+`)`, grace)
 	if err != nil {
@@ -1037,19 +1306,159 @@ func (s *Store) DeleteOrphanBlobs() (int, error) {
 	}
 	rows.Close()
 	n := 0
+	var firstErr error
 	for _, sha := range shas {
 		s.blobMu.Lock()
-		res, err := s.DB.Exec(`DELETE FROM blobs WHERE sha256=? AND created_at<=? AND NOT (`+blobReferencedSQL+`)`, sha, grace)
-		if err == nil {
-			if k, _ := res.RowsAffected(); k == 1 {
-				if err := os.Remove(s.blobPath(sha)); err == nil || os.IsNotExist(err) {
-					n++
+		tx, txErr := s.DB.Begin()
+		if txErr == nil {
+			var one int
+			txErr = tx.QueryRow(`SELECT 1 FROM blobs WHERE sha256=? AND created_at<=?
+				AND NOT (`+blobReferencedSQL+`)`, sha, grace).Scan(&one)
+			if errors.Is(txErr, sql.ErrNoRows) {
+				txErr = nil // candidate gained a reference or was refreshed
+				tx.Rollback()
+			} else if txErr == nil {
+				src := s.blobPath(sha)
+				tombDir := filepath.Join(s.dataDir, "blob-tombs")
+				tomb := filepath.Join(tombDir, sha+"."+randToken(6))
+				renamed := false
+				if txErr = os.MkdirAll(tombDir, 0o700); txErr == nil {
+					var info os.FileInfo
+					info, txErr = os.Lstat(src)
+					if os.IsNotExist(txErr) {
+						txErr = nil // metadata-only orphan from an older failure
+					} else if txErr == nil && !info.Mode().IsRegular() {
+						txErr = fmt.Errorf("blob path %s is not a regular file", src)
+					} else if txErr == nil {
+						txErr = os.Rename(src, tomb)
+						if txErr == nil {
+							renamed = true
+						}
+					}
 				}
+				if txErr == nil {
+					var res sql.Result
+					res, txErr = tx.Exec(`DELETE FROM blobs WHERE sha256=?`, sha)
+					if txErr == nil {
+						if deleted, _ := res.RowsAffected(); deleted != 1 {
+							txErr = fmt.Errorf("delete blob metadata changed %d rows", deleted)
+						}
+					}
+				}
+				committed := false
+				commitAttempted := false
+				if txErr == nil {
+					commitAttempted = true
+					commitErr := tx.Commit()
+					if commitErr == nil {
+						committed = true
+					} else {
+						committed, txErr = s.resolveAmbiguousBlobCommit(sha, src, tomb, renamed, commitErr)
+					}
+				} else {
+					tx.Rollback()
+				}
+				if txErr != nil && renamed && !committed && !commitAttempted {
+					if restoreErr := os.Rename(tomb, src); restoreErr != nil {
+						txErr = fmt.Errorf("%v; restore blob after DB failure: %w", txErr, restoreErr)
+					}
+				} else if committed {
+					n++
+					if renamed {
+						if unlinkErr := os.Remove(tomb); unlinkErr != nil && !os.IsNotExist(unlinkErr) {
+							txErr = unlinkErr // next run retries tomb cleanup
+						}
+					}
+				}
+			} else {
+				tx.Rollback()
 			}
 		}
 		s.blobMu.Unlock()
+		if txErr != nil && firstErr == nil {
+			firstErr = txErr
+		}
 	}
-	return n, nil
+	return n, firstErr
+}
+
+// resolveAmbiguousBlobCommit determines whether a failed Commit call actually
+// committed. SQLite can report a commit error after the durable outcome is no
+// longer safely inferable from that call alone. The metadata row is the source
+// of truth: restore a tomb only while the row survives; if the row is gone,
+// treat the delete as committed and discard the tomb. A failed recheck leaves
+// the tomb in place for reconcileBlobTombs instead of guessing.
+func (s *Store) resolveAmbiguousBlobCommit(sha, src, tomb string, renamed bool, commitErr error) (bool, error) {
+	var one int
+	err := s.DB.QueryRow(`SELECT 1 FROM blobs WHERE sha256=?`, sha).Scan(&one)
+	switch {
+	case err == nil:
+		if renamed {
+			if restoreErr := os.Rename(tomb, src); restoreErr != nil {
+				return false, fmt.Errorf("%v; restore blob after ambiguous DB failure: %w", commitErr, restoreErr)
+			}
+		}
+		return false, commitErr
+	case errors.Is(err, sql.ErrNoRows):
+		if renamed {
+			if unlinkErr := os.Remove(tomb); unlinkErr != nil && !os.IsNotExist(unlinkErr) {
+				return true, unlinkErr
+			}
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("%v; determine blob commit outcome: %w", commitErr, err)
+	}
+}
+
+// reconcileBlobTombs completes or rolls back a GC operation interrupted after
+// the filesystem rename. A surviving metadata row means the transaction did
+// not commit and the bytes belong at their canonical path; no row means the
+// committed tomb can be discarded.
+func (s *Store) reconcileBlobTombs() error {
+	dir := filepath.Join(s.dataDir, "blob-tombs")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		sha, _, ok := strings.Cut(entry.Name(), ".")
+		if !ok || sha == "" {
+			continue
+		}
+		tomb := filepath.Join(dir, entry.Name())
+		var one int
+		err := s.DB.QueryRow(`SELECT 1 FROM blobs WHERE sha256=?`, sha).Scan(&one)
+		switch {
+		case err == nil:
+			dst := s.blobPath(sha)
+			if _, statErr := os.Stat(dst); os.IsNotExist(statErr) {
+				if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+					return err
+				}
+				if err := os.Rename(tomb, dst); err != nil {
+					return err
+				}
+			} else if statErr != nil {
+				return statErr
+			} else if err := os.Remove(tomb); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			if err := os.Remove(tomb); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		default:
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- files (the folder) ----
@@ -1153,7 +1562,12 @@ func (s *Store) FileEntry(agentID, sha, name string) (File, error) {
 // DeleteFile removes folder entries for a hash. It returns the removed entries;
 // the blob is reclaimed by orphan GC once nothing references it.
 func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
-	rows, err := s.DB.Query(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND sha256=?`, agentID, sha)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT `+fileCols+` FROM files WHERE agent_id=? AND sha256=?`, agentID, sha)
 	if err != nil {
 		return nil, err
 	}
@@ -1166,19 +1580,28 @@ func (s *Store) DeleteFile(agentID, sha string) ([]File, error) {
 		}
 		files = append(files, f)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	if len(files) == 0 {
 		return nil, ErrNotFound
 	}
-	res, err := s.DB.Exec(`DELETE FROM files WHERE agent_id=? AND sha256=?`, agentID, sha)
+	res, err := tx.Exec(`DELETE FROM files WHERE agent_id=? AND sha256=?`, agentID, sha)
 	if err != nil {
 		return nil, err
 	}
 	deleted, _ := res.RowsAffected()
-	if deleted == 0 {
-		return nil, ErrNotFound
+	if deleted != int64(len(files)) {
+		return nil, fmt.Errorf("delete file changed %d rows after selecting %d", deleted, len(files))
 	}
-	return files[:deleted], nil
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // DeleteFileEntry removes one exact folder entry. It is used for temporary
@@ -1216,17 +1639,47 @@ func (s *Store) KeepFile(agentID, sha string, expiresAt int64) (File, error) {
 }
 
 // StorageUsed sums distinct blobs attributable to an agent: anything in its
-// folder, plus anything it posted as a file event to a space. Space events are
-// durable blob references, so continuing to charge them after the folder row
-// is deleted closes an otherwise-unbounded upload→post→delete quota bypass.
-// A blob present in both places (or posted repeatedly) is counted only once.
+// folder or active links, plus every file pinned by a space it owns. Charging
+// all space storage to the durable owner_id avoids tying accounting to actor
+// email strings, which can be deleted and later re-registered by an unrelated
+// identity. A blob present in several places is counted only once.
 func (s *Store) StorageUsed(agentID string) (int64, error) {
 	var n sql.NullInt64
 	err := s.DB.QueryRow(`SELECT SUM(b.size) FROM blobs b WHERE
 		EXISTS (SELECT 1 FROM files f WHERE f.agent_id=? AND f.sha256=b.sha256)
-		OR EXISTS (SELECT 1 FROM space_events e JOIN agents a ON a.id=?
-			WHERE e.kind='file' AND e.actor=a.email AND e.sha256=b.sha256)`, agentID, agentID).Scan(&n)
-	return n.Int64, err
+		OR EXISTS (SELECT 1 FROM links l WHERE l.agent_id=? AND l.sha256=b.sha256
+			AND l.status='active' AND l.expires_at>?)
+		OR EXISTS (SELECT 1 FROM space_events e JOIN spaces sp ON sp.id=e.space_id
+			WHERE e.kind='file' AND e.sha256=b.sha256 AND sp.owner_id=?)`,
+		agentID, agentID, now(), agentID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if n.Int64 < 0 {
+		return 0, fmt.Errorf("invalid negative storage usage %d", n.Int64)
+	}
+	return n.Int64, nil
+}
+
+// AgentUsesStorageBlob reports whether sha is already part of the agent's
+// logical storage charge. Adding another folder name for already-charged bytes
+// must not consume the blob's size a second time.
+func (s *Store) AgentUsesStorageBlob(agentID, sha string) (bool, error) {
+	var one int
+	err := s.DB.QueryRow(`SELECT 1 WHERE
+		EXISTS (SELECT 1 FROM files WHERE agent_id=? AND sha256=?)
+		OR EXISTS (SELECT 1 FROM links WHERE agent_id=? AND sha256=?
+			AND status='active' AND expires_at>?)
+		OR EXISTS (SELECT 1 FROM space_events e JOIN spaces sp ON sp.id=e.space_id
+			WHERE e.kind='file' AND e.sha256=? AND sp.owner_id=?)`,
+		agentID, sha, agentID, sha, now(), sha, agentID).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
 }
 
 // StorageConsumer is one row of the admin "top storage consumers" view.
@@ -1236,20 +1689,36 @@ type StorageConsumer struct {
 	Email         string `json:"email"`
 	OwnerEmail    string `json:"owner_email"`
 	OwnerVerified bool   `json:"owner_verified"`
-	Files         int64  `json:"files"`
-	Bytes         int64  `json:"bytes"`
+	// Files is the number of distinct blobs in this agent's logical transfer
+	// charge. The JSON name is retained for API compatibility.
+	Files int64 `json:"files"`
+	Bytes int64 `json:"bytes"`
 }
 
-// TopStorageConsumers returns agents ordered by folder bytes, biggest first —
-// abuse cleanup starts with being able to SEE who holds the disk.
+// TopStorageConsumers ranks the same distinct logical blob set StorageUsed
+// enforces: folder rows, unexpired active links, and file events in spaces the
+// agent owns. Repeated names/references to one sha count once.
 func (s *Store) TopStorageConsumers(limit int) ([]StorageConsumer, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.DB.Query(`SELECT a.id, a.name, a.email, a.owner_email, a.owner_verified,
-			COUNT(f.id), COALESCE(SUM(f.size),0) AS bytes
-		FROM agents a LEFT JOIN files f ON f.agent_id=a.id
-		GROUP BY a.id ORDER BY bytes DESC, a.created_at LIMIT ?`, limit)
+	rows, err := s.DB.Query(`WITH charged_refs(agent_id,sha256) AS (
+			SELECT agent_id,sha256 FROM files
+			UNION
+			SELECT agent_id,sha256 FROM links
+				WHERE status='active' AND expires_at>?
+			UNION
+			SELECT sp.owner_id,e.sha256 FROM space_events e
+				JOIN spaces sp ON sp.id=e.space_id WHERE e.kind='file'
+		), charges AS (
+			SELECT r.agent_id,COUNT(*) AS blobs,COALESCE(SUM(b.size),0) AS bytes
+			FROM charged_refs r JOIN blobs b ON b.sha256=r.sha256
+			GROUP BY r.agent_id
+		)
+		SELECT a.id,a.name,a.email,a.owner_email,a.owner_verified,
+			COALESCE(c.blobs,0),COALESCE(c.bytes,0) AS bytes
+		FROM agents a LEFT JOIN charges c ON c.agent_id=a.id
+		ORDER BY bytes DESC,a.created_at LIMIT ?`, now(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1279,7 +1748,12 @@ func (s *Store) StoredBytes() (int64, error) {
 // and unverified-tier uploads alike (expires_at=0 means immortal). It returns
 // the expired entries (for receipts).
 func (s *Store) ExpireFiles(cutoff int64) ([]File, error) {
-	rows, err := s.DB.Query(`SELECT `+fileCols+` FROM files WHERE expires_at>0 AND expires_at<=?`, cutoff)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT `+fileCols+` FROM files WHERE expires_at>0 AND expires_at<=?`, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -1292,10 +1766,19 @@ func (s *Store) ExpireFiles(cutoff int64) ([]File, error) {
 		}
 		files = append(files, f)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	expired := files[:0]
 	for _, f := range files {
-		res, err := s.DB.Exec(`DELETE FROM files WHERE id=?`, f.ID)
+		// Recheck the expiry predicate in the mutation itself. If KeepFile or
+		// owner verification committed first, this delete is a no-op; if this
+		// transaction commits first, the concurrent keeper observes not-found.
+		res, err := tx.Exec(`DELETE FROM files WHERE id=? AND expires_at>0 AND expires_at<=?`, f.ID, cutoff)
 		if err != nil {
 			return nil, err
 		}
@@ -1303,6 +1786,9 @@ func (s *Store) ExpireFiles(cutoff int64) ([]File, error) {
 			continue // someone else deleted it first
 		}
 		expired = append(expired, f)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return expired, nil
 }
@@ -1317,10 +1803,26 @@ func (s *Store) CreateLink(agentID, sha, name, mime string, size int64, once boo
 		Size: size, Once: once, Status: "active",
 		ExpiresAt: time.Now().Add(ttl).Unix(), CreatedAt: now(),
 	}
-	_, err := s.DB.Exec(`INSERT INTO links(token,agent_id,sha256,name,mime,size,once,downloads,status,expires_at,created_at)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return Link{}, err
+	}
+	defer tx.Rollback()
+	var live int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM links
+		WHERE agent_id=? AND status='active' AND expires_at>?`, agentID, now()).Scan(&live); err != nil {
+		return Link{}, err
+	}
+	if live >= MaxActiveLinksPerAgent {
+		return Link{}, fmt.Errorf("%w: at most %d active links per agent", ErrLimit, MaxActiveLinksPerAgent)
+	}
+	_, err = tx.Exec(`INSERT INTO links(token,agent_id,sha256,name,mime,size,once,downloads,status,expires_at,created_at)
 		VALUES(?,?,?,?,?,?,?,0,'active',?,?)`,
 		l.Token, l.AgentID, l.SHA256, l.Name, l.MIME, l.Size, boolInt(l.Once), l.ExpiresAt, l.CreatedAt)
-	return l, err
+	if err != nil {
+		return l, err
+	}
+	return l, tx.Commit()
 }
 
 const linkCols = `token,agent_id,sha256,name,mime,size,once,downloads,status,expires_at,created_at`
@@ -1445,10 +1947,41 @@ func (s *Store) CountDownload(token string) error {
 	return err
 }
 
+// CountActiveDownload claims a download only while the capability remains
+// active and unexpired. This is used by inline transports that have buffered
+// the body but have not exposed it to their caller yet.
+func (s *Store) CountActiveDownload(token string) error {
+	res, err := s.DB.Exec(`UPDATE links SET downloads=downloads+1
+		WHERE token=? AND status='active' AND expires_at>?`, token, now())
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ---- messages ----
 
-// AddMessage inserts an inbox row for an agent.
+const messageStorageBytesSQL = `
+	LENGTH(CAST(from_addr AS BLOB))+LENGTH(CAST(to_addrs AS BLOB))+
+	LENGTH(CAST(subject AS BLOB))+LENGTH(CAST(body AS BLOB))+
+	LENGTH(CAST(message_id AS BLOB))+LENGTH(CAST(in_reply_to AS BLOB))+
+	LENGTH(CAST(refs AS BLOB))+LENGTH(CAST(manifest AS BLOB))+
+	LENGTH(CAST(attachments AS BLOB))+LENGTH(CAST(dkim AS BLOB))+
+	LENGTH(CAST(spf AS BLOB))`
+
+// AddMessage inserts an inbox row for an agent. When the durable inbox is at
+// its count or byte ceiling, the oldest read messages are evicted in the same
+// transaction to make room. Unread messages are never silently discarded.
 func (s *Store) AddMessage(m Message) (Message, error) {
+	return s.addMessageLimited(m, MaxInboxMessagesPerAgent, MaxInboxBytesPerAgent)
+}
+
+// addMessageLimited carries explicit limits so boundary behavior can be tested
+// without constructing a 256 MiB fixture. Production always calls AddMessage.
+func (s *Store) addMessageLimited(m Message, maxMessages, maxBytes int64) (Message, error) {
 	if m.ID == "" {
 		m.ID = NewID("msg")
 	}
@@ -1460,10 +1993,66 @@ func (s *Store) AddMessage(m Message) (Message, error) {
 	if m.Attachments == nil {
 		attJSON = []byte("[]")
 	}
-	_, err := s.DB.Exec(`INSERT INTO messages(id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,quarantined,received_at)
+	incomingBytes := int64(len(m.From) + len(toJSON) + len(m.Subject) + len(m.Text) + len(m.MessageID) +
+		len(m.InReplyTo) + len(m.References) + len(m.Manifest) + len(attJSON) + len(m.DKIM) + len(m.SPF))
+	if maxMessages <= 0 || maxBytes <= 0 || incomingBytes > maxBytes {
+		return m, fmt.Errorf("%w: incoming message is %d bytes (max %d)", ErrInboxFull, incomingBytes, maxBytes)
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return m, err
+	}
+	defer tx.Rollback()
+	var count, used int64
+	if err := tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(`+messageStorageBytesSQL+`),0)
+		FROM messages WHERE agent_id=?`, m.AgentID).Scan(&count, &used); err != nil {
+		return m, err
+	}
+	if count >= maxMessages || storageBytesExceed(used, incomingBytes, maxBytes) {
+		rows, err := tx.Query(`SELECT id,received_at,`+messageStorageBytesSQL+`
+			FROM messages WHERE agent_id=? AND read=1 ORDER BY received_at,id`, m.AgentID)
+		if err != nil {
+			return m, err
+		}
+		var removed int64
+		var cutoffID string
+		var cutoffReceived int64
+		for rows.Next() {
+			var rowBytes int64
+			if err := rows.Scan(&cutoffID, &cutoffReceived, &rowBytes); err != nil {
+				rows.Close()
+				return m, err
+			}
+			removed++
+			count--
+			used -= rowBytes
+			if count < maxMessages && !storageBytesExceed(used, incomingBytes, maxBytes) {
+				break
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return m, err
+		}
+		if count >= maxMessages || storageBytesExceed(used, incomingBytes, maxBytes) {
+			return m, fmt.Errorf("%w: unread inbox uses %d messages / %d bytes (max %d / %d)",
+				ErrInboxFull, count, used, maxMessages, maxBytes)
+		}
+		res, err := tx.Exec(`DELETE FROM messages WHERE agent_id=? AND read=1 AND
+			(received_at<? OR (received_at=? AND id<=?))`, m.AgentID, cutoffReceived, cutoffReceived, cutoffID)
+		if err != nil {
+			return m, err
+		}
+		if n, _ := res.RowsAffected(); n != removed {
+			return m, fmt.Errorf("evicted %d read inbox messages, want %d", n, removed)
+		}
+	}
+	_, err = tx.Exec(`INSERT INTO messages(id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,quarantined,received_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
 		m.ID, m.AgentID, m.From, string(toJSON), m.Subject, m.Text, m.MessageID, m.InReplyTo, m.References, m.Manifest, string(attJSON), m.DKIM, m.SPF, boolInt(m.Quarantined), m.ReceivedAt)
-	return m, err
+	if err != nil {
+		return m, err
+	}
+	return m, tx.Commit()
 }
 
 const msgCols = `id,agent_id,from_addr,to_addrs,subject,body,message_id,in_reply_to,refs,manifest,attachments,dkim,spf,read,quarantined,received_at`
@@ -1494,10 +2083,16 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 // names an inbox row, its wire Message-ID, parent, and References become thread
 // needles so selecting a reply still returns ancestors and sibling replies.
 func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit int) ([]Message, error) {
-	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=0`
+	if limit <= 0 {
+		limit = DefaultInboxListLimit
+	}
+	if limit > MaxInboxListLimit {
+		limit = MaxInboxListLimit
+	}
+	where := `agent_id=? AND quarantined=0`
 	args := []any{agentID}
 	if unreadOnly {
-		q += ` AND read=0`
+		where += ` AND read=0`
 	}
 	if thread != "" {
 		needles := []string{thread}
@@ -1519,13 +2114,17 @@ func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit 
 			clauses = append(clauses, `instr(message_id,?)>0`, `instr(in_reply_to,?)>0`, `instr(refs,?)>0`)
 			threadArgs = append(threadArgs, needle, needle, needle)
 		}
-		q += ` AND (` + strings.Join(clauses, ` OR `) + `)`
+		where += ` AND (` + strings.Join(clauses, ` OR `) + `)`
 		args = append(args, threadArgs...)
 	}
-	q += ` ORDER BY received_at, id`
-	if limit > 0 {
-		q += fmt.Sprintf(` LIMIT %d`, limit)
-	}
+	// Select the newest bounded window, then restore chronological wire order.
+	// Limiting an ascending query would return the same oldest rows forever and
+	// hide every new arrival once a mailbox grows past the default window.
+	q := `SELECT ` + msgCols + ` FROM (
+		SELECT ` + msgCols + ` FROM messages WHERE ` + where + `
+		ORDER BY received_at DESC,id DESC LIMIT ?
+	) ORDER BY received_at,id`
+	args = append(args, limit)
 	rows, err := s.DB.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -1545,10 +2144,14 @@ func (s *Store) ListInbox(agentID string, unreadOnly bool, thread string, limit 
 // ListQuarantine returns messages held out of the main inbox by the recipient's
 // accept policy (unknown senders), newest first.
 func (s *Store) ListQuarantine(agentID string, limit int) ([]Message, error) {
-	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=1 ORDER BY received_at DESC, id`
-	if limit > 0 {
-		q += fmt.Sprintf(` LIMIT %d`, limit)
+	if limit <= 0 {
+		limit = DefaultInboxListLimit
 	}
+	if limit > MaxInboxListLimit {
+		limit = MaxInboxListLimit
+	}
+	q := `SELECT ` + msgCols + ` FROM messages WHERE agent_id=? AND quarantined=1 ORDER BY received_at DESC, id DESC`
+	q += fmt.Sprintf(` LIMIT %d`, limit)
 	rows, err := s.DB.Query(q, agentID)
 	if err != nil {
 		return nil, err
@@ -1610,7 +2213,7 @@ func (s *Store) AppendReceipt(actor, action, sha string, size int64, target, mes
 	}
 	r := receipt.Receipt{
 		V: 1, ID: NewID("rcp"), TS: time.Now().UTC().Format(time.RFC3339Nano),
-		Instance: s.instance, Actor: actor, Action: action,
+		Instance: s.Instance(), Actor: actor, Action: action,
 		SHA256: sha, Size: size, Target: target, MessageID: messageID, Prev: prev,
 	}
 	r.Sign(s.signKey)
@@ -1640,17 +2243,23 @@ func scanReceipt(row interface{ Scan(...any) error }) (receipt.Receipt, error) {
 
 const receiptCols = `seq,id,ts,instance,actor,action,sha256,size,target,message_id,prev,sig`
 
-// ListReceipts returns receipts, oldest first. actor "" means all (admin).
+// ListReceipts returns receipts in chain order (oldest first). actor "" means
+// all (admin). A positive limit selects the newest window first, then restores
+// ascending order so bounded logs show current activity without reversing the
+// receipt sequence clients verify and display.
 func (s *Store) ListReceipts(actor string, limit int) ([]receipt.Receipt, error) {
-	q := `SELECT ` + receiptCols + ` FROM receipts`
+	where := ""
 	var args []any
 	if actor != "" {
-		q += ` WHERE actor=?`
+		where = ` WHERE actor=?`
 		args = append(args, actor)
 	}
-	q += ` ORDER BY seq`
+	q := `SELECT ` + receiptCols + ` FROM receipts` + where + ` ORDER BY seq`
 	if limit > 0 {
-		q += fmt.Sprintf(` LIMIT %d`, limit)
+		q = `SELECT ` + receiptCols + ` FROM (
+			SELECT ` + receiptCols + ` FROM receipts` + where + ` ORDER BY seq DESC LIMIT ?
+		) ORDER BY seq`
+		args = append(args, limit)
 	}
 	rows, err := s.DB.Query(q, args...)
 	if err != nil {
@@ -1670,21 +2279,99 @@ func (s *Store) ListReceipts(actor string, limit int) ([]receipt.Receipt, error)
 
 // ---- idempotency ----
 
-// GetIdempotent returns a stored response for (agent, key), or "".
-func (s *Store) GetIdempotent(agentID, key string) (string, error) {
-	var resp string
-	err := s.DB.QueryRow(`SELECT response FROM idempotency WHERE agent_id=? AND key=?`, agentID, key).Scan(&resp)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return resp, err
+// schemaIdempotencyV12 replaces response-only records with request-bound
+// status/body records. In-flight rows use status=0. Old entries are deliberately
+// discarded: they lack a request fingerprint and cannot safely reject key reuse
+// with a different payload.
+const schemaIdempotencyV12 = `
+DROP TABLE idempotency;
+CREATE TABLE idempotency (
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status INTEGER NOT NULL DEFAULT 0 CHECK(status=0 OR (status>=100 AND status<=599)),
+  response BLOB NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, key)
+);
+CREATE INDEX idx_idempotency_agent_created ON idempotency(agent_id, created_at);
+`
+
+type IdempotencyRecord struct {
+	RequestHash string
+	Status      int
+	Response    []byte
+	CreatedAt   int64
 }
 
-// PutIdempotent stores a response for (agent, key).
-func (s *Store) PutIdempotent(agentID, key, response string) error {
-	_, err := s.DB.Exec(`INSERT INTO idempotency(agent_id,key,response,created_at) VALUES(?,?,?,?) ON CONFLICT(agent_id,key) DO NOTHING`,
-		agentID, key, response, now())
-	return err
+// BeginIdempotent atomically binds key to requestHash and reserves one bounded
+// in-flight record. Existing same-request records are returned for replay;
+// different-request reuse is rejected. Expired records are pruned before the
+// per-agent ceiling is checked, so invalid unique requests cannot grow SQLite
+// without bound.
+func (s *Store) BeginIdempotent(agentID, key, requestHash string) (IdempotencyRecord, bool, error) {
+	var record IdempotencyRecord
+	if key == "" || requestHash == "" {
+		return record, false, errors.New("idempotency key and request hash are required")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return record, false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM idempotency WHERE agent_id=? AND created_at<?`,
+		agentID, now()-IdempotencyTTLSeconds); err != nil {
+		return record, false, err
+	}
+	err = tx.QueryRow(`SELECT request_hash,status,response,created_at FROM idempotency
+		WHERE agent_id=? AND key=?`, agentID, key).
+		Scan(&record.RequestHash, &record.Status, &record.Response, &record.CreatedAt)
+	if err == nil {
+		if record.RequestHash != requestHash {
+			return IdempotencyRecord{}, false, ErrIdempotencyConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return IdempotencyRecord{}, false, err
+		}
+		return record, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return record, false, err
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM idempotency WHERE agent_id=?`, agentID).Scan(&count); err != nil {
+		return record, false, err
+	}
+	if count >= MaxIdempotencyRowsPerAgent {
+		return record, false, fmt.Errorf("%w: at most %d idempotency records per agent", ErrLimit, MaxIdempotencyRowsPerAgent)
+	}
+	record = IdempotencyRecord{RequestHash: requestHash, CreatedAt: now()}
+	if _, err := tx.Exec(`INSERT INTO idempotency(agent_id,key,request_hash,status,response,created_at)
+		VALUES(?,?,?,0,'',?)`, agentID, key, requestHash, record.CreatedAt); err != nil {
+		return IdempotencyRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return IdempotencyRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+// CompleteIdempotent commits the exact HTTP status and JSON bytes for replay.
+// Only the request that owns the matching pending reservation may complete it.
+func (s *Store) CompleteIdempotent(agentID, key, requestHash string, status int, response []byte) error {
+	if status < 100 || status > 599 || len(response) == 0 {
+		return errors.New("invalid idempotency response")
+	}
+	res, err := s.DB.Exec(`UPDATE idempotency SET status=?,response=?
+		WHERE agent_id=? AND key=? AND request_hash=? AND status=0`,
+		status, response, agentID, key, requestHash)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ---- verification tokens ----
@@ -1761,6 +2448,15 @@ func (s *Store) ConsumeVerifyToken(tok string) (string, error) {
 // verified bit. Either ordering prevents an old click from blessing a new
 // mailbox nomination.
 func (s *Store) VerifyOwnerToken(tok string) (string, error) {
+	return s.VerifyOwnerTokenLimited(tok, 0)
+}
+
+// VerifyOwnerTokenLimited claims a human-verified mailbox slot in the same
+// transaction that consumes the challenge and flips owner_verified. Pending
+// nominations do not count; maxVerified<=0 is unlimited for operator/internal
+// flows. A cap failure rolls the token deletion back so it can be retried after
+// the owner frees a verified slot.
+func (s *Store) VerifyOwnerTokenLimited(tok string, maxVerified int64) (string, error) {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return "", err
@@ -1775,7 +2471,20 @@ func (s *Store) VerifyOwnerToken(tok string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	res, err := tx.Exec(`UPDATE agents SET owner_verified=1,owner_verified_at=?,owner_verification_method='email'
+	if maxVerified > 0 {
+		var verified int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM agents
+			WHERE id<>? AND owner_verified=1 AND owner_verification_method='email'
+			AND lower(owner_email)=lower(?)`, agentID, challengedEmail).Scan(&verified); err != nil {
+			return "", err
+		}
+		if verified >= maxVerified {
+			return "", fmt.Errorf("%w: mailbox already has %d verified agents (max %d)",
+				ErrOwnerAgentLimit, verified, maxVerified)
+		}
+	}
+	res, err := tx.Exec(`UPDATE agents SET owner_verified=1,owner_verified_at=?,
+		owner_verification_method='email',owner_pending_at=0
 		WHERE id=? AND lower(owner_email)=lower(?)`, now(), agentID, challengedEmail)
 	if err != nil {
 		return "", err
@@ -1804,9 +2513,25 @@ func (s *Store) CreateUploadRequest(agentID, note string, ttl time.Duration) (Up
 		Token: NewLinkToken(), AgentID: agentID, Note: note,
 		ExpiresAt: time.Now().Add(ttl).Unix(), CreatedAt: now(),
 	}
-	_, err := s.DB.Exec(`INSERT INTO upload_requests(token,agent_id,note,used,expires_at,created_at) VALUES(?,?,?,0,?,?)`,
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return UploadRequest{}, err
+	}
+	defer tx.Rollback()
+	var live int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM upload_requests
+		WHERE agent_id=? AND used=0 AND expires_at>?`, agentID, now()).Scan(&live); err != nil {
+		return UploadRequest{}, err
+	}
+	if live >= MaxUploadRequestsPerAgent {
+		return UploadRequest{}, fmt.Errorf("%w: at most %d live upload requests per agent", ErrLimit, MaxUploadRequestsPerAgent)
+	}
+	_, err = tx.Exec(`INSERT INTO upload_requests(token,agent_id,note,used,expires_at,created_at) VALUES(?,?,?,0,?,?)`,
 		u.Token, u.AgentID, u.Note, u.ExpiresAt, u.CreatedAt)
-	return u, err
+	if err != nil {
+		return u, err
+	}
+	return u, tx.Commit()
 }
 
 // GetUploadRequest fetches a live (unused, unexpired) upload request.
@@ -1837,6 +2562,45 @@ func (s *Store) UseUploadRequest(token string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n == 1, nil
+}
+
+// UseUploadRequestWithFile consumes a one-time request and creates its folder
+// entry in one transaction. A foreign-key, blob, or file insert failure rolls
+// the token update back, so a retryable storage failure cannot burn the page.
+func (s *Store) UseUploadRequestWithFile(token, agentID, sha, name, mime string, size int64, expiresAt int64) (File, bool, error) {
+	f := File{
+		ID: NewID("fil"), AgentID: agentID, SHA256: sha, Name: safeName(name), MIME: mime,
+		Size: size, Source: "request", Claimed: false, ExpiresAt: expiresAt, CreatedAt: now(),
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return File{}, false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE upload_requests SET used=1
+		WHERE token=? AND agent_id=? AND used=0 AND expires_at>?`, token, agentID, now())
+	if err != nil {
+		return File{}, false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return File{}, false, nil
+	}
+	if _, err := tx.Exec(`INSERT INTO files(id,agent_id,sha256,name,mime,size,source,claimed,expires_at,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(agent_id,name,sha256) DO UPDATE SET
+			expires_at=CASE WHEN files.claimed=1 THEN files.expires_at ELSE excluded.expires_at END`,
+		f.ID, f.AgentID, f.SHA256, f.Name, f.MIME, f.Size, f.Source, 0, f.ExpiresAt, f.CreatedAt); err != nil {
+		return File{}, false, err
+	}
+	f, err = scanFile(tx.QueryRow(`SELECT `+fileCols+` FROM files
+		WHERE agent_id=? AND name=? AND sha256=?`, agentID, f.Name, sha))
+	if err != nil {
+		return File{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return File{}, false, err
+	}
+	return f, true, nil
 }
 
 // ---- daily counters (rate limits) ----
@@ -1876,6 +2640,16 @@ func (s *Store) Prune() error {
 		return err
 	}
 	if _, err := s.DB.Exec(`DELETE FROM upload_requests WHERE expires_at<? OR used=1`, now()-24*3600); err != nil {
+		return err
+	}
+	if _, err := s.DB.Exec(`DELETE FROM links WHERE status<>'active' AND
+		((status='expired' AND expires_at<?) OR (status<>'expired' AND created_at<?))`,
+		now()-7*24*3600, now()-7*24*3600); err != nil {
+		return err
+	}
+	if _, err := s.DB.Exec(`DELETE FROM messages WHERE
+		(read=1 AND received_at<?) OR (quarantined=1 AND received_at<?)`,
+		now()-30*24*3600, now()-14*24*3600); err != nil {
 		return err
 	}
 	day := time.Now().UTC().AddDate(0, 0, -2).Format("2006-01-02")

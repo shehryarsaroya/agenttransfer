@@ -91,9 +91,51 @@ func (c *Client) Health(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) Readiness(ctx context.Context) (RunnerReadiness, error) {
+	var out healthResult
+	if err := c.do(ctx, http.MethodGet, apiPrefix+"/health", nil, &out); err != nil {
+		return RunnerReadiness{}, err
+	}
+	return RunnerReadiness{
+		DockerHealthy: out.OK, ContainerReady: out.ContainerReady, ContainerState: out.ContainerState,
+	}, nil
+}
+
+// ContainerReady includes Docker health and a proven runtime networking path.
+// Health alone remains useful while an internal bridge has not yet been
+// proven host-routable by a running managed container.
+func (c *Client) ContainerReady(ctx context.Context) error {
+	out, err := c.Readiness(ctx)
+	if err != nil {
+		return err
+	}
+	if !out.DockerHealthy {
+		return errors.New("apphost: runner reported unhealthy")
+	}
+	if !out.ContainerReady {
+		return fmt.Errorf("apphost: container network is %s", out.ContainerState)
+	}
+	return nil
+}
+
 func (c *Client) Build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 	var out BuildResult
 	err := c.do(ctx, http.MethodPost, apiPrefix+"/build", req, &out)
+	return out, err
+}
+
+// RemoveImage idempotently removes the exact managed build tag derived from
+// appID and releaseID. It cannot target arbitrary Docker images.
+func (c *Client) RemoveImage(ctx context.Context, appID, releaseID string) (RemoveImageResult, error) {
+	if err := validateAppID(appID); err != nil {
+		return RemoveImageResult{}, err
+	}
+	if !releaseIDPattern.MatchString(releaseID) {
+		return RemoveImageResult{}, errors.New("invalid release_id")
+	}
+	var out RemoveImageResult
+	err := c.do(ctx, http.MethodPost, apiPrefix+"/apps/"+url.PathEscape(appID)+
+		"/images/"+url.PathEscape(releaseID)+"/remove", nil, &out)
 	return out, err
 }
 
@@ -118,6 +160,17 @@ func (c *Client) RuntimeStatus(ctx context.Context, runtimeID string) (AppStatus
 	}
 	var out AppStatus
 	err := c.do(ctx, http.MethodGet, apiPrefix+"/runtimes/"+url.PathEscape(runtimeID)+"/status", nil, &out)
+	return out, err
+}
+
+// RuntimeRoute returns runner-validated routing metadata without scanning the
+// runtime's persistent data tree.
+func (c *Client) RuntimeRoute(ctx context.Context, runtimeID string) (AppStatus, error) {
+	if err := validateRuntimeID(runtimeID); err != nil {
+		return AppStatus{}, err
+	}
+	var out AppStatus
+	err := c.do(ctx, http.MethodGet, apiPrefix+"/runtimes/"+url.PathEscape(runtimeID)+"/route", nil, &out)
 	return out, err
 }
 
@@ -176,6 +229,18 @@ func (c *Client) StopRuntime(ctx context.Context, runtimeID string) (StopResult,
 	}
 	var out StopResult
 	err := c.do(ctx, http.MethodPost, apiPrefix+"/runtimes/"+url.PathEscape(runtimeID)+"/stop", nil, &out)
+	return out, err
+}
+
+// StartRuntime restarts an existing managed runtime and returns its freshly
+// observed runner-approved endpoint. Callers must perform their configured
+// HTTP health check before restoring public routing.
+func (c *Client) StartRuntime(ctx context.Context, runtimeID string) (AppStatus, error) {
+	if err := validateRuntimeID(runtimeID); err != nil {
+		return AppStatus{}, err
+	}
+	var out AppStatus
+	err := c.do(ctx, http.MethodPost, apiPrefix+"/runtimes/"+url.PathEscape(runtimeID)+"/start", nil, &out)
 	return out, err
 }
 

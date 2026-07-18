@@ -13,6 +13,7 @@ Description=AgentTransfer nightly backup snapshot
 [Service]
 Type=oneshot
 Environment=DATA_DIR=/var/lib/agenttransfer
+Environment=APP_DATA_ROOT=/var/lib/agenttransfer-app-data
 Environment=BACKUP_DIR=/var/backups/agenttransfer
 ExecStart=/bin/bash -c '\
   set -euo pipefail; \
@@ -20,22 +21,30 @@ ExecStart=/bin/bash -c '\
   work=$(mktemp -d "$DATA_DIR/.agenttransfer-backup-XXXXXXXX"); \
   archive=$(mktemp "$BACKUP_DIR/.agenttransfer-XXXXXXXX.tar.gz"); \
   restart_needed=0; \
-  cleanup() { [ "$restart_needed" -eq 0 ] || systemctl start agenttransfer; rm -rf "$work"; [ -z "${archive:-}" ] || rm -f "$archive"; }; \
+  runner_restart_needed=0; \
+  concierge_restart_needed=0; \
+  cleanup() { [ "$restart_needed" -eq 0 ] || systemctl start agenttransfer; [ "$runner_restart_needed" -eq 0 ] || systemctl start agenttransfer-app-runner; [ "$concierge_restart_needed" -eq 0 ] || systemctl start agenttransfer-concierge; rm -rf "$work"; [ -z "${archive:-}" ] || rm -f "$archive"; }; \
   trap cleanup EXIT; \
   systemctl is-active --quiet agenttransfer && restart_needed=1 || true; \
+  systemctl is-active --quiet agenttransfer-app-runner && runner_restart_needed=1 || true; \
+  systemctl is-active --quiet agenttransfer-concierge && concierge_restart_needed=1 || true; \
   stopped_at=$(date +%%s); \
   [ "$restart_needed" -eq 0 ] || systemctl stop agenttransfer; \
+  [ "$runner_restart_needed" -eq 0 ] || systemctl stop agenttransfer-app-runner; \
+  [ "$concierge_restart_needed" -eq 0 ] || systemctl stop agenttransfer-concierge; \
   sqlite3 "$DATA_DIR/agenttransfer.db" ".backup $work/agenttransfer.db"; \
   cp -al "$DATA_DIR/blobs" "$work/blobs"; \
   [ ! -e "$DATA_DIR/certmagic" ] || cp -a "$DATA_DIR/certmagic" "$work/certmagic"; \
   if [ "$restart_needed" -eq 1 ]; then systemctl start agenttransfer; restart_needed=0; fi; \
+  if [ "$runner_restart_needed" -eq 1 ]; then systemctl start agenttransfer-app-runner; runner_restart_needed=0; fi; \
+  if [ "$concierge_restart_needed" -eq 1 ]; then systemctl start agenttransfer-concierge; concierge_restart_needed=0; fi; \
   echo "AgentTransfer public snapshot pause: $(($(date +%%s)-stopped_at))s"; \
-  if [ -e "$work/certmagic" ] && [ -e "$DATA_DIR/apps/data" ]; then \
-    tar -czf "$archive" -C "$work" agenttransfer.db blobs certmagic -C "$DATA_DIR" apps/data; \
+  if [ -e "$work/certmagic" ] && [ -e "$APP_DATA_ROOT" ]; then \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs certmagic -C "$(dirname "$APP_DATA_ROOT")" "$(basename "$APP_DATA_ROOT")"; \
   elif [ -e "$work/certmagic" ]; then \
     tar -czf "$archive" -C "$work" agenttransfer.db blobs certmagic; \
-  elif [ -e "$DATA_DIR/apps/data" ]; then \
-    tar -czf "$archive" -C "$work" agenttransfer.db blobs -C "$DATA_DIR" apps/data; \
+  elif [ -e "$APP_DATA_ROOT" ]; then \
+    tar -czf "$archive" -C "$work" agenttransfer.db blobs -C "$(dirname "$APP_DATA_ROOT")" "$(basename "$APP_DATA_ROOT")"; \
   else \
     tar -czf "$archive" -C "$work" agenttransfer.db blobs; \
   fi; \

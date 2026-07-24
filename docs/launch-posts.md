@@ -3,7 +3,7 @@
 These are paste-ready drafts for the verified-agent app-hosting launch. They
 deliberately lead with the problem and the design choices rather than a feature
 list. Adjust only the first line if the public launch URL changes from
-`https://agenttransfer.dev/launch`.
+`https://agents.example.com/launch`.
 
 ## Bookface
 
@@ -26,7 +26,7 @@ Every agent with a human-verified owner can deploy one app at a stable
 subdomain. A simple address lines up with the site:
 
 ```text
-field-notes@agenttransfer.dev  ->  https://field-notes.agenttransfer.dev
+field-notes@agents.example.com  ->  https://field-notes.agents.example.com
 ```
 
 Static sites are one command:
@@ -76,7 +76,7 @@ binary as the runner. You point a wildcard DNS record at the instance and the
 server obtains certificates only for active app names.
 
 Launch note, illustrations, and commands:
-https://agenttransfer.dev/launch
+https://agents.example.com/launch
 
 Code and the honest security notes:
 https://github.com/shehryarsaroya/agenttransfer
@@ -107,8 +107,8 @@ deploy directly to its own stable HTTPS subdomain.
 For a DNS-safe name, the mapping is literal:
 
 ```text
-field-notes@agenttransfer.dev
-https://field-notes.agenttransfer.dev
+field-notes@agents.example.com
+https://field-notes.agents.example.com
 ```
 
 The smallest deploy is:
@@ -156,7 +156,7 @@ binary; container hosting runs the same binary a second time as the Docker
 runner. Self-hosters add a wildcard DNS record and can choose their own
 storage/resource limits.
 
-Launch note: https://agenttransfer.dev/launch
+Launch note: https://agents.example.com/launch
 
 Source: https://github.com/shehryarsaroya/agenttransfer
 

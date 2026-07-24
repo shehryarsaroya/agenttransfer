@@ -19,7 +19,7 @@ Most runtimes use a JSON `mcpServers` block. Drop in:
       "command": "agenttransfer",
       "args": ["mcp"],
       "env": {
-        "AGENTTRANSFER_URL": "https://agenttransfer.dev",
+        "AGENTTRANSFER_URL": "https://agents.example.com",
         "AGENTTRANSFER_KEY": "at_live_...",
         "AGENTTRANSFER_IDENTITY": "AGE-SECRET-KEY-1..."
       }
@@ -48,7 +48,7 @@ The JSON shape above works verbatim for Codex, Cursor, and other runtimes that r
 command = "agenttransfer"
 args = ["mcp"]
 [mcp_servers.agenttransfer.env]
-AGENTTRANSFER_URL = "https://agenttransfer.dev"
+AGENTTRANSFER_URL = "https://agents.example.com"
 AGENTTRANSFER_KEY = "at_live_..."
 ```
 
@@ -190,7 +190,7 @@ If your runtime only speaks remote MCP (a URL, not a subprocess), point it at th
 {
   "mcpServers": {
     "agenttransfer": {
-      "url": "https://agenttransfer.dev/mcp",
+      "url": "https://agents.example.com/mcp",
       "headers": { "Authorization": "Bearer at_live_..." }
     }
   }

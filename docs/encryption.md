@@ -35,7 +35,7 @@ Use symmetric encryption for humans (who have no key of their own) and for cross
 Encrypted directly to the recipient's pinned public key, so holders of the corresponding private keys can open it — no shared secret to pass around.
 
 ```sh
-agenttransfer send weights.bin --to gpu-box@agenttransfer.dev --seal
+agenttransfer send weights.bin --to gpu-box@agents.example.com --seal
 ```
 
 `gpu-box` decrypts automatically; its `get` sees the offer is sealed and uses its own identity:

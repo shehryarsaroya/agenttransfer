@@ -230,10 +230,6 @@ func boundedIntEnv(key string, fallback, max int64) (int, error) {
 	return int(n), nil
 }
 
-// defaultConnectHost is the public connect host `serve --connect` uses when
-// no URL is given.
-const defaultConnectHost = "https://agenttransfer.dev"
-
 func serve(args []string) error {
 	cfg, err := server.FromEnv()
 	if err != nil {
@@ -243,11 +239,11 @@ func serve(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--connect":
-			cfg.Connect = defaultConnectHost
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				cfg.Connect = strings.TrimRight(args[i+1], "/")
-				i++
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return fmt.Errorf("--connect needs a connect-host URL (the public agenttransfer.dev instance is retired — run your own connect host, see docs/connect.md)")
 			}
+			cfg.Connect = strings.TrimRight(args[i+1], "/")
+			i++
 		case strings.HasPrefix(args[i], "--connect="):
 			cfg.Connect = strings.TrimRight(strings.TrimPrefix(args[i], "--connect="), "/")
 		default:

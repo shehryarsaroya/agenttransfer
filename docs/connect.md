@@ -2,15 +2,15 @@
 
 Connect makes a full AgentTransfer instance runnable on a laptop, a desktop,
 or any box behind NAT — **no domain, no DNS, no open ports, no relay account**.
-A *connect host* (the hosted one at agenttransfer.dev, or one you run — see
+A *connect host* (the hosted one at agents.example.com, or one you run — see
 below) lends your instance three things over a single outbound tunnel:
 
 ```
-your laptop                                connect host (agenttransfer.dev)
+your laptop                                connect host (agents.example.com)
 ┌─────────────────────────┐   one outbound  ┌────────────────────────────────┐
-│ agenttransfer serve     │◄═══ tunnel ════►│ https://<name>.agenttransfer.dev│
+│ agenttransfer serve     │◄═══ tunnel ════►│ https://<name>.agents.example.com│
 │  --connect              │                 │   └─ proxies web traffic to you │
-│                         │                 │ *@<name>.agenttransfer.dev      │
+│                         │                 │ *@<name>.agents.example.com      │
 │ agents, folders, links, │                 │   └─ receives + queues your mail│
 │ inbox, receipts — all   │                 │ outbound email relay            │
 │ local, all yours        │                 │   └─ sends for verified owners  │
@@ -29,17 +29,16 @@ not learn file contents.
 ## Use it (client side)
 
 ```sh
-./agenttransfer serve --connect            # uses https://agenttransfer.dev
-./agenttransfer serve --connect https://hub.example.com   # or any connect host
+./agenttransfer serve --connect https://hub.example.com   # any connect host you trust
 ```
 
 First run registers anonymously and prints your assigned identity, e.g.
-`https://quiet-moth-79.agenttransfer.dev`. The name and token persist in
+`https://quiet-moth-79.agents.example.com`. The name and token persist in
 `DATA_DIR`, so restarts keep the same address. From that moment:
 
-- **Share links work worldwide** — `https://<name>.agenttransfer.dev/f/…`,
+- **Share links work worldwide** — `https://<name>.agents.example.com/f/…`,
   served from your machine through the tunnel.
-- **Agents can receive email immediately** — `bot@<name>.agenttransfer.dev`
+- **Agents can receive email immediately** — `bot@<name>.agents.example.com`
   is a real address. Mail that arrives while your machine is asleep is queued
   on the host and delivered when the tunnel returns (store-and-forward).
 - **Sending email is locked until a human vouches for the instance**:
@@ -54,7 +53,7 @@ Check state anytime: `GET /v1/connect` (admin token) → connected, name,
 public URL. Suspending, quotas, and abuse handling are the host's side, below.
 
 Everything else about the instance is unchanged: same API, same MCP endpoint
-(`https://<name>.agenttransfer.dev/mcp`), same receipts, same admin token.
+(`https://<name>.agents.example.com/mcp`), same receipts, same admin token.
 `CONNECT=https://…` in the environment is equivalent to the flag.
 
 ## What the host enforces (abuse safeguards)

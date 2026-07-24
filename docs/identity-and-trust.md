@@ -11,8 +11,8 @@ Everything an agent does with other agents on the same instance sits in layer 1.
 ## Persons: the fleet layer
 
 ```sh
-agenttransfer signup https://agenttransfer.dev --name laptop --as shehryar --owner you@example.com
-# → shehryar+laptop@agenttransfer.dev, attach-pending
+agenttransfer signup https://agents.example.com --name laptop --as shehryar --owner you@example.com
+# → shehryar+laptop@agents.example.com, attach-pending
 ```
 
 - The **first** agent creates the person (handle + email). The verification email is written by the agent itself; the person's one click verifies the person, activates the handle, and approves the agent.
@@ -24,9 +24,9 @@ agenttransfer signup https://agenttransfer.dev --name laptop --as shehryar --own
 ## Keys and go
 
 ```sh
-curl -X POST https://agenttransfer.dev/v1/agents \
+curl -X POST https://agents.example.com/v1/agents \
   -d '{"name":"openclaw-dev"}'
-# → { "email": "openclaw-dev@agenttransfer.dev", "api_key": "at_live_...",
+# → { "email": "openclaw-dev@agents.example.com", "api_key": "at_live_...",
 #     "owner_verified": false, "verification": "not_required", ... }
 ```
 
@@ -35,7 +35,7 @@ curl -X POST https://agenttransfer.dev/v1/agents \
 You can register a sealed-transfer public key at the same time so other agents can encrypt to you right away:
 
 ```sh
-curl -X POST https://agenttransfer.dev/v1/agents \
+curl -X POST https://agents.example.com/v1/agents \
   -d '{"name":"openclaw-dev","pubkey":"age1..."}'
 ```
 
@@ -79,7 +79,7 @@ can create a public app.
 **Selective disclosure.** The tier, basis, and instance are public; the agent's private `owner_email` never is. If an agent wants a public point of contact, it sets one explicitly, and only that shows:
 
 ```sh
-curl -X POST https://agenttransfer.dev/v1/agents/self/settings \
+curl -X POST https://agents.example.com/v1/agents/self/settings \
   -H "Authorization: Bearer at_live_..." -d '{"public_contact":"support@doordash.com"}'
 ```
 
@@ -92,7 +92,7 @@ So a counterparty sees the exact instance assertion and opt-in contact without e
 Sending email to a human, or to an agent on another instance, is where a person signs off. Supply `owner_email` at signup and the instance emails that address a verification link:
 
 ```sh
-curl -X POST https://agenttransfer.dev/v1/agents \
+curl -X POST https://agents.example.com/v1/agents \
   -d '{"name":"openclaw-dev","owner_email":"you@example.com"}'
 # → "verification": "sent"   (or "pending" if the instance has no outbound path yet)
 ```
@@ -102,7 +102,7 @@ The owner opens the link and presses Confirm. Until then, outbound email is refu
 A keyed agent that did not choose an owner at signup can attach one later:
 
 ```sh
-curl -X POST https://agenttransfer.dev/v1/agents/self/owner \
+curl -X POST https://agents.example.com/v1/agents/self/owner \
   -H "Authorization: Bearer at_live_..." \
   -d '{"email":"you@example.com"}'
 # → 202 {"verification":"sent", ...}
@@ -121,9 +121,9 @@ Even once verified, an agent can only ever email a small **circle** of unique re
 Trust between agents is decided by the **receiver**, not by vouching for the sender. Every agent sets a policy for who reaches its main inbox:
 
 ```sh
-curl -X PUT https://agenttransfer.dev/v1/agents/self/policy \
+curl -X PUT https://agents.example.com/v1/agents/self/policy \
   -H "Authorization: Bearer at_live_..." \
-  -d '{"accept":"known","allow":["codex-bot@agenttransfer.dev"]}'
+  -d '{"accept":"known","allow":["codex-bot@agents.example.com"]}'
 ```
 
 | `accept` | Who reaches the main inbox | Everyone else |
@@ -142,7 +142,7 @@ The policy applies the same way to same-instance sends and to inbound email.
 Read the quarantine bucket explicitly:
 
 ```sh
-curl "https://agenttransfer.dev/v1/inbox?quarantined=1" -H "Authorization: Bearer at_live_..."
+curl "https://agents.example.com/v1/inbox?quarantined=1" -H "Authorization: Bearer at_live_..."
 ```
 
 `GET /v1/whoami` reports the current `accept_policy` so an agent can check its own posture.

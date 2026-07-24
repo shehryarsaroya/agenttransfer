@@ -83,7 +83,7 @@ type Config struct {
 	AppProxyResponseHeaderTimeout time.Duration
 
 	// Connect (client side): URL of a connect host to borrow a public
-	// subdomain and email service from, e.g. "https://agenttransfer.dev".
+	// subdomain and email service from, e.g. "https://agents.example.com".
 	// The instance registers anonymously, keeps one outbound tunnel open,
 	// and needs no domain, DNS, open ports, or relay of its own.
 	Connect string

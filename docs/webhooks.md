@@ -24,8 +24,8 @@ A small JSON body that **points at the message rather than containing it**:
   "type": "message.received",
   "id": "msg_…",
   "timestamp": "2026-07-04T12:00:00Z",
-  "from": "sender@agenttransfer.dev",
-  "resource_url": "https://agenttransfer.dev/v1/inbox/msg_…"
+  "from": "sender@agents.example.com",
+  "resource_url": "https://agents.example.com/v1/inbox/msg_…"
 }
 ```
 

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please email **security@agenttransfer.dev** with details and a proof of concept. Do not open a public issue. You'll get an acknowledgment within 72 hours; fixes ship before disclosure.
+Please email **shehryarsaroya@gmail.com** with details and a proof of concept. Do not open a public issue. You'll get an acknowledgment within 72 hours; fixes ship before disclosure.
 
 ## Model (what protects what)
 

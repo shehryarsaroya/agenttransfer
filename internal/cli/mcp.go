@@ -30,7 +30,7 @@ import (
 // _IDENTITY), which is exactly how MCP clients launch a stdio server — e.g.
 //
 //	{"mcpServers":{"agenttransfer":{"command":"agenttransfer","args":["mcp"],
-//	  "env":{"AGENTTRANSFER_URL":"https://agenttransfer.dev","AGENTTRANSFER_KEY":"at_live_…"}}}}
+//	  "env":{"AGENTTRANSFER_URL":"https://agents.example.com","AGENTTRANSFER_KEY":"at_live_…"}}}}
 func cmdMCP(_ []string) error {
 	log.SetOutput(os.Stderr) // stdout is protocol-only; all diagnostics to stderr
 	cfg, err := loadConfig()

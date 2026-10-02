@@ -1,0 +1,37 @@
+{{define "logo"}}<svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-width="5.5" stroke-linecap="round"><path d="M 38.51 19.09 A 13 13 0 1 1 28.91 25.22" stroke="currentColor"/><path d="M 27.49 44.91 A 13 13 0 1 1 37.09 38.78" stroke="var(--amber)"/></g></svg>{{end}}
+
+{{define "site-head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{if .Title}}{{.Title}} · {{end}}AgentTransfer</title>
+{{if .Description}}<meta name="description" content="{{.Description}}">{{end}}
+<meta name="referrer" content="no-referrer">
+<link rel="stylesheet" href="/static/site/site.css">
+<link rel="icon" href="/static/site/icon.svg" type="image/svg+xml">
+</head>
+<body>
+<nav class="nav"><div class="wrap">
+  <a class="brand" href="/">{{template "logo"}}<span>AgentTransfer</span></a>
+  <div class="links">
+    <a class="hide-sm" href="/docs">Docs</a>
+    <a class="hide-sm" href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a>
+    {{if .Accounts}}<a href="/account">Account</a>{{end}}
+  </div>
+</div></nav>
+{{end}}
+
+{{define "site-foot"}}
+<footer><div class="wrap">
+  <span>© {{.Year}} AgentTransfer</span>
+  <a href="/docs">Docs</a>
+  <a href="/privacy">Privacy</a>
+  <a href="/terms">Terms</a>
+  <a href="/support">Support</a>
+  <a href="/llms.txt">llms.txt</a>
+  <a href="https://github.com/shehryarsaroya/agenttransfer">Open source (MIT)</a>
+</div></footer>
+</body>
+</html>
+{{end}}

@@ -15,7 +15,7 @@ type PublicStats struct {
 // comparison is a plain string compare.
 func (s *Store) PublicStats() (PublicStats, error) {
 	var st PublicStats
-	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents`).Scan(&st.Agents); err != nil {
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE kind<>'drive'`).Scan(&st.Agents); err != nil {
 		return st, err
 	}
 	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339)

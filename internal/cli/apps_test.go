@@ -358,6 +358,10 @@ func TestMCPUploadEscapesFilename(t *testing.T) {
 	}
 	wantSHA := strings.Repeat("b", 64)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/agenttransfer" {
+			writeTestJSON(w, map[string]any{}) // capability probe: no direct uploads
+			return
+		}
 		if got := r.URL.EscapedPath(); got != "/v1/files/a%3Fb%23c.txt" {
 			t.Errorf("escaped path = %q", got)
 		}

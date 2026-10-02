@@ -25,8 +25,11 @@ type Config struct {
 	// is set (autocert) and ":8080" otherwise.
 	HTTPAddr string
 	// SMTPAddr is the inbound SMTP listen address (":25" when Domain is set;
-	// empty disables).
+	// "off" disables it even then).
 	SMTPAddr string
+	// SMTPOff records an explicit SMTP_ADDR=off so re-applying defaults
+	// never resurrects the :25 listener.
+	SMTPOff bool
 	// Outbound is the relay: "resend:<key>", "smtp://user:pass@host:587" or
 	// "smtps://...". Empty disables outbound email.
 	Outbound string
@@ -131,6 +134,41 @@ type Config struct {
 	// downloads deliberately have no write timeout. <=0 disables — FromEnv
 	// defaults it to 1h.
 	UploadBodyTimeout time.Duration
+	// S3 holds blob bytes in an S3-compatible bucket (Cloudflare R2, MinIO,
+	// AWS) instead of DATA_DIR/blobs when S3Bucket is set. Uploads can then go
+	// straight to the bucket with presigned URLs (POST /v1/uploads) and
+	// downloads redirect to short-lived presigned GETs; the database stays in
+	// DATA_DIR. S3_ENDPOINT is the service origin (R2:
+	// https://<account>.r2.cloudflarestorage.com), S3_REGION defaults to "auto".
+	S3Endpoint  string
+	S3Region    string
+	S3Bucket    string
+	S3AccessKey string
+	S3SecretKey string
+
+	// PublicLinks is "all" (default) or "verified". With "verified", a share
+	// link owned by an unverified folder downloads only with an agent
+	// credential: anonymous agents can still hand files to other agents, but
+	// an open-signup instance never becomes an anonymous public file host.
+	PublicLinks string
+	// Accounts enables the human side: email sign-in, the account page, and the
+	// OAuth 2.1 authorization server that lets ChatGPT, Claude and other MCP
+	// clients connect as an agent of the signed-in person.
+	Accounts bool
+	// StorageQuotaPlus is the drive quota for persons on the "plus" plan
+	// (0 disables the plan).
+	StorageQuotaPlus int64
+	// SupportEmail is shown on the support, privacy and terms pages.
+	SupportEmail string
+	// OperatorName is the legal operator named in the terms and privacy pages.
+	OperatorName string
+	// OpenAIAppsChallenge is served at /.well-known/openai-apps-challenge for
+	// ChatGPT plugin domain verification.
+	OpenAIAppsChallenge string
+	// DevLoginLinks shows sign-in links on the page (local development and
+	// tests without outbound email). Never enable on a public instance.
+	DevLoginLinks bool
+
 	// UnverifiedFileTTL makes files owned by agents WITHOUT a verified owner
 	// expire — the storage mirror of the quota tier: anonymous signups get a
 	// scratchpad, verified owners get the drive. Verifying lifts the expiry
@@ -169,8 +207,23 @@ func FromEnv() (Config, error) {
 		ConnectDomain: strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("CONNECT_DOMAIN")), ".")),
 
 		DiskReserve: envOr("DISK_RESERVE", "10%"),
+
+		S3Endpoint:          strings.TrimRight(strings.TrimSpace(os.Getenv("S3_ENDPOINT")), "/"),
+		S3Region:            strings.TrimSpace(os.Getenv("S3_REGION")),
+		S3Bucket:            strings.TrimSpace(os.Getenv("S3_BUCKET")),
+		S3AccessKey:         strings.TrimSpace(os.Getenv("S3_ACCESS_KEY_ID")),
+		S3SecretKey:         strings.TrimSpace(os.Getenv("S3_SECRET_ACCESS_KEY")),
+		PublicLinks:         strings.ToLower(strings.TrimSpace(os.Getenv("PUBLIC_LINKS"))),
+		Accounts:            envBool("ACCOUNTS"),
+		SupportEmail:        strings.TrimSpace(os.Getenv("SUPPORT_EMAIL")),
+		OperatorName:        strings.TrimSpace(os.Getenv("OPERATOR_NAME")),
+		OpenAIAppsChallenge: strings.TrimSpace(os.Getenv("OPENAI_APPS_CHALLENGE")),
+		DevLoginLinks:       envBool("DEV_LOGIN_LINKS"),
 	}
 	var err error
+	if c.StorageQuotaPlus, err = parseSizeEnv("STORAGE_QUOTA_PLUS", "0"); err != nil {
+		return c, err
+	}
 	if c.AppStorageQuota, err = parseSizeEnv("APP_STORAGE_QUOTA", "10GB"); err != nil {
 		return c, err
 	}
@@ -265,8 +318,19 @@ func (c *Config) ApplyDefaults() {
 			c.HTTPAddr = ":8080"
 		}
 	}
-	if c.SMTPAddr == "" && c.Domain != "" {
+	if strings.EqualFold(c.SMTPAddr, "off") {
+		c.SMTPOff = true
+	}
+	if c.SMTPOff {
+		c.SMTPAddr = "" // explicit opt-out: no inbound SMTP even with DOMAIN
+	} else if c.SMTPAddr == "" && c.Domain != "" {
 		c.SMTPAddr = ":25"
+	}
+	if c.PublicLinks == "" {
+		c.PublicLinks = "all"
+	}
+	if c.S3Bucket != "" && c.S3Region == "" {
+		c.S3Region = "auto"
 	}
 	if c.MaxFileSize == 0 {
 		c.MaxFileSize = 5 << 30
@@ -332,6 +396,21 @@ func (c *Config) ApplyDefaults() {
 func (c *Config) Validate() error {
 	if c.Domain != "" && !validDNSName(c.Domain) {
 		return fmt.Errorf("DOMAIN must be a valid DNS name")
+	}
+	if c.PublicLinks != "all" && c.PublicLinks != "verified" {
+		return fmt.Errorf("PUBLIC_LINKS must be \"all\" or \"verified\"")
+	}
+	if c.S3Bucket != "" {
+		if c.S3Endpoint == "" || c.S3AccessKey == "" || c.S3SecretKey == "" {
+			return fmt.Errorf("S3_BUCKET needs S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY")
+		}
+		u, err := url.Parse(c.S3Endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && !loopbackURLHost(u.Hostname())) {
+			return fmt.Errorf("S3_ENDPOINT must be an https origin")
+		}
+		if c.AppDomain != "" {
+			return fmt.Errorf("app hosting (APP_DOMAIN) needs the local blob store; unset S3_BUCKET or APP_DOMAIN")
+		}
 	}
 	_, httpPort, err := net.SplitHostPort(c.HTTPAddr)
 	if err != nil {

@@ -259,12 +259,13 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 	type addedEntry struct{ sha, name string }
 	var added []addedEntry
 	committed := false
+	folder := s.folderFor(agent)
 	defer func() {
 		if committed {
 			return
 		}
 		for _, f := range added {
-			_, _ = s.st.DeleteFileEntry(agent.ID, f.sha, f.name)
+			_, _ = s.st.DeleteFileEntry(folder.ID, f.sha, f.name)
 		}
 	}()
 	for _, a := range in.Attachments {
@@ -283,24 +284,24 @@ func (s *Server) ingestInbound(agent store.Agent, from string, in *mail.Inbound,
 		if err != nil {
 			return err
 		}
-		used, err := s.st.StorageUsed(agent.ID)
+		used, err := s.st.StorageUsed(folder.ID)
 		if err != nil {
 			return fmt.Errorf("read storage usage: %w", err)
 		}
-		alreadyCharged, err := s.st.AgentUsesStorageBlob(agent.ID, sha)
+		alreadyCharged, err := s.st.AgentUsesStorageBlob(folder.ID, sha)
 		if err != nil {
 			return fmt.Errorf("inspect storage references: %w", err)
 		}
-		if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(agent)) {
+		if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(folder)) {
 			text += fmt.Sprintf("\n[agenttransfer: attachment %q dropped — storage quota exceeded]", a.Name)
 			continue
 		}
 		expires := time.Now().Add(s.cfg.DefaultTTL).Unix()
-		preexisting := s.st.AgentHasFile(agent.ID, sha, a.Name)
+		preexisting := s.st.AgentHasFile(folder.ID, sha, a.Name)
 		// AddFile's conflict path refreshes expires_at. A repeated attachment
 		// should get a full arrival TTL even when identical bytes/name already
 		// exist; rollback still removes only rows this message created.
-		f, err := s.st.AddFile(agent.ID, sha, a.Name, a.MIME, size, "inbound", false, expires)
+		f, err := s.st.AddFile(folder.ID, sha, a.Name, a.MIME, size, "inbound", false, expires)
 		if err != nil {
 			return err
 		}

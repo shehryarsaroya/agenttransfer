@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
@@ -111,6 +112,9 @@ type api struct {
 	key    string
 	hc     *http.Client
 	longHC *http.Client
+
+	capOnce sync.Once // server capability probe (direct uploads)
+	direct  bool
 }
 
 func newAPI(c clientConfig) *api {
@@ -712,39 +716,8 @@ func cmdPut(args []string) error {
 	}
 	defer body.Close()
 
-	q := url.Values{}
-	if *share || *ttl != "" || *once {
-		q.Set("share", "1")
-	}
-	if *ttl != "" {
-		q.Set("ttl", *ttl)
-	}
-	if *once {
-		q.Set("once", "1")
-	}
-	path := "/v1/files/" + url.PathEscape(name)
-	if len(q) > 0 {
-		path += "?" + q.Encode()
-	}
-	resp, err := a.req("PUT", path, body, "application/octet-stream")
+	up, err := a.uploadBody(name, body, *share || *ttl != "" || *once, *ttl, *once, os.Stderr)
 	if err != nil {
-		return err
-	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return apiError(resp.StatusCode, data)
-	}
-	var up struct {
-		SHA256 string `json:"sha256"`
-		Size   int64  `json:"size"`
-		Link   *struct {
-			URL       string `json:"url"`
-			ExpiresAt string `json:"expires_at"`
-			Once      bool   `json:"once"`
-		} `json:"link"`
-	}
-	if err := json.Unmarshal(data, &up); err != nil {
 		return err
 	}
 	if *encrypt {
@@ -836,20 +809,8 @@ func cmdSendWithIdempotencyGenerator(args []string, generate func() (string, err
 	}
 	defer body.Close()
 
-	resp, err := a.req("PUT", "/v1/files/"+url.PathEscape(name), body, "application/octet-stream")
+	up, err := a.uploadBody(name, body, false, "", false, os.Stderr)
 	if err != nil {
-		return err
-	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return apiError(resp.StatusCode, data)
-	}
-	var up struct {
-		SHA256 string `json:"sha256"`
-		Size   int64  `json:"size"`
-	}
-	if err := json.Unmarshal(data, &up); err != nil {
 		return err
 	}
 	if encMode != "" {

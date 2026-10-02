@@ -83,14 +83,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	// JSON responses only — no server push stream, no sessions to delete.
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	tok := bearer(r)
-	agent, err := s.st.AgentByKey(tok)
+	agent, err := s.mcpAgent(r)
 	if err != nil {
-		errJSON(w, http.StatusUnauthorized, "invalid or missing API key (Authorization: Bearer at_live_...)")
+		s.mcpChallenge(w, "invalid or missing credentials: connect with OAuth or send Authorization: Bearer <api key>")
 		return
 	}
 
@@ -115,52 +115,205 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A request carrying per-request protocol _meta (or the modern header)
+	// is served statelessly under 2026-07-28; initialize selects the legacy
+	// handshake.
+	modern, verr := s.mcpModernRequest(r, req)
+	if verr != nil {
+		s.rpcReplyStatus(w, http.StatusBadRequest, req.ID, nil, verr)
+		return
+	}
+	reply := func(result map[string]any, rpcErr *rpcError) {
+		if modern && result != nil {
+			result["resultType"] = "complete"
+			result["_meta"] = mergeMeta(result["_meta"], map[string]any{
+				mcpMetaServerInfo: map[string]any{"name": "agenttransfer", "version": Version},
+			})
+		}
+		s.rpcReply(w, req.ID, result, rpcErr)
+	}
+
 	switch req.Method {
 	case "initialize":
 		var p struct {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		_ = json.Unmarshal(req.Params, &p)
-		s.rpcReply(w, req.ID, map[string]any{
+		reply(map[string]any{
 			"protocolVersion": negotiateMCPProtocolVersion(p.ProtocolVersion),
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
-			"serverInfo":      map[string]any{"name": "agenttransfer", "version": Version},
-			"instructions": "AgentTransfer: file transfer for AI agents. Upload files to your folder, " +
-				"mint expiring share links, send them to other agents (or humans) by email, " +
-				"and poll your inbox. Supported transfer and app-lifecycle events emit best-effort signed receipts.",
+			"serverInfo":      map[string]any{"name": "agenttransfer", "title": "AgentTransfer", "version": Version},
+			"instructions":    mcpInstructions,
+		}, nil)
+	case "server/discover":
+		reply(map[string]any{
+			"supportedVersions": []string{modernMCPProtocolVersion, latestMCPProtocolVersion, previousMCPProtocolVersion},
+			"capabilities":      map[string]any{"tools": map[string]any{}},
+			"instructions":      mcpInstructions,
+			"ttlMs":             3600000,
+			"cacheScope":        "private",
 		}, nil)
 	case "ping":
-		s.rpcReply(w, req.ID, map[string]any{}, nil)
+		reply(map[string]any{}, nil)
 	case "tools/list":
-		s.rpcReply(w, req.ID, map[string]any{"tools": mcpTools}, nil)
+		res := map[string]any{"tools": s.mcpToolList()}
+		if modern {
+			res["ttlMs"] = 3600000
+			res["cacheScope"] = "private"
+		}
+		reply(res, nil)
+	case "resources/list":
+		reply(map[string]any{"resources": []any{}, "ttlMs": 3600000, "cacheScope": "private"}, nil)
+	case "prompts/list":
+		reply(map[string]any{"prompts": []any{}, "ttlMs": 3600000, "cacheScope": "private"}, nil)
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
-			s.rpcReply(w, req.ID, nil, &rpcError{-32602, "invalid params"})
+			reply(nil, &rpcError{-32602, "invalid params"})
+			return
+		}
+		if !s.mcpKnownTool(p.Name) {
+			reply(nil, &rpcError{-32602, "unknown tool: " + p.Name})
 			return
 		}
 		out, callErr := s.mcpCall(r.Context(), agent, p.Name, p.Arguments)
 		if callErr != nil {
 			// Tool-level failures are results with isError, not RPC errors.
-			s.rpcReply(w, req.ID, map[string]any{
+			reply(map[string]any{
 				"content": []map[string]any{{"type": "text", "text": callErr.Error()}},
 				"isError": true,
 			}, nil)
 			return
 		}
+		if rich, ok := out.(*mcpRich); ok {
+			res := map[string]any{"content": rich.content}
+			if rich.structured != nil {
+				res["structuredContent"] = rich.structured
+			}
+			reply(res, nil)
+			return
+		}
 		text, _ := json.MarshalIndent(out, "", "  ")
-		s.rpcReply(w, req.ID, map[string]any{
-			"content": []map[string]any{{"type": "text", "text": string(text)}},
-		}, nil)
+		res := map[string]any{"content": []map[string]any{{"type": "text", "text": string(text)}}}
+		if m, ok := toObject(out); ok {
+			res["structuredContent"] = m
+		}
+		reply(res, nil)
 	default:
-		s.rpcReply(w, req.ID, nil, &rpcError{-32601, "method not found: " + req.Method})
+		reply(nil, &rpcError{-32601, "method not found: " + req.Method})
 	}
 }
 
+func mergeMeta(existing any, add map[string]any) map[string]any {
+	out := map[string]any{}
+	if m, ok := existing.(map[string]any); ok {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	for k, v := range add {
+		out[k] = v
+	}
+	return out
+}
+
+// toObject renders a tool result as a JSON object for structuredContent.
+func toObject(v any) (map[string]any, bool) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// mcpModernRequest reports whether req uses the stateless 2026-07-28 framing
+// and validates it: the _meta version must be one we serve, and the
+// MCP-Protocol-Version and Mcp-Method headers, when sent, must agree.
+func (s *Server) mcpModernRequest(r *http.Request, req rpcRequest) (bool, *rpcError) {
+	var p struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	_ = json.Unmarshal(req.Params, &p)
+	var version string
+	if raw, ok := p.Meta[mcpMetaVersion]; ok {
+		_ = json.Unmarshal(raw, &version)
+	}
+	header := r.Header.Get("MCP-Protocol-Version")
+	if version == "" && req.Method != "server/discover" && header != modernMCPProtocolVersion {
+		return false, nil // legacy framing
+	}
+	if version == "" {
+		version = header
+	}
+	if version != modernMCPProtocolVersion {
+		return true, &rpcError{-32022, "Unsupported protocol version"}
+	}
+	if header != "" && header != version {
+		return true, &rpcError{-32020, "MCP-Protocol-Version header does not match _meta"}
+	}
+	if m := r.Header.Get("Mcp-Method"); m != "" && m != req.Method {
+		return true, &rpcError{-32020, "Mcp-Method header does not match the request method"}
+	}
+	return true, nil
+}
+
+// mcpKnownTool reports whether name is callable (listed or a legacy alias).
+func (s *Server) mcpKnownTool(name string) bool {
+	switch name {
+	case "upload_file", "share_file", "download_file", "get_receipts", "deploy_app":
+		return true // legacy hosted names and the bridge-only alias (useful error)
+	}
+	for _, t := range s.mcpToolList() {
+		if t["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpAgent authenticates an MCP request. OAuth access tokens must have been
+// issued for this server (audience check, RFC 8707).
+func (s *Server) mcpAgent(r *http.Request) (store.Agent, error) {
+	tok := bearer(r)
+	if tok == "" {
+		return store.Agent{}, store.ErrNotFound
+	}
+	if strings.HasPrefix(tok, "at_oat_") {
+		t, err := s.st.OAuthTokenByAccess(tok)
+		if err != nil {
+			return store.Agent{}, err
+		}
+		if !s.validResource(t.Resource) {
+			return store.Agent{}, store.ErrNotFound
+		}
+	}
+	return s.agentForToken(tok)
+}
+
+// mcpChallenge answers 401 with the RFC 9728 pointer clients use to start
+// OAuth (Claude and ChatGPT both begin sign-in from this header).
+func (s *Server) mcpChallenge(w http.ResponseWriter, msg string) {
+	if s.cfg.Accounts {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`,
+			s.BaseURL()+"/.well-known/oauth-protected-resource/mcp", mcpScope))
+	} else {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="agenttransfer"`)
+	}
+	errJSON(w, http.StatusUnauthorized, "%s", msg)
+}
+
 func (s *Server) rpcReply(w http.ResponseWriter, id json.RawMessage, result any, rpcErr *rpcError) {
+	s.rpcReplyStatus(w, http.StatusOK, id, result, rpcErr)
+}
+
+func (s *Server) rpcReplyStatus(w http.ResponseWriter, status int, id json.RawMessage, result any, rpcErr *rpcError) {
 	resp := map[string]any{"jsonrpc": "2.0"}
 	if id != nil {
 		resp["id"] = json.RawMessage(id)
@@ -168,11 +321,15 @@ func (s *Server) rpcReply(w http.ResponseWriter, id json.RawMessage, result any,
 		resp["id"] = nil
 	}
 	if rpcErr != nil {
-		resp["error"] = rpcErr
+		e := map[string]any{"code": rpcErr.Code, "message": rpcErr.Message}
+		if rpcErr.Code == -32022 {
+			e["data"] = map[string]any{"supported": []string{modernMCPProtocolVersion, latestMCPProtocolVersion, previousMCPProtocolVersion}}
+		}
+		resp["error"] = e
 	} else {
 		resp["result"] = result
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, status, resp)
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -186,123 +343,6 @@ func obj(props map[string]any, required ...string) map[string]any {
 func str(desc string) map[string]any   { return map[string]any{"type": "string", "description": desc} }
 func boolp(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 func intp(desc string) map[string]any  { return map[string]any{"type": "integer", "description": desc} }
-
-var mcpTools = []map[string]any{
-	{
-		"name":        "whoami",
-		"description": "Your authenticated identity/provenance, public contact, encryption recipient, storage/limits, remote-recipient circle, and app-hosting readiness/status.",
-		"inputSchema": obj(map[string]any{}),
-	},
-	{
-		"name":        "list_files",
-		"description": "List the files in your folder (persistent unless unclaimed).",
-		"inputSchema": obj(map[string]any{}),
-	},
-	{
-		"name": "upload_file",
-		"description": "Upload a small file into your folder from inline content (≤1MiB as text or base64). " +
-			"For anything bigger, PUT the raw bytes to {api}/v1/files/{name} with your bearer key (e.g. curl -T).",
-		"inputSchema": obj(map[string]any{
-			"name":           str("filename"),
-			"content_text":   str("UTF-8 file content"),
-			"content_base64": str("base64 file content (binary)"),
-			"share":          boolp("also mint a share link"),
-			"ttl":            str("share link TTL like \"3h\" (max 24h)"),
-			"once":           boolp("burn-after-read share link"),
-		}, "name"),
-	},
-	{
-		"name":        "share_file",
-		"description": "Mint an ephemeral share link (≤24h) for a file already in your folder.",
-		"inputSchema": obj(map[string]any{
-			"file": str("\"sha256:...\" or a folder filename"),
-			"ttl":  str("TTL like \"3h\" (max 24h)"),
-			"once": boolp("burn-after-read"),
-		}, "file"),
-	},
-	{
-		"name": "send",
-		"description": "Send a message and/or a file to other agents or humans by email. Same-instance " +
-			"agents receive it instantly in their inbox; everyone else gets a normal email with a " +
-			"download link and a machine-readable manifest. A stable idempotency_key is required so uncertain retries cannot deliver twice.",
-		"inputSchema": obj(map[string]any{
-			"to":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "recipient email addresses"},
-			"file":     str("optional: \"sha256:...\" or folder filename to attach as a link"),
-			"note":     str("message text"),
-			"subject":  str("optional subject"),
-			"ttl":      str("link TTL like \"3h\""),
-			"once":     boolp("burn-after-read link"),
-			"reply_to": str("inbox message id (msg_...) this replies to"),
-			"cc_owner": boolp("CC your human owner"),
-			"enc_mode": str("optional client-encryption marker: symmetric or sealed"),
-			"idempotency_key": map[string]any{
-				"type": "string", "minLength": 1, "maxLength": store.MaxIdempotencyKeyBytes,
-				"pattern": "^[!-~]+$", "description": "required stable visible-ASCII key; reuse only for an uncertain retry of this exact send",
-			},
-		}, "to", "idempotency_key"),
-	},
-	{
-		"name":        "check_inbox",
-		"description": "List inbox messages. Set wait_seconds to long-poll until something arrives.",
-		"inputSchema": obj(map[string]any{
-			"unread":       boolp("only unread (default true)"),
-			"wait_seconds": intp("long-poll up to this many seconds (max 60)"),
-		}),
-	},
-	{
-		"name":        "read_message",
-		"description": "Fetch one inbox message by id and mark it read.",
-		"inputSchema": obj(map[string]any{"id": str("message id (msg_...)")}, "id"),
-	},
-	{
-		"name": "download_file",
-		"description": "Download a file. Accepts a sha256 from your folder or an AgentTransfer share URL " +
-			"from a message offer. Returns base64 content up to 1MiB; larger files return the URL to fetch.",
-		"inputSchema": obj(map[string]any{
-			"sha256": str("hash of a file in your folder"),
-			"url":    str("share link URL from an offer"),
-		}),
-	},
-	{
-		"name":        "create_upload_request",
-		"description": "Mint a one-time browser upload page a human can drop a file into; it lands in your inbox.",
-		"inputSchema": obj(map[string]any{
-			"note": str("what you want them to upload"),
-			"ttl":  str("how long the page lives, like \"24h\""),
-		}),
-	},
-	{
-		"name":        "get_receipts",
-		"description": "Your signed receipt trail (uploads, sends, downloads, expiries).",
-		"inputSchema": obj(map[string]any{"limit": intp("max receipts")}),
-	},
-	{
-		"name":        "app_status",
-		"description": "Get this agent's hosted app eligibility, public URL, status, active deployment, and storage usage.",
-		"inputSchema": obj(map[string]any{}),
-	},
-	{
-		"name":        "deploy_app_image",
-		"description": "Deploy an OCI image as this verified agent's hosted app. Hosted HTTP MCP cannot read local paths or upload source/static bundles; for those, run the local stdio bridge and call deploy_app with a local path.",
-		"inputSchema": obj(map[string]any{
-			"image":       str("OCI image reference (required)"),
-			"port":        intp("container HTTP port (default 8080)"),
-			"env":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "container environment variables; values are never returned"},
-			"command":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "container argv override"},
-			"health_path": str("HTTP health-check path inside the app (default /)"),
-		}, "image"),
-	},
-	{
-		"name":        "app_logs",
-		"description": "Read a bounded tail of this verified agent's container app logs.",
-		"inputSchema": obj(map[string]any{"tail": intp("recent lines, 1-2000 (default 200)")}),
-	},
-	{
-		"name":        "stop_app",
-		"description": "Stop this verified agent's running app without deleting its configuration or data.",
-		"inputSchema": obj(map[string]any{}),
-	},
-}
 
 func validateMCPIdempotencyKey(key string) error {
 	if key == "" || len(key) > store.MaxIdempotencyKeyBytes {
@@ -358,15 +398,20 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		args = json.RawMessage("{}")
 	}
 	switch name {
+	case "save_file":
+		return s.mcpSaveFile(ctx, agent, args)
+	case "read_file":
+		return s.mcpReadFile(ctx, agent, args)
+	case "get_link":
+		return s.mcpGetLink(agent, args)
+	case "delete_file":
+		return s.mcpDeleteFile(agent, args)
+	case "save_received_file":
+		return s.mcpSaveReceived(agent, args)
+	case "list_files":
+		return s.mcpListFiles(agent, args)
 	case "whoami":
 		return s.mcpWhoami(ctx, agent)
-
-	case "list_files":
-		files, err := s.st.ListFiles(agent.ID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"files": files}, nil
 
 	case "upload_file":
 		var p struct {
@@ -415,7 +460,8 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		f, err := s.resolveFile(agent, p.File)
+		folder := s.folderFor(agent)
+		f, err := s.resolveFile(folder, p.File)
 		if err != nil {
 			return nil, err
 		}
@@ -423,7 +469,7 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		if err != nil {
 			return nil, err
 		}
-		l, err := s.st.CreateLink(agent.ID, f.SHA256, f.Name, f.MIME, f.Size, p.Once, ttl)
+		l, err := s.st.CreateLink(folder.ID, f.SHA256, f.Name, f.MIME, f.Size, p.Once, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -556,7 +602,7 @@ func (s *Server) mcpCall(ctx context.Context, agent store.Agent, name string, ar
 		downloadActor := agent.Email
 		switch {
 		case p.SHA256 != "":
-			f, err := s.st.FileBySHA(agent.ID, strings.TrimPrefix(strings.ToLower(p.SHA256), "sha256:"))
+			f, err := s.st.FileBySHA(s.folderFor(agent).ID, strings.TrimPrefix(strings.ToLower(p.SHA256), "sha256:"))
 			if err != nil {
 				return nil, errors.New("no such file in your folder")
 			}

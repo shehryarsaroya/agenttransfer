@@ -633,37 +633,8 @@ func (s *mcpServer) upload(path string, share bool, ttl string, once, encrypt bo
 	}
 	defer reader.Close()
 
-	q := url.Values{}
-	if share {
-		q.Set("share", "1")
-	}
-	if ttl != "" {
-		q.Set("ttl", ttl)
-	}
-	if once {
-		q.Set("once", "1")
-	}
-	p := "/v1/files/" + url.PathEscape(name)
-	if len(q) > 0 {
-		p += "?" + q.Encode()
-	}
-	resp, err := s.a.req("PUT", p, reader, "application/octet-stream")
+	up, err := s.a.uploadBody(name, reader, share, ttl, once, os.Stderr)
 	if err != nil {
-		return "", 0, "", "", err
-	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return "", 0, "", "", apiError(resp.StatusCode, data)
-	}
-	var up struct {
-		SHA256 string `json:"sha256"`
-		Size   int64  `json:"size"`
-		Link   *struct {
-			URL string `json:"url"`
-		} `json:"link"`
-	}
-	if err := json.Unmarshal(data, &up); err != nil {
 		return "", 0, "", "", err
 	}
 	if up.Link != nil {

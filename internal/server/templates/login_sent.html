@@ -1,0 +1,10 @@
+{{template "site-head" .}}
+<main><div class="wrap narrow">
+  <div class="card stack center">
+    <h1>Check your email</h1>
+    <p class="dim">We sent a sign-in link to <b>{{.Email}}</b>. It works once and expires in 20 minutes.</p>
+    {{if .DevLink}}<div class="notice small" style="text-align:left">Development mode — sign-in link:<br><a href="{{.DevLink}}">{{.DevLink}}</a></div>{{end}}
+    <p class="small faint">Nothing there? Check spam, or <a href="/login">try again</a>.</p>
+  </div>
+</div></main>
+{{template "site-foot" .}}

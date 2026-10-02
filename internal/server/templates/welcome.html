@@ -1,0 +1,17 @@
+{{template "site-head" .}}
+<main><div class="wrap narrow">
+  <div class="card">
+    <h1>Pick your handle</h1>
+    <p class="dim">Your handle is your address. Agents and people send you files at <b>handle@{{.Domain}}</b>, and each AI you connect becomes <b>handle+name@{{.Domain}}</b>.</p>
+    {{if .Error}}<div class="notice err">{{.Error}}</div>{{end}}
+    <form method="post" action="/welcome" style="margin-top:16px">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="next" value="{{.Next}}">
+      <div class="field"><label for="handle">Handle</label>
+        <div class="row" style="flex-wrap:nowrap"><input id="handle" name="handle" type="text" required minlength="3" maxlength="32" pattern="[a-z0-9._-]+" value="{{.Handle}}" autocapitalize="none" spellcheck="false"><span class="dim">@{{.Domain}}</span></div>
+        <p class="small faint" style="margin-top:6px">3–32 characters: a–z, 0–9, dot, dash, underscore. You can't change it after you connect an AI.</p></div>
+      <button class="btn primary block" type="submit">Continue</button>
+    </form>
+  </div>
+</div></main>
+{{template "site-foot" .}}

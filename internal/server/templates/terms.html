@@ -1,0 +1,38 @@
+{{template "site-head" .}}
+<main><div class="wrap prose">
+  <h1>Terms of service</h1>
+  <p class="dim small">Last updated {{.Updated}}</p>
+  <p>These terms govern your use of AgentTransfer at {{.Domain}}, operated by {{.Operator}}. By creating an account or connecting an agent you agree to them.</p>
+
+  <h2>The service</h2>
+  <p>AgentTransfer stores files for you and your AI agents and moves them between agents and people. The free plan includes {{.Quota}} of storage for verified accounts and {{.QuotaAnon}} of temporary storage for agents without a verified owner. We may change limits and features, and will give notice of changes that take something away.</p>
+
+  <h2>Your account and agents</h2>
+  <p>You're responsible for activity under your account, including what agents you connect do on your behalf. Keep your API keys private; disconnect any agent you no longer trust.</p>
+
+  <h2>Your content</h2>
+  <p>You keep all rights to your files. You give us permission to store, copy and transmit them only as needed to run the service for you.</p>
+
+  <h2>Acceptable use</h2>
+  <p>Don't use AgentTransfer to store or send:</p>
+  <ul>
+    <li>anything illegal, including child sexual abuse material;</li>
+    <li>malware, phishing pages or other harmful files;</li>
+    <li>material that infringes someone else's rights;</li>
+    <li>spam or unsolicited bulk messages.</li>
+  </ul>
+  <p>Don't try to break, overload or get around the service's limits or security. We may remove content and suspend accounts that break these rules. Report abuse to {{if .Contact}}<a href="mailto:{{.Contact}}">{{.Contact}}</a>{{else}}the support address{{end}}.</p>
+
+  <h2>Open source</h2>
+  <p>The AgentTransfer software is open source under the MIT license. These terms cover the hosted service at {{.Domain}}, not your use of the software elsewhere.</p>
+
+  <h2>No warranty</h2>
+  <p>The service is provided “as is”. Keep your own copies of important files. To the extent the law allows, we aren't liable for indirect or consequential losses, or for losses above the amount you paid us in the past 12 months.</p>
+
+  <h2>Ending</h2>
+  <p>You can delete your account at any time. We may end the service or your access with reasonable notice, except for serious abuse, where we may act immediately.</p>
+
+  <h2>Contact</h2>
+  <p>{{if .Contact}}<a href="mailto:{{.Contact}}">{{.Contact}}</a>{{else}}See the <a href="/support">support page</a>.{{end}}</p>
+</div></main>
+{{template "site-foot" .}}

@@ -1,0 +1,12 @@
+{{template "site-head" .}}
+<main><div class="wrap narrow">
+  <div class="card stack center">
+    <h1>Sign in</h1>
+    <p class="dim">Continue as <b>{{.Email}}</b>?</p>
+    <form method="post" action="/login/verify">
+      <input type="hidden" name="t" value="{{.Token}}">
+      <button class="btn primary block" type="submit">Continue</button>
+    </form>
+  </div>
+</div></main>
+{{template "site-foot" .}}

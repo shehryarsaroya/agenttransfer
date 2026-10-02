@@ -71,7 +71,7 @@ func (s *Server) auth(next authedHandler) http.HandlerFunc {
 			errJSON(w, http.StatusUnauthorized, "missing Authorization: Bearer <api_key>")
 			return
 		}
-		agent, err := s.st.AgentByKey(tok)
+		agent, err := s.agentForToken(tok)
 		if err != nil {
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
@@ -614,10 +614,29 @@ func (s *Server) humanCircleMax(a store.Agent) int64 {
 // quotaFor returns the storage quota tier for an agent: verified owners get
 // the full drive, anonymous signups a small one until a human vouches.
 func (s *Server) quotaFor(a store.Agent) int64 {
-	if a.OwnerVerified {
-		return s.cfg.StorageQuota
+	if !a.OwnerVerified {
+		return s.cfg.StorageQuotaUnverified
 	}
-	return s.cfg.StorageQuotaUnverified
+	if a.PersonID != "" && s.cfg.StorageQuotaPlus > 0 && s.st.PersonPlan(a.PersonID) == "plus" {
+		return s.cfg.StorageQuotaPlus
+	}
+	return s.cfg.StorageQuota
+}
+
+// folderFor returns the agent whose folder a request reads and writes: the
+// person's shared drive for an approved fleet agent, otherwise the agent
+// itself. Identity (sender address, inbox, receipts actor) always stays the
+// acting agent; only file storage is shared.
+func (s *Server) folderFor(a store.Agent) store.Agent {
+	if a.PersonID == "" || !a.OwnerVerified || a.IsDrive() {
+		return a
+	}
+	d, err := s.st.DriveForPerson(a.PersonID)
+	if err != nil {
+		log.Printf("drive for %s: %v", a.Name, err)
+		return a
+	}
+	return d
 }
 
 // fileExpiry returns the expiry for a file entering this agent's folder —
@@ -832,7 +851,8 @@ func (s *Server) handleSetPolicy(w http.ResponseWriter, r *http.Request, agent s
 // and hosted MCP. Keeping one projection prevents trust or readiness fields
 // from silently drifting between transports.
 func (s *Server) whoamiProjection(ctx context.Context, agent store.Agent) (map[string]any, error) {
-	used, err := s.st.StorageUsed(agent.ID)
+	folder := s.folderFor(agent)
+	used, err := s.st.StorageUsed(folder.ID)
 	if err != nil {
 		return nil, fmt.Errorf("read storage usage: %w", err)
 	}
@@ -842,9 +862,12 @@ func (s *Server) whoamiProjection(ctx context.Context, agent store.Agent) (map[s
 	}
 	storage := map[string]any{
 		"used":  used,
-		"quota": s.quotaFor(agent),
+		"quota": s.quotaFor(folder),
 	}
-	if exp := s.fileExpiry(agent); exp > 0 {
+	if folder.ID != agent.ID {
+		storage["shared_drive"] = true // every approved agent of this person sees the same files
+	}
+	if exp := s.fileExpiry(folder); exp > 0 {
 		// The unverified tier: files are mortal until the owner verifies.
 		storage["files_expire_after"] = s.cfg.UnverifiedFileTTL.String()
 	}
@@ -954,6 +977,7 @@ func (s *Server) performUpload(agent store.Agent, name, contentType string, body
 	if err := s.checkRate(agent.ID, "uploads", s.cfg.UploadRate); err != nil {
 		return nil, http.StatusTooManyRequests, err
 	}
+	folder := s.folderFor(agent)
 	sha, size, err := s.st.PutBlob(body, s.cfg.MaxFileSize)
 	if err != nil {
 		if errors.Is(err, store.ErrDiskReserve) {
@@ -980,27 +1004,30 @@ func (s *Server) performUpload(agent store.Agent, name, contentType string, body
 	// can't all pass the same headroom reading. An idempotent re-upload of an
 	// entry the agent already has is free (dedup); anything that adds a
 	// folder row is charged.
-	lock := s.uploadLock(agent.ID)
+	lock := s.uploadLock(folder.ID)
 	lock.Lock()
-	used, err := s.st.StorageUsed(agent.ID)
+	used, err := s.st.StorageUsed(folder.ID)
 	if err != nil {
 		lock.Unlock()
 		return nil, http.StatusInternalServerError, err
 	}
-	alreadyCharged, err := s.st.AgentUsesStorageBlob(agent.ID, sha)
+	if pending, perr := s.st.PendingUploadBytes(folder.ID); perr == nil {
+		used += pending
+	}
+	alreadyCharged, err := s.st.AgentUsesStorageBlob(folder.ID, sha)
 	if err != nil {
 		lock.Unlock()
 		return nil, http.StatusInternalServerError, fmt.Errorf("inspect storage references: %w", err)
 	}
-	if quota := s.quotaFor(agent); !alreadyCharged && !storageAdditionFits(used, size, quota) {
+	if quota := s.quotaFor(folder); !alreadyCharged && !storageAdditionFits(used, size, quota) {
 		lock.Unlock()
 		hint := "delete files or raise STORAGE_QUOTA"
-		if !agent.OwnerVerified {
+		if !folder.OwnerVerified {
 			hint = "unverified agents get a reduced quota — verify your owner email to unlock the full one"
 		}
 		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("storage quota exceeded: %d used + %d new > %d (%s)", used, size, quota, hint)
 	}
-	f, err := s.st.AddFile(agent.ID, sha, name, mimeType, size, "upload", true, s.fileExpiry(agent))
+	f, err := s.st.AddFile(folder.ID, sha, name, mimeType, size, "upload", true, s.fileExpiry(folder))
 	lock.Unlock()
 	if err != nil {
 		return nil, http.StatusInternalServerError, err
@@ -1013,7 +1040,7 @@ func (s *Server) performUpload(agent store.Agent, name, contentType string, body
 		res.ExpiresAt = time.Unix(f.ExpiresAt, 0).UTC().Format(time.RFC3339)
 	}
 	if share {
-		l, err := s.st.CreateLink(agent.ID, sha, f.Name, f.MIME, size, once, ttl)
+		l, err := s.st.CreateLink(folder.ID, sha, f.Name, f.MIME, size, once, ttl)
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
@@ -1058,12 +1085,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, agent stor
 }
 
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request, agent store.Agent) {
-	files, err := s.st.ListFiles(agent.ID)
+	folder := s.folderFor(agent)
+	files, err := s.st.ListFiles(folder.ID)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	used, err := s.st.StorageUsed(agent.ID)
+	used, err := s.st.StorageUsed(folder.ID)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "read storage usage: %v", err)
 		return
@@ -1080,7 +1108,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request, agent s
 		}
 		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": out, "storage_used": used, "storage_quota": s.quotaFor(agent)})
+	writeJSON(w, http.StatusOK, map[string]any{"files": out, "storage_used": used, "storage_quota": s.quotaFor(folder)})
 }
 
 func shaParam(r *http.Request) string {
@@ -1089,8 +1117,9 @@ func shaParam(r *http.Request) string {
 
 func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	sha := shaParam(r)
+	folder := s.folderFor(agent)
 	if entry := strings.TrimSpace(r.URL.Query().Get("entry")); entry != "" {
-		f, err := s.st.DeleteFileEntry(agent.ID, sha, entry)
+		f, err := s.st.DeleteFileEntry(folder.ID, sha, entry)
 		if errors.Is(err, store.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "no such file entry in your folder")
 			return
@@ -1103,7 +1132,7 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent 
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": 1, "links_revoked": 0})
 		return
 	}
-	files, err := s.st.DeleteFile(agent.ID, sha)
+	files, err := s.st.DeleteFile(folder.ID, sha)
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no such file in your folder")
 		return
@@ -1113,7 +1142,7 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent 
 		return
 	}
 	// Deleting a file kills its live links too — "remove" means now.
-	revoked, _ := s.st.RevokeLinksForSHA(agent.ID, sha)
+	revoked, _ := s.st.RevokeLinksForSHA(folder.ID, sha)
 	for _, l := range revoked {
 		s.sever(l.Token)
 		s.appendReceipt(agent.Email, receipt.ActionRevoked, l.SHA256, l.Size, "link:"+l.Token, "")
@@ -1127,7 +1156,8 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request, agent 
 func (s *Server) handleKeepFile(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	// Keep claims the file at the agent's tier: persistent for verified
 	// owners, extended to the unverified ceiling otherwise.
-	f, err := s.st.KeepFile(agent.ID, shaParam(r), s.fileExpiry(agent))
+	folder := s.folderFor(agent)
+	f, err := s.st.KeepFile(folder.ID, shaParam(r), s.fileExpiry(folder))
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no such file in your folder")
 		return
@@ -1147,13 +1177,26 @@ func (s *Server) handleKeepFile(w http.ResponseWriter, r *http.Request, agent st
 // share link).
 func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	sha := shaParam(r)
-	f, err := s.st.FileBySHA(agent.ID, sha)
+	f, err := s.st.FileBySHA(s.folderFor(agent).ID, sha)
 	if errors.Is(err, store.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "no such file in your folder")
 		return
 	}
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if s.st.Remote() {
+		// Bytes come straight from object storage; X-Sha256 rides on this
+		// redirect so clients can still verify what they receive.
+		u, err := s.st.BlobURL(f.SHA256, f.Name, f.MIME, s.downloadURLTTL())
+		if err != nil {
+			errJSON(w, http.StatusNotFound, "blob missing")
+			return
+		}
+		w.Header().Set("X-Sha256", f.SHA256)
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, u, http.StatusFound)
 		return
 	}
 	blob, err := s.st.OpenBlob(f.SHA256)
@@ -1180,7 +1223,8 @@ func (s *Server) handleCreateLink(w http.ResponseWriter, r *http.Request, agent 
 		errJSON(w, http.StatusBadRequest, "%v", err)
 		return
 	}
-	f, err := s.resolveFile(agent, req.File)
+	folder := s.folderFor(agent)
+	f, err := s.resolveFile(folder, req.File)
 	if err != nil {
 		errJSON(w, http.StatusNotFound, "%v", err)
 		return
@@ -1190,7 +1234,7 @@ func (s *Server) handleCreateLink(w http.ResponseWriter, r *http.Request, agent 
 		errJSON(w, http.StatusBadRequest, "%v", err)
 		return
 	}
-	l, err := s.st.CreateLink(agent.ID, f.SHA256, f.Name, f.MIME, f.Size, req.Once, ttl)
+	l, err := s.st.CreateLink(folder.ID, f.SHA256, f.Name, f.MIME, f.Size, req.Once, ttl)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -1198,19 +1242,20 @@ func (s *Server) handleCreateLink(w http.ResponseWriter, r *http.Request, agent 
 	writeJSON(w, http.StatusCreated, s.linkJSON(l))
 }
 
-func (s *Server) resolveFile(agent store.Agent, ref string) (store.File, error) {
+// resolveFile looks ref up in folder — callers pass s.folderFor(agent).
+func (s *Server) resolveFile(folder store.Agent, ref string) (store.File, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return store.File{}, errors.New("file reference required (\"sha256:...\" or a folder filename)")
 	}
 	if sha, ok := strings.CutPrefix(ref, "sha256:"); ok {
-		f, err := s.st.FileBySHA(agent.ID, strings.ToLower(sha))
+		f, err := s.st.FileBySHA(folder.ID, strings.ToLower(sha))
 		if err != nil {
 			return f, fmt.Errorf("no file with hash %s in your folder", sha)
 		}
 		return f, nil
 	}
-	f, err := s.st.FileByName(agent.ID, ref)
+	f, err := s.st.FileByName(folder.ID, ref)
 	if err != nil {
 		return f, fmt.Errorf("no file named %q in your folder", ref)
 	}
@@ -1218,7 +1263,7 @@ func (s *Server) resolveFile(agent store.Agent, ref string) (store.File, error) 
 }
 
 func (s *Server) handleListLinks(w http.ResponseWriter, r *http.Request, agent store.Agent) {
-	links, err := s.st.ListLinks(agent.ID)
+	links, err := s.st.ListLinks(s.folderFor(agent).ID)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -1233,7 +1278,7 @@ func (s *Server) handleListLinks(w http.ResponseWriter, r *http.Request, agent s
 func (s *Server) handleRevokeLink(w http.ResponseWriter, r *http.Request, agent store.Agent) {
 	token := r.PathValue("token")
 	l, err := s.st.GetLink(token)
-	if err != nil || l.AgentID != agent.ID {
+	if err != nil || (l.AgentID != agent.ID && l.AgentID != s.folderFor(agent).ID) {
 		errJSON(w, http.StatusNotFound, "no such link")
 		return
 	}
@@ -1485,6 +1530,7 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	var localAgents []store.Agent
 	var remote []string
 	var canonicalTo []string
+	skippedSelf := ""
 	seen := map[string]bool{}
 	for _, to := range req.To {
 		raw := strings.TrimSpace(to)
@@ -1511,6 +1557,12 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 				return nil, http.StatusBadRequest, fmt.Errorf("no agent %q on this instance", addr)
 			}
 			for _, la := range resolved {
+				// Fan-out to a person reaches their other agents, not the
+				// sender itself (an explicit self-address still delivers).
+				if la.ID == agent.ID && localpart != agent.Name {
+					skippedSelf = addr
+					continue
+				}
 				dup := false
 				for _, have := range localAgents {
 					if have.ID == la.ID {
@@ -1527,6 +1579,9 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 		remote = append(remote, addr)
 	}
 	if len(localAgents)+len(remote) == 0 {
+		if skippedSelf != "" {
+			return nil, http.StatusBadRequest, fmt.Errorf("you are the only agent at %s so far — connect another AI to receive there", skippedSelf)
+		}
 		return nil, http.StatusBadRequest, errors.New("\"to\" requires at least one recipient")
 	}
 
@@ -1554,8 +1609,9 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	// have no side effects, so a bad reference costs nothing.
 	var sendFile *store.File
 	var linkTTL time.Duration
+	folder := s.folderFor(agent)
 	if req.File != "" {
-		f, err := s.resolveFile(agent, req.File)
+		f, err := s.resolveFile(folder, req.File)
 		if err != nil {
 			return nil, http.StatusNotFound, err
 		}
@@ -1613,7 +1669,7 @@ func (s *Server) performSend(agent store.Agent, req sendRequest) (*sendResult, i
 	// File → fresh ephemeral link.
 	var filePart *proto.Part
 	if sendFile != nil {
-		l, err := s.st.CreateLink(agent.ID, sendFile.SHA256, sendFile.Name, sendFile.MIME, sendFile.Size, req.Once, linkTTL)
+		l, err := s.st.CreateLink(folder.ID, sendFile.SHA256, sendFile.Name, sendFile.MIME, sendFile.Size, req.Once, linkTTL)
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
@@ -2190,6 +2246,18 @@ func (s *Server) handleWellKnown(w http.ResponseWriter, r *http.Request) {
 		"email_enabled":  s.emailCapable(),
 		"protocols":      map[string]any{"manifest": proto.Version, "uri_file_parts": true},
 		"endpoints":      map[string]string{"api": s.BaseURL() + "/v1", "mcp": s.BaseURL() + "/mcp"},
+		// Direct uploads: POST /v1/uploads hands out presigned object-storage
+		// URLs (single PUT or resumable multipart); bytes never transit here.
+		"uploads":      map[string]any{"direct": s.st.Remote()},
+		"public_links": s.cfg.PublicLinks,
+	}
+	if s.cfg.Accounts {
+		out["accounts"] = map[string]any{
+			"sign_in":                    s.BaseURL() + "/login",
+			"oauth_authorization_server": s.BaseURL() + "/.well-known/oauth-authorization-server",
+			"oauth_protected_resource":   s.BaseURL() + "/.well-known/oauth-protected-resource/mcp",
+			"openapi":                    s.BaseURL() + "/openapi.json",
+		}
 	}
 	if s.cfg.AppDomain != "" {
 		readiness := s.appHostingStatus(r.Context())
@@ -2223,6 +2291,15 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// browsers always lead with text/html and keep the human page.
 	if wantsMarkdown(r) {
 		s.handleLLMs(w, r)
+		return
+	}
+	if s.cfg.Accounts {
+		// The hosted product: a person's drive shared by every AI they connect.
+		_, _, signedIn := s.currentPerson(r)
+		s.render(w, "home.html", map[string]any{
+			"MCP": s.mcpResource(), "Quota": roundSize(s.cfg.StorageQuota),
+			"MaxFile": roundSize(s.cfg.MaxFileSize), "SignedIn": signedIn,
+		})
 		return
 	}
 	staticReady, containersReady := s.advertisedAppHosting(r.Context())
@@ -2277,4 +2354,4 @@ func (s *Server) handleLaunchAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 // Version is stamped at build time via -ldflags; keep a sane default.
-var Version = "0.7.0-dev"
+var Version = "0.8.0-dev"

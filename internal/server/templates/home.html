@@ -1,0 +1,377 @@
+<!doctype html>
+<!--
+  If you are an agent reading the source: this page is also served as plain
+  text — GET / with "Accept: text/markdown", or fetch /llms.txt.
+  MCP connector: {{.MCP}} · API: {{.Base}}/openapi.json
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentTransfer — share files between ChatGPT, Claude, Muse and your other AIs</title>
+<meta name="description" content="One drive every AI you use can share. Save a file in ChatGPT, open it in Claude, hand it to your coding agent — or send it to someone else's agent. Free, any size, hash-checked.">
+<meta property="og:title" content="AgentTransfer — send any file to any agent">
+<meta property="og:description" content="One drive shared by ChatGPT, Claude, Muse and your coding agents, plus an address other agents can send to. Free, any size, hash-checked.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{.Base}}/">
+<link rel="canonical" href="{{.Base}}/">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="Agent-readable overview">
+<link rel="stylesheet" href="/static/site/site.css">
+<link rel="icon" href="/static/site/icon.svg" type="image/svg+xml">
+<script type="application/ld+json">
+[{"@context":"https://schema.org","@type":"SoftwareApplication","name":"AgentTransfer",
+ "applicationCategory":"BusinessApplication","operatingSystem":"Web",
+ "offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},
+ "description":"Share files between ChatGPT, Claude, Muse and coding agents: one drive every AI you use can read and write, an address per agent, sha256-verified transfers of any size.",
+ "url":"{{.Base}}/","sameAs":["https://github.com/shehryarsaroya/agenttransfer"]},
+ {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[
+  {"@type":"Question","name":"What can a connected AI see?","acceptedAnswer":{"@type":"Answer","text":"Only your AgentTransfer drive and the messages sent to its own address. It can't see your other apps or chats."}},
+  {"@type":"Question","name":"Is AgentTransfer free?","acceptedAnswer":{"@type":"Answer","text":"Yes. The free plan includes a {{.Quota}} drive and files up to {{.MaxFile}} each."}},
+  {"@type":"Question","name":"Do you train AI on my files?","acceptedAnswer":{"@type":"Answer","text":"No. Your files are only stored and delivered for you."}}]}]
+</script>
+<style>
+  main{padding:0}
+  .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint)}
+  .hero{text-align:center;padding:30px 0 6px}
+  .hero canvas{display:block;margin:0 auto -14px;width:min(300px,62vw);height:auto}
+  .hero h1{font-size:clamp(28px,5.2vw,46px);line-height:1.12;letter-spacing:-1px;max-width:820px;margin:12px auto 0}
+  .hero h1 em{font-style:normal;color:var(--amber)}
+  .hero .lead{margin:16px auto 0;font-size:16px;max-width:660px}
+  .cta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:24px 0 0}
+  .cta .btn{padding:12px 20px;font-size:14px}
+  .addto{margin-top:14px;font-size:13px;color:var(--dim)}
+  .addto a{color:var(--ink)}
+  .addto .sep{color:var(--faint);margin:0 6px}
+
+  section.block{padding:76px 0 0}
+  section.block h2{font-size:clamp(20px,3vw,27px);letter-spacing:-.4px;margin:8px 0 10px;line-height:1.25}
+  section.block .lead{max-width:660px}
+
+  /* pains */
+  .pains{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:22px}
+  .pain{border:1px dashed var(--line2);border-radius:12px;padding:16px 16px 14px;color:var(--dim);font-size:13.5px}
+  .pain b{display:block;color:var(--ink);font-size:14px;margin-bottom:6px;text-decoration:line-through;text-decoration-color:var(--amber);text-decoration-thickness:2px}
+  .fix{margin-top:14px;font-size:14px}
+  .fix b{color:var(--amber)}
+  @media (max-width:760px){.pains{grid-template-columns:1fr}}
+
+  /* fleet diagram */
+  .fleet{display:grid;grid-template-columns:1fr auto minmax(220px,auto) auto 1fr;gap:16px;align-items:center;margin-top:26px}
+  .fleet .col{display:flex;flex-direction:column;gap:10px}
+  .addr{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:11px 14px;font-size:13px;
+        display:flex;justify-content:space-between;gap:10px;align-items:center}
+  .addr b{font-weight:600} .addr i{font-style:normal;color:var(--faint);font-size:12px}
+  .drivebox{border:1px solid var(--amber);border-radius:14px;padding:20px;text-align:center;
+        background:color-mix(in srgb,var(--amber) 6%,var(--panel))}
+  .drivebox .t{font-weight:700;font-size:15px}
+  .drivebox .f{font-size:12.5px;color:var(--dim);margin-top:10px;line-height:1.9;text-align:left}
+  .wire{color:var(--faint);font-size:20px;text-align:center}
+  @media (max-width:760px){.fleet{grid-template-columns:1fr}.wire{transform:rotate(90deg)}}
+
+  /* scenes */
+  .scenes{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:16px;margin-top:24px}
+  .scene{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:12px}
+  .scene .k{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--amber)}
+  .scene h3{margin:0;font-size:15.5px}
+  .scene p{color:var(--dim);font-size:13.5px;margin:0}
+  .chat{border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:12px;font-size:12.5px;display:flex;flex-direction:column;gap:8px;margin-top:auto}
+  .chat .u{align-self:flex-end;background:var(--raise);border:1px solid var(--line);border-radius:10px 10px 2px 10px;padding:6px 10px;max-width:90%}
+  .chat .a{align-self:flex-start;color:var(--ink);max-width:95%}
+  .chat .a small{display:block;color:var(--faint);font-size:11px}
+  .chat .who{font-size:10.5px;color:var(--faint);letter-spacing:.08em;text-transform:uppercase}
+
+  /* connect tabs (CSS only) */
+  .connect{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:20px;margin-top:22px}
+  .connect input[type=radio]{position:absolute;opacity:0;pointer-events:none}
+  .connect .tabs label{margin:0;cursor:pointer;border:1px solid var(--line2);border-radius:999px;padding:6px 13px;font-size:12.5px;color:var(--dim);background:var(--raise)}
+  .connect .tabs label:hover{color:var(--ink)}
+  .connect .panel{display:none;margin-top:16px}
+  #t-chatgpt:checked~.tabs label[for=t-chatgpt],#t-claude:checked~.tabs label[for=t-claude],#t-muse:checked~.tabs label[for=t-muse],
+  #t-code:checked~.tabs label[for=t-code],#t-other:checked~.tabs label[for=t-other]{color:var(--amber-ink);background:var(--amber);border-color:var(--amber)}
+  #t-chatgpt:checked~.p-chatgpt,#t-claude:checked~.p-claude,#t-muse:checked~.p-muse,#t-code:checked~.p-code,#t-other:checked~.p-other{display:block}
+  .connect .steps{margin-top:6px}
+  .connect .steps li{color:var(--dim);font-size:13.5px}
+  .connect .steps b{color:var(--ink)}
+  .urlrow{display:flex;gap:8px;align-items:stretch;margin:4px 0 14px}
+  .urlrow code{flex:1;display:flex;align-items:center;padding:10px 12px;font-size:13px;overflow-x:auto;white-space:nowrap}
+
+  /* trust grid */
+  .facts{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+         border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:22px}
+  .facts>div{background:var(--panel);padding:18px}
+  .facts b{display:block;font-size:14px;margin-bottom:4px}
+  .facts span{color:var(--dim);font-size:13px}
+  @media (max-width:820px){.facts{grid-template-columns:repeat(2,1fr)}}
+  @media (max-width:520px){.facts{grid-template-columns:1fr}}
+
+  /* faq */
+  .faq{margin-top:18px;border-top:1px solid var(--line)}
+  .faq details{border-bottom:1px solid var(--line);padding:14px 2px}
+  .faq summary{cursor:pointer;font-weight:600;list-style:none;display:flex;justify-content:space-between;gap:12px}
+  .faq summary::-webkit-details-marker{display:none}
+  .faq summary::after{content:"+";color:var(--amber);font-weight:400}
+  .faq details[open] summary::after{content:"–"}
+  .faq p{color:var(--dim);font-size:13.5px;margin:10px 0 0;max-width:720px}
+
+  .agents pre{margin-top:14px}
+  .price{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:22px}
+  .plan{border:1px solid var(--line);border-radius:12px;padding:22px;background:var(--panel)}
+  .plan.main{border-color:var(--amber)}
+  .plan .p{font-size:28px;font-weight:700;margin:6px 0 2px}
+  .plan ul{list-style:none;margin:14px 0 18px;color:var(--dim);font-size:13.5px}
+  .plan li{margin:6px 0}
+  .plan li::before{content:"✓ ";color:var(--green)}
+  .closing{text-align:center;padding:84px 0 72px}
+  .closing h2{font-size:clamp(22px,3.4vw,30px);letter-spacing:-.5px}
+  .closing p{color:var(--dim);margin-top:8px}
+</style>
+</head>
+<body>
+<nav class="nav"><div class="wrap">
+  <a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke-width="5.5" stroke-linecap="round"><path d="M 38.51 19.09 A 13 13 0 1 1 28.91 25.22" stroke="currentColor"/><path d="M 27.49 44.91 A 13 13 0 1 1 37.09 38.78" stroke="var(--amber)"/></g></svg><span>AgentTransfer</span></a>
+  <div class="links">
+    <a class="hide-sm" href="#connect">Connect</a>
+    <a class="hide-sm" href="#faq">FAQ</a>
+    <a class="hide-sm" href="/docs">Docs</a>
+    <a href="/account">{{if .SignedIn}}Your drive{{else}}Sign in{{end}}</a>
+  </div>
+</div></nav>
+
+<main>
+<div class="wrap">
+  <header class="hero">
+    <canvas id="chain" width="300" height="300" aria-label="Two interlocked rings drawn in halftone dots; a pulse of light passes from one ring to the other, like a file handed between two agents."></canvas>
+    <div class="eyebrow">For everyone who uses more than one AI</div>
+    <h1>Send any file to any agent — <em>yours or anyone's.</em></h1>
+    <p class="lead">ChatGPT, Claude, Muse and your coding agents each keep their own files, so you end up downloading and re-uploading. AgentTransfer gives them one drive to share — save in one, open in another, or send it straight to someone else's agent.</p>
+    <div class="cta">
+      <a class="btn primary" href="{{if .SignedIn}}/account{{else}}/login{{end}}">{{if .SignedIn}}Open your drive{{else}}Get started — it's free{{end}}</a>
+      <a class="btn" href="#connect">Connect your AIs →</a>
+    </div>
+    <p class="addto">Add to <a href="#connect" data-tab="t-chatgpt">ChatGPT</a><span class="sep">·</span><a href="#connect" data-tab="t-claude">Claude</a><span class="sep">·</span><a href="#connect" data-tab="t-muse">Meta Muse</a><span class="sep">·</span><a href="#connect" data-tab="t-code">Claude Code &amp; Codex</a><span class="sep">·</span><a href="#connect" data-tab="t-other">any MCP app</a></p>
+  </header>
+
+  <section class="block" id="why">
+    <div class="eyebrow">Sound familiar?</div>
+    <h2>Your AIs are great. Getting files between them isn't.</h2>
+    <div class="pains">
+      <div class="pain"><b>Download from ChatGPT, re-upload to Claude.</b>Every app keeps its own copy, and none of them can see the others'.</div>
+      <div class="pain"><b>"File too large to attach."</b>Your coding agent's 3 GB export is stuck on the laptop it ran on.</div>
+      <div class="pain"><b>Emailing files so someone's agent can read them.</b>Then hoping the right version arrived intact.</div>
+    </div>
+    <p class="fix">AgentTransfer gives every AI you use <b>one shared drive</b>, and every agent <b>an address</b> files can be sent to.</p>
+  </section>
+
+  <section class="block" id="drive">
+    <div class="eyebrow">One drive, every AI</div>
+    <h2>Each AI gets its own address. They all share your drive.</h2>
+    <p class="lead">Connect an AI and it joins your account under your name. What one saves, the others can open. Disconnect any of them and your files stay put.</p>
+    <div class="fleet" role="img" aria-label="Four connected AIs, each with its own address, all sharing one drive">
+      <div class="col">
+        <div class="addr"><b>you+chatgpt@</b><i>ChatGPT</i></div>
+        <div class="addr"><b>you+claude@</b><i>Claude</i></div>
+      </div>
+      <div class="wire" aria-hidden="true">⇄</div>
+      <div class="drivebox">
+        <div class="t">you@{{.Domain}}</div>
+        <div class="f">▤ launch-brief.md<br>▤ launch-deck.pdf<br>▤ dataset-v3.tar.gz · 3.1 GB<br>▤ q3-forecast.xlsx</div>
+      </div>
+      <div class="wire" aria-hidden="true">⇄</div>
+      <div class="col">
+        <div class="addr"><b>you+muse@</b><i>Meta Muse</i></div>
+        <div class="addr"><b>you+laptop@</b><i>Claude Code</i></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="scenes">
+    <div class="eyebrow">What it's for</div>
+    <h2>Make it in one AI. Finish it in another. Hand it to anyone.</h2>
+    <div class="scenes">
+      <article class="scene">
+        <div class="k">Across your AIs</div>
+        <h3>Claude drafts the brief. ChatGPT picks it up.</h3>
+        <p>No downloading, no re-uploading — the file is already there.</p>
+        <div class="chat">
+          <div class="who">in ChatGPT</div>
+          <div class="u">Open the launch brief Claude wrote and tighten the intro.</div>
+          <div class="a">Opened <b>launch-brief.md</b> from AgentTransfer. Here's a tighter intro — saved as <b>launch-brief-v2.md</b>.<small>read_file · save_file</small></div>
+        </div>
+      </article>
+      <article class="scene">
+        <div class="k">Any size</div>
+        <h3>Claude Code exports 3 GB. Your other AIs can reach it.</h3>
+        <p>Big files go straight to storage, resume if the connection drops, and are hash-checked before anyone sees them.</p>
+        <div class="chat">
+          <div class="who">in your terminal</div>
+          <div class="u">$ agenttransfer put dataset-v3.tar.gz</div>
+          <div class="a">✓ 3.1 GB uploaded · sha256 8f2a41…c09e verified<small>in your drive for every connected AI</small></div>
+        </div>
+      </article>
+      <article class="scene">
+        <div class="k">To anyone's agent</div>
+        <h3>Send it to dana@. It reaches whichever of her agents is awake.</h3>
+        <p>Every delivery carries the file's sha256, so the receiving agent can check it got exactly what you sent.</p>
+        <div class="chat">
+          <div class="who">in Claude</div>
+          <div class="u">Send the deck to dana@{{.Domain}}.</div>
+          <div class="a">Sent <b>launch-deck.pdf</b> (4.2 MB) to Dana. Her agents can verify it by its hash.<small>send</small></div>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section class="block" id="connect">
+    <div class="eyebrow">Connect in a minute</div>
+    <h2>Add AgentTransfer to the AIs you already use.</h2>
+    <p class="lead">One connector URL works everywhere. Each app asks you to sign in and approve it once.</p>
+    <div class="connect">
+      <input type="radio" name="tab" id="t-chatgpt" checked>
+      <input type="radio" name="tab" id="t-claude">
+      <input type="radio" name="tab" id="t-muse">
+      <input type="radio" name="tab" id="t-code">
+      <input type="radio" name="tab" id="t-other">
+      <div class="tabs row" role="tablist">
+        <label for="t-chatgpt">ChatGPT</label><label for="t-claude">Claude</label><label for="t-muse">Meta Muse</label><label for="t-code">Claude Code &amp; Codex</label><label for="t-other">Other MCP apps</label>
+      </div>
+      <div class="panel p-chatgpt">
+        <ol class="steps">
+          <li>In ChatGPT open <b>Settings → Apps &amp; Connectors</b> and turn on <b>Developer mode</b> (under Advanced).</li>
+          <li>Choose <b>Create</b>, paste the URL below, and pick <b>OAuth</b>.</li>
+          <li>Sign in and click <b>Allow</b>. Then attach a file and say <i>"Save this to AgentTransfer."</i></li>
+        </ol>
+      </div>
+      <div class="panel p-claude">
+        <ol class="steps">
+          <li>In Claude open <b>Settings → Connectors → Add custom connector</b>.</li>
+          <li>Paste the URL below and click <b>Connect</b>.</li>
+          <li>Sign in and click <b>Allow</b>. Then ask <i>"What's in my AgentTransfer drive?"</i></li>
+        </ol>
+      </div>
+      <div class="panel p-muse">
+        <ol class="steps">
+          <li><a href="/login">Sign in</a> and create an API key named <b>muse</b> on your account page.</li>
+          <li>Tell Muse: <i>"Connect to AgentTransfer at {{.Base}} — the API is described at {{.Base}}/openapi.json — using this key."</i></li>
+          <li>Muse becomes <b>you+muse@{{.Domain}}</b> and shares your drive.</li>
+        </ol>
+      </div>
+      <div class="panel p-code">
+        <ol class="steps">
+          <li>Claude Code: <code>claude mcp add --transport http agenttransfer {{.MCP}}</code>, then run <code>/mcp</code> to sign in.</li>
+          <li>Codex, Cursor and others: add the URL below as a remote MCP server with OAuth.</li>
+          <li>For big files, the <a href="/docs#cli">CLI</a> uploads straight to storage: <code>agenttransfer put ./dataset.tar.gz</code></li>
+        </ol>
+      </div>
+      <div class="panel p-other">
+        <ol class="steps">
+          <li>Gemini, Perplexity, Grok, Le Chat: add a <b>custom MCP connector</b> with the URL below and OAuth.</li>
+          <li>Apps without OAuth can use an API key from your account as <code>Authorization: Bearer …</code>.</li>
+          <li>Everything is plain HTTPS too: <a href="/openapi.json">OpenAPI</a> · <a href="/llms.txt">llms.txt</a>.</li>
+        </ol>
+      </div>
+      <div class="urlrow"><code id="mcpurl">{{.MCP}}</code><button class="btn sm" type="button" data-copy="#mcpurl">Copy</button></div>
+      <p class="small faint">More detail for each app is in the <a href="/docs#connect">docs</a>.</p>
+    </div>
+  </section>
+
+  <section class="block" id="trust">
+    <div class="eyebrow">Built to be trusted</div>
+    <h2>Handoffs you can check, from apps you can disconnect.</h2>
+    <div class="facts">
+      <div><b>Hash-checked</b><span>Every file is fingerprinted with sha256 when it's saved, and the hash travels with every delivery so the receiver can check it.</span></div>
+      <div><b>An address per AI</b><span>you+chatgpt@, you+claude@ — see what each one did, cut any one off.</span></div>
+      <div><b>Your approval, every time</b><span>Each AI connects through a sign-in and a consent screen you approve — and you can disconnect any of them.</span></div>
+      <div><b>Links that expire</b><span>Share links last 24 hours at most, and can be single-use.</span></div>
+      <div><b>Not used for training</b><span>Your files are stored and delivered for you — never sold, never used to train models.</span></div>
+      <div><b>Open source</b><span>MIT-licensed. Read the code, or run your own copy with one binary.</span></div>
+    </div>
+  </section>
+
+  <section class="block" id="faq">
+    <div class="eyebrow">Questions</div>
+    <h2>Good to know</h2>
+    <div class="faq">
+      <details><summary>What can a connected AI see?</summary><p>Only your AgentTransfer drive and the messages sent to its own address. It can't see your other apps, chats or accounts. Disconnect it from your account page any time.</p></details>
+      <details><summary>Is it free?</summary><p>Yes. The free plan includes a {{.Quota}} drive, files up to {{.MaxFile}} each, and as many connected AIs as you like. Bigger plans are coming.</p></details>
+      <details><summary>How big can files be?</summary><p>Up to {{.MaxFile}} each. Chat apps limit what you can attach, so for big files ask your AI to "create an AgentTransfer upload page", use the drop zone on your account page, or the CLI — all three go straight to storage.</p></details>
+      <details><summary>Who can download my files?</summary><p>You and the AIs you connect. A file only leaves your drive when you or one of your AIs sends it, or creates a share link — and links expire within 24 hours.</p></details>
+      <details><summary>Can I send files to other people?</summary><p>Yes. Send to their address (name@{{.Domain}}) and it arrives in their agents' inboxes with its sha256 fingerprint. Send to any email address and they get a download link.</p></details>
+      <details><summary>Can I delete my data?</summary><p>Delete any file whenever you like. Deleting your account removes your connected agents and every file in your drive.</p></details>
+      <details><summary>Can I run it myself?</summary><p>Yes — AgentTransfer is open source. One Go binary runs the whole service on your own server, with local disk or any S3-compatible storage. <a href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a>.</p></details>
+    </div>
+  </section>
+
+  <section class="block agents" id="agents">
+    <div class="eyebrow">For developers and agents</div>
+    <h2>It's an MCP server and a plain HTTPS API.</h2>
+    <p class="lead">Connect over MCP with OAuth at <code>{{.MCP}}</code>, or use an API key with the REST API (<a href="/openapi.json">OpenAPI</a>) and the open-source CLI. Agents can read <a href="/llms.txt">/llms.txt</a>.</p>
+<pre><span class="faint"># save a file, then send it to another agent</span>
+curl -T report.pdf {{.Base}}/v1/files/report.pdf -H "Authorization: Bearer $AGENTTRANSFER_KEY"
+curl -X POST {{.Base}}/v1/send -H "Authorization: Bearer $AGENTTRANSFER_KEY" \
+  -d '{"to":["dana@{{.Domain}}"],"file":"report.pdf","note":"final version"}'</pre>
+  </section>
+
+  <section class="block" id="pricing">
+    <div class="eyebrow">Pricing</div>
+    <h2>Free while we're early.</h2>
+    <div class="price">
+      <div class="plan main">
+        <div class="eyebrow">Free</div>
+        <div class="p">$0</div>
+        <div class="dim small">per month</div>
+        <ul>
+          <li>{{.Quota}} drive</li>
+          <li>Files up to {{.MaxFile}} each</li>
+          <li>Unlimited connected AIs</li>
+          <li>Send to any agent or person</li>
+        </ul>
+        <a class="btn primary block" href="{{if .SignedIn}}/account{{else}}/login{{end}}">{{if .SignedIn}}Open your drive{{else}}Get started{{end}}</a>
+      </div>
+      <div class="plan">
+        <div class="eyebrow">More space</div>
+        <div class="p">Soon</div>
+        <div class="dim small">bigger drive and files</div>
+        <ul>
+          <li>100 GB+ drive</li>
+          <li>Larger files</li>
+          <li>Priority support</li>
+        </ul>
+        <a class="btn block" href="/support">Ask for early access</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="closing">
+    <h2>Give your AIs one place to put things.</h2>
+    <p>Two minutes to set up. Free.</p>
+    <div class="cta"><a class="btn primary" href="{{if .SignedIn}}/account{{else}}/login{{end}}">{{if .SignedIn}}Open your drive{{else}}Get started — it's free{{end}}</a><a class="btn" href="https://github.com/shehryarsaroya/agenttransfer">View source</a></div>
+  </section>
+</div>
+</main>
+
+<footer><div class="wrap">
+  <span>© {{.Year}} AgentTransfer</span>
+  <a href="/docs">Docs</a>
+  <a href="/privacy">Privacy</a>
+  <a href="/terms">Terms</a>
+  <a href="/support">Support</a>
+  <a href="/llms.txt">llms.txt</a>
+  <a href="https://github.com/shehryarsaroya/agenttransfer">Open source (MIT)</a>
+</div></footer>
+<script src="/static/site/chain.js" defer></script>
+<script>
+  // "Add to …" links open the matching connect tab; copy buttons copy.
+  document.addEventListener("click", function (e) {
+    var a = e.target.closest("[data-tab]");
+    if (a) { var t = document.getElementById(a.getAttribute("data-tab")); if (t) t.checked = true; }
+    var b = e.target.closest("[data-copy]");
+    if (b) {
+      var el = document.querySelector(b.getAttribute("data-copy"));
+      navigator.clipboard.writeText(el.textContent.trim()).then(function () {
+        var old = b.textContent; b.textContent = "Copied"; setTimeout(function () { b.textContent = old; }, 1400);
+      });
+    }
+  });
+</script>
+</body>
+</html>

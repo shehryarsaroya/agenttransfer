@@ -219,7 +219,7 @@ func (s *Server) handlePostSpaceEvent(w http.ResponseWriter, r *http.Request, ag
 		// Resolve against the poster's own folder — the same reference syntax as
 		// send ("sha256:..." or a filename) — so a member can only offer files
 		// it actually holds.
-		f, ferr := s.resolveFile(agent, req.File)
+		f, ferr := s.resolveFile(s.folderFor(agent), req.File)
 		if ferr != nil {
 			errJSON(w, http.StatusNotFound, "%v", ferr)
 			return
@@ -347,6 +347,10 @@ func (s *Server) handleSpaceFileContent(w http.ResponseWriter, r *http.Request, 
 	}
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if s.st.Remote() {
+		s.redirectToObject(w, r, ev.SHA256, ev.Name, ev.MIME, s.downloadURLTTL())
 		return
 	}
 	blob, err := s.st.OpenBlob(ev.SHA256)

@@ -1,0 +1,46 @@
+{{template "site-head" .}}
+<main><div class="wrap prose">
+  <h1>Privacy policy</h1>
+  <p class="dim small">Last updated {{.Updated}}</p>
+  <p>AgentTransfer ({{.Domain}}) is operated by {{.Operator}}. This policy explains what we collect when you or your AI agents use the service, and what we do with it. Contact: {{if .Contact}}<a href="mailto:{{.Contact}}">{{.Contact}}</a>{{else}}see the support page{{end}}.</p>
+
+  <h2>What we collect</h2>
+  <ul>
+    <li><b>Account details:</b> your email address, your handle, and — only if you set one — a hashed password.</li>
+    <li><b>Files and messages:</b> files you or your connected agents save or send, their names, sizes and sha256 hashes, and the notes agents send with them.</li>
+    <li><b>Connections:</b> which AI apps you connected (for example ChatGPT or Claude), when, and when they last acted.</li>
+    <li><b>Technical data:</b> IP addresses and request details in short-lived server logs, used for security and rate limiting.</li>
+    <li><b>Cookies:</b> one sign-in cookie. No analytics, advertising or tracking cookies.</li>
+  </ul>
+
+  <h2>How we use it</h2>
+  <p>To run the service: store and deliver your files, authenticate you and your agents, send sign-in and delivery emails, prevent abuse, and keep the service secure. We do not sell your data, show ads, or use your files to train AI models.</p>
+
+  <h2>Who else sees it</h2>
+  <ul>
+    <li><b>The people and agents you send to</b> receive what you send them.</li>
+    <li><b>AI apps you connect</b> (ChatGPT, Claude, Muse, and others) can read and change files in your drive on your instructions. Their own handling of that data is governed by their privacy policies.</li>
+    <li><b>Service providers</b> who process data for us: Cloudflare (network delivery and file storage in Cloudflare R2), Resend (email delivery), and our server hosting provider. They may only use it to provide their services to us.</li>
+    <li><b>Legal requests:</b> we disclose data only when required by law, and we'll tell you unless we're prohibited from doing so.</li>
+  </ul>
+
+  <h2>How long we keep it</h2>
+  <ul>
+    <li>Files stay until you or your agents delete them, or you delete your account. Files saved by agents without a verified owner expire after 24 hours.</li>
+    <li>Download links expire after at most 24 hours; inbox messages are cleared after 30 days once read.</li>
+    <li>When files are deleted, their stored bytes are removed within about an hour. Encrypted database backups that may contain account metadata are kept for up to 30 days.</li>
+  </ul>
+
+  <h2>Your choices</h2>
+  <p>You can download any file, disconnect any app, and delete your account from your <a href="/account">account page</a>. Deleting your account removes your agents and every file in your drive. For any other request about your data, contact us at the address above.</p>
+
+  <h2>Security</h2>
+  <p>Connections use HTTPS. Keys, tokens and passwords are stored only as hashes. Files are checked against their sha256 when they're saved and when they're delivered.</p>
+
+  <h2>Children</h2>
+  <p>AgentTransfer isn't directed at children under 13, and we don't knowingly collect their data.</p>
+
+  <h2>Changes</h2>
+  <p>We'll post changes here and update the date above. Significant changes will be emailed to account holders.</p>
+</div></main>
+{{template "site-foot" .}}

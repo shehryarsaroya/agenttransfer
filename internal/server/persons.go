@@ -191,7 +191,7 @@ func (s *Server) sendJoinEmail(agent store.Agent, person store.Person, newPerson
 // to nothing, indistinguishable from nonexistent.
 func (s *Server) resolveLocalRecipient(localpart string) []store.Agent {
 	if la, err := s.st.AgentByName(localpart); err == nil {
-		if !la.AttachPending() {
+		if !la.AttachPending() && !la.IsDrive() {
 			return []store.Agent{la}
 		}
 		return nil

@@ -1,0 +1,86 @@
+{{template "site-head" .}}
+<main><div class="wrap prose">
+  <h1>Docs</h1>
+  <p class="lead">AgentTransfer moves files between AI agents — yours and anyone's. You get one drive that every AI you connect shares, and an address other agents and people can send files to.</p>
+
+  <h2 id="concepts">The idea in one minute</h2>
+  <ul>
+    <li><b>Your drive.</b> One place for files, shared by every AI you connect. ChatGPT saves a spreadsheet; Claude, Muse or your coding agent can open it a minute later.</li>
+    <li><b>Addresses.</b> You are <code>you@{{.Domain}}</code>. Each AI you connect gets its own address under your name — <code>you+chatgpt@</code>, <code>you+claude@</code>, <code>you+laptop@</code> — so you can see who did what and disconnect any one of them.</li>
+    <li><b>Sending.</b> Send a file to any address and it lands in that inbox with its sha256, so the receiving agent can prove it got exactly what you sent. Outside email addresses get a normal email with a link.</li>
+    <li><b>Links.</b> Download links expire (24 hours at most) and can be single-use.</li>
+    <li><b>Size.</b> Files up to {{.MaxFile}} each; your drive holds {{.Quota}} on the free plan. Big files go straight to storage and are hash-checked before they show up.</li>
+  </ul>
+
+  <h2 id="connect">Connect your AIs</h2>
+  <p>The connector URL for every MCP client:</p>
+  <pre>{{.MCP}}</pre>
+  <p class="small dim">Clients sign in with OAuth — you approve each one on a consent screen, and it becomes <code>you+name@{{.Domain}}</code>.</p>
+
+  <h3 id="chatgpt">ChatGPT</h3>
+  <ol class="steps">
+    <li>Open <b>Settings → Apps &amp; Connectors</b>. If AgentTransfer is in the directory, click it and connect.</li>
+    <li>Otherwise enable <b>Developer mode</b> (Settings → Apps &amp; Connectors → Advanced), choose <b>Create</b>, paste the URL above, and pick <b>OAuth</b>.</li>
+    <li>Sign in and click <b>Allow</b>. Try: <i>“Save this file to AgentTransfer.”</i> with a file attached.</li>
+  </ol>
+
+  <h3 id="claude">Claude</h3>
+  <ol class="steps">
+    <li>Open <b>Settings → Connectors → Add custom connector</b>, paste the URL above, and connect.</li>
+    <li>Sign in and click <b>Allow</b>. Try: <i>“List my AgentTransfer files.”</i></li>
+  </ol>
+  <p class="small dim">Claude Code: <code>claude mcp add --transport http agenttransfer {{.MCP}}</code>, then run <code>/mcp</code> to sign in.</p>
+
+  <h3 id="muse">Meta Muse</h3>
+  <ol class="steps">
+    <li>In your <a href="/account">account</a>, create an API key named <code>muse</code>.</li>
+    <li>Tell Muse: <i>“Connect to AgentTransfer at {{.Base}}. The API is described at {{.Base}}/openapi.json. Use this API key: …”</i></li>
+    <li>Muse becomes <code>you+muse@{{.Domain}}</code> and shares your drive.</li>
+  </ol>
+
+  <h3 id="others">Gemini, Perplexity, Grok, Le Chat, Cursor, Codex</h3>
+  <p>Add a custom MCP connector with the URL above and OAuth. For clients configured with JSON:</p>
+<pre>{
+  "mcpServers": {
+    "agenttransfer": { "url": "{{.MCP}}" }
+  }
+}</pre>
+  <p class="small dim">Clients without OAuth can send an API key from your account as <code>Authorization: Bearer at_live_…</code>.</p>
+
+  <h2 id="tools">What a connected AI can do</h2>
+  <table>
+    <tr><td><code>save_file</code></td><td>Save an attached file, or text it wrote, to your drive</td></tr>
+    <tr><td><code>list_files</code> · <code>read_file</code></td><td>Find files and read text or images</td></tr>
+    <tr><td><code>get_link</code></td><td>Make an expiring download link</td></tr>
+    <tr><td><code>send</code></td><td>Send a file or note to any address</td></tr>
+    <tr><td><code>check_inbox</code> · <code>read_message</code> · <code>save_received_file</code></td><td>Receive files and keep them</td></tr>
+    <tr><td><code>delete_file</code></td><td>Delete a file (only when you ask)</td></tr>
+    <tr><td><code>create_upload_request</code></td><td>A web page anyone can upload a big file through</td></tr>
+  </table>
+
+  <h2 id="cli">Big files from a computer: the CLI</h2>
+  <p>Coding agents and scripts can use the open-source CLI, which streams files of any size straight to storage and verifies the sha256 on the way back:</p>
+<pre>agenttransfer login {{.Base}} --key at_live_…   # a key from your account
+agenttransfer put ./dataset.tar.gz                # resumable, hash-checked
+agenttransfer send dataset.tar.gz --to dana@{{.Domain}} --note "v3"
+agenttransfer inbox --wait 60
+agenttransfer get msg_…                           # downloads and verifies</pre>
+  <p class="small dim">Install from <a href="https://github.com/shehryarsaroya/agenttransfer/releases">GitHub releases</a> or <code>go install github.com/shehryarsaroya/agenttransfer@latest</code>. It also runs as a local MCP server (<code>agenttransfer mcp</code>) that moves files by path, so bytes never pass through the model.</p>
+
+  <h2 id="api">REST API</h2>
+  <p>Everything above is plain HTTPS with a bearer key. The machine-readable spec is at <a href="/openapi.json">/openapi.json</a>; an agent-readable overview is at <a href="/llms.txt">/llms.txt</a>.</p>
+<pre># upload: ask for a session, PUT the bytes, complete
+curl -X POST {{.Base}}/v1/uploads -H "Authorization: Bearer $KEY" \
+  -d '{"name":"report.pdf","size":48213}'
+curl -T report.pdf "&lt;put_url from the response&gt;"
+curl -X POST {{.Base}}/v1/uploads/&lt;upload_id&gt;/complete -H "Authorization: Bearer $KEY"
+
+# send it, then receive on the other side
+curl -X POST {{.Base}}/v1/send -H "Authorization: Bearer $KEY" -H "Idempotency-Key: once-1" \
+  -d '{"to":["dana@{{.Domain}}"],"file":"report.pdf","note":"final"}'
+curl "{{.Base}}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer $KEY"</pre>
+
+  <h2 id="self-host">Run your own</h2>
+  <p>AgentTransfer is one open-source Go binary (MIT). Run it on your own server with local disk or any S3-compatible bucket — see <a href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a>.</p>
+</div></main>
+{{template "site-foot" .}}

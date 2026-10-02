@@ -27,6 +27,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/s3"
 )
 
 // ErrNotFound is returned when a row does not exist.
@@ -99,7 +100,9 @@ type Agent struct {
 	HumanRecipientsMax int64 `json:"-"`
 	// PersonID links a person-owned agent (name = handle+tag) to its person;
 	// "" for flat-named keyed agents.
-	PersonID  string `json:"person_id,omitempty"`
+	PersonID string `json:"person_id,omitempty"`
+	// Kind is KindAgent, or KindDrive for a person's shared drive row.
+	Kind      string `json:"-"`
 	CreatedAt int64  `json:"created_at"`
 }
 
@@ -224,6 +227,10 @@ type Store struct {
 	// blobMu serializes blob finalization (row write + byte write) against
 	// the orphan GC (row delete + unlink) — see PutBlob and DeleteOrphanBlobs.
 	blobMu sync.Mutex
+
+	// remote, when set, holds blob bytes in an S3-compatible bucket instead of
+	// dataDir/blobs (see remote.go). The database stays local either way.
+	remote *s3.Client
 }
 
 // Open opens (creating if needed) the store at dataDir. adminToken, if
@@ -489,6 +496,10 @@ var migrations = []string{
 	schemaLocalNamesV11,         // v11: atomic shared person/agent localpart namespace
 	schemaIdempotencyV12,        // v12: request-bound status/body idempotency records
 	schemaOwnerPendingV13,       // v13: age unverified mailbox nominations independently
+	schemaRemoteBlobsV14,        // v14: blob bytes in an S3-compatible bucket (object_key + tombs)
+	schemaDriveV15,              // v15: one shared drive per verified person (agents.kind)
+	schemaUploadSessionsV16,     // v16: direct-to-bucket upload sessions
+	schemaAccountsV17,           // v17: web sessions, login links, OAuth 2.1 clients/codes/tokens/grants
 }
 
 // migrate brings db up to len(migrations) via PRAGMA user_version.
@@ -651,7 +662,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	var ver, cc int
 	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.OwnerEmail, &ver,
 		&a.OwnerVerifiedAt, &a.OwnerVerificationMethod, &cc, &a.HumanRecipientsMax,
-		&a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.PersonID, &a.CreatedAt)
+		&a.Pubkey, &a.AcceptPolicy, &a.PublicContact, &a.PersonID, &a.Kind, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -660,7 +671,7 @@ func scanAgent(row interface{ Scan(...any) error }) (Agent, error) {
 	return a, err
 }
 
-const agentCols = `id,name,email,owner_email,owner_verified,owner_verified_at,owner_verification_method,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,person_id,created_at`
+const agentCols = `id,name,email,owner_email,owner_verified,owner_verified_at,owner_verification_method,always_cc_owner,human_recipients_max,pubkey,accept_policy,public_contact,person_id,kind,created_at`
 
 // AgentByKey resolves an API key to its agent.
 func (s *Store) AgentByKey(key string) (Agent, error) {
@@ -682,7 +693,7 @@ func (s *Store) AgentByID(id string) (Agent, error) {
 // mailbox's cap.
 func (s *Store) CountAgentsByOwner(owner string) (int64, error) {
 	var n int64
-	err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE owner_email<>''
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM agents WHERE owner_email<>'' AND kind<>'drive'
 		AND owner_verified=1 AND owner_verification_method='email' AND LOWER(owner_email)=LOWER(?)`,
 		strings.TrimSpace(owner)).Scan(&n)
 	return n, err
@@ -1105,6 +1116,9 @@ func (s *Store) volumeStatsAt(path string) (int64, int64, error) {
 // from ever reaching 100% (where SQLite writes start failing and the whole
 // instance falls over). Callers refuse new uploads while it holds.
 func (s *Store) DiskFull() bool {
+	if s.remote != nil {
+		return false // bytes live in the bucket; only the small DB is local
+	}
 	s.diskWriteMu.Lock()
 	reserve := s.diskReserve
 	pending := s.diskPending
@@ -1146,6 +1160,9 @@ func (s *Store) blobPath(sha string) string {
 // content is stored once (content addressing); re-putting an existing blob
 // just refreshes its row.
 func (s *Store) PutBlob(r io.Reader, limit int64) (sha string, size int64, err error) {
+	if s.remote != nil {
+		return s.putRemoteBlob(r, limit)
+	}
 	tmp, err := os.CreateTemp(filepath.Join(s.dataDir, "blobs"), "tmp-*")
 	if err != nil {
 		return "", 0, err
@@ -1253,6 +1270,9 @@ func (s *Store) OpenBlob(sha string) (*os.File, error) {
 	if len(sha) < 3 || strings.ContainsAny(sha, "/\\.") {
 		return nil, ErrNotFound
 	}
+	if s.remote != nil {
+		return nil, ErrRemoteBlob
+	}
 	f, err := os.Open(s.blobPath(sha))
 	if os.IsNotExist(err) {
 		return nil, ErrNotFound
@@ -1284,6 +1304,9 @@ const blobReferencedSQL = `EXISTS (SELECT 1 FROM files WHERE files.sha256=blobs.
 // Tombs left by a crash are reconciled on the next run (restored when their DB
 // row remains, removed otherwise). blobMu prevents PutBlob from interleaving.
 func (s *Store) DeleteOrphanBlobs() (int, error) {
+	if s.remote != nil {
+		return s.deleteOrphanRemoteBlobs()
+	}
 	s.blobMu.Lock()
 	tombErr := s.reconcileBlobTombs()
 	s.blobMu.Unlock()
@@ -2474,7 +2497,7 @@ func (s *Store) VerifyOwnerTokenLimited(tok string, maxVerified int64) (string, 
 	if maxVerified > 0 {
 		var verified int64
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM agents
-			WHERE id<>? AND owner_verified=1 AND owner_verification_method='email'
+			WHERE id<>? AND kind<>'drive' AND owner_verified=1 AND owner_verification_method='email'
 			AND lower(owner_email)=lower(?)`, agentID, challengedEmail).Scan(&verified); err != nil {
 			return "", err
 		}
@@ -2568,8 +2591,14 @@ func (s *Store) UseUploadRequest(token string) (bool, error) {
 // entry in one transaction. A foreign-key, blob, or file insert failure rolls
 // the token update back, so a retryable storage failure cannot burn the page.
 func (s *Store) UseUploadRequestWithFile(token, agentID, sha, name, mime string, size int64, expiresAt int64) (File, bool, error) {
+	return s.UseUploadRequestIntoFolder(token, agentID, agentID, sha, name, mime, size, expiresAt)
+}
+
+// UseUploadRequestIntoFolder consumes agentID's upload request and files the
+// drop into folderID (the requester's own folder, or its person's drive).
+func (s *Store) UseUploadRequestIntoFolder(token, agentID, folderID, sha, name, mime string, size int64, expiresAt int64) (File, bool, error) {
 	f := File{
-		ID: NewID("fil"), AgentID: agentID, SHA256: sha, Name: safeName(name), MIME: mime,
+		ID: NewID("fil"), AgentID: folderID, SHA256: sha, Name: safeName(name), MIME: mime,
 		Size: size, Source: "request", Claimed: false, ExpiresAt: expiresAt, CreatedAt: now(),
 	}
 	tx, err := s.DB.Begin()
@@ -2593,7 +2622,7 @@ func (s *Store) UseUploadRequestWithFile(token, agentID, sha, name, mime string,
 		return File{}, false, err
 	}
 	f, err = scanFile(tx.QueryRow(`SELECT `+fileCols+` FROM files
-		WHERE agent_id=? AND name=? AND sha256=?`, agentID, f.Name, sha))
+		WHERE agent_id=? AND name=? AND sha256=?`, folderID, f.Name, sha))
 	if err != nil {
 		return File{}, false, err
 	}

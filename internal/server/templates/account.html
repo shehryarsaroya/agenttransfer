@@ -1,0 +1,133 @@
+{{template "site-head" .}}
+<main><div class="wrap">
+  <div class="row" style="align-items:flex-end;margin-bottom:6px">
+    <div>
+      <p class="small dim">Signed in as {{.Person.Email}}</p>
+      <h1 style="margin:2px 0 0">{{.PersonAddress}}</h1>
+    </div>
+    <div class="spacer"></div>
+    <form method="post" action="/logout"><button class="btn ghost sm" type="submit">Sign out</button></form>
+  </div>
+  <p class="lead">One drive for every AI you connect. Anything one of them saves, the others can open — and anyone can send you files at <b>{{.PersonAddress}}</b>.</p>
+
+  {{if .NewKey}}
+  <div class="notice ok" style="margin-top:20px">
+    <b>API key for {{.NewAgent}}</b> — copy it now; it won't be shown again.
+    <div class="copyrow" style="margin-top:8px"><pre id="newkey">{{.NewKey}}</pre><button class="btn sm" type="button" data-copy="#newkey">Copy</button></div>
+  </div>
+  {{end}}
+
+  <!-- drive -->
+  <section class="card" style="margin-top:22px" id="drive" data-csrf="{{.CSRF}}" data-remote="{{.Remote}}">
+    <div class="row">
+      <h2 style="margin:0">Drive</h2>
+      <span class="spacer"></span>
+      <span class="small dim" id="usage">{{.Used}} of {{.Quota}}</span>
+    </div>
+    <div class="meter" style="margin:10px 0 16px" aria-label="storage used"><span id="meterbar" style="width:{{.UsedPct}}%"></span></div>
+    <label class="drop" id="dropzone" for="filepick">
+      <b>Drop files here</b> or click to choose · up to {{.MaxFile}} each
+      <input id="filepick" type="file" multiple hidden>
+    </label>
+    <div class="progress" id="progress" aria-live="polite"></div>
+    <div style="overflow-x:auto;margin-top:12px">
+    <table id="files">
+      <thead><tr><th>Name</th><th class="num">Size</th><th class="hide-sm">Saved</th><th></th></tr></thead>
+      <tbody>
+      {{range .Files}}
+        <tr data-sha="{{.SHA256}}" data-name="{{.Name}}">
+          <td class="trunc" title="{{.Name}} · sha256 {{.SHA256}}">{{.Name}}</td>
+          <td class="num" data-size="{{.Size}}">{{.Size}}</td>
+          <td class="hide-sm dim small" data-ts="{{.CreatedAt}}"></td>
+          <td style="text-align:right;white-space:nowrap">
+            <a class="btn sm ghost" href="/account/api/files/{{.SHA256}}/content">Download</a>
+            <button class="btn sm ghost" type="button" data-act="link">Link</button>
+            <button class="btn sm ghost danger" type="button" data-act="delete">Delete</button>
+          </td>
+        </tr>
+      {{else}}
+        <tr class="empty"><td colspan="4" class="dim small" style="padding:18px 6px">Nothing here yet. Drop a file, or ask a connected AI to save one.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <!-- connect -->
+  <section class="card" id="connect">
+    <h2 style="margin-top:0">Connect an AI</h2>
+    <p class="dim">Add AgentTransfer as a connector, then sign in here when asked. Each AI gets its own address under your name.</p>
+    <div class="copyrow" style="margin:12px 0 16px"><pre id="mcpurl">{{.MCP}}</pre><button class="btn sm" type="button" data-copy="#mcpurl">Copy</button></div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr))">
+      <div><h3 style="margin-top:0">ChatGPT</h3><p class="small dim">Settings → Apps &amp; Connectors → Create (developer mode) → paste the URL above, OAuth. Or find AgentTransfer in the directory once listed.</p></div>
+      <div><h3 style="margin-top:0">Claude</h3><p class="small dim">Settings → Connectors → Add custom connector → paste the URL above. Claude Code: <code>claude mcp add --transport http agenttransfer {{.MCP}}</code></p></div>
+      <div><h3 style="margin-top:0">Meta Muse</h3><p class="small dim">Create an API key below (e.g. <code>muse</code>), then tell Muse: “Connect to AgentTransfer at {{.Base}} — the API is described at {{.Base}}/openapi.json — using this key.”</p></div>
+      <div><h3 style="margin-top:0">Codex, Cursor, OpenClaw…</h3><p class="small dim">Any MCP client: the URL above with OAuth, or an API key in <code>Authorization: Bearer</code>. Big files: the <a href="/docs#cli">CLI</a> streams straight to storage.</p></div>
+    </div>
+  </section>
+
+  <!-- connections -->
+  <section class="card" id="connections">
+    <h2 style="margin-top:0">Connected</h2>
+    {{if .Connections}}
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>Address</th><th class="hide-sm">App</th><th>Via</th><th class="hide-sm">Last used</th><th></th></tr></thead>
+      <tbody>
+      {{range .Connections}}
+        <tr>
+          <td class="trunc" title="{{.Agent.Email}}">{{.Agent.Email}}</td>
+          <td class="hide-sm dim">{{if .Client}}{{.Client}}{{if .Host}} <span class="faint">({{.Host}})</span>{{end}}{{else}}—{{end}}</td>
+          <td><span class="pill{{if eq .Via "OAuth"}} ok{{end}}">{{.Via}}</span></td>
+          <td class="hide-sm dim small">{{if .LastUsed}}{{.LastUsed}}{{else}}—{{end}}</td>
+          <td style="text-align:right">
+            <form method="post" action="/account/agents/{{.Agent.ID}}/remove" onsubmit="return confirm('Disconnect {{.Agent.Email}}? Your files stay in the drive.')">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="btn sm ghost danger" type="submit">Disconnect</button>
+            </form>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}<p class="dim small">No AIs connected yet.</p>{{end}}
+
+    <h3>API key for an agent</h3>
+    <p class="small dim">For agents with their own computer — Muse, Claude Code, Codex, OpenClaw, scripts. The agent becomes <b>{{.Person.Handle}}+name@{{.Domain}}</b> and shares your drive.</p>
+    {{if .KeyError}}<div class="notice err">{{.KeyError}}</div>{{end}}
+    <form method="post" action="/account/agents" class="row" style="flex-wrap:nowrap;max-width:520px">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <span class="dim">{{.Person.Handle}}+</span><input name="tag" type="text" required minlength="3" maxlength="32" pattern="[a-z0-9._-]+" placeholder="muse" autocapitalize="none" spellcheck="false">
+      <button class="btn" type="submit">Create key</button>
+    </form>
+  </section>
+
+  <!-- settings -->
+  <section class="card" id="settings">
+    <h2 style="margin-top:0">Account</h2>
+    <div class="grid two">
+      <div>
+        <h3 style="margin-top:0">Password</h3>
+        <p class="small dim">Optional. Email links always work; a password helps when you can't get to your inbox.</p>
+        {{if .PasswordMsg}}<div class="notice small">{{.PasswordMsg}}</div>{{end}}
+        <form method="post" action="/account/password" class="stack">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input name="password" type="password" autocomplete="new-password" minlength="10" placeholder="{{if .HasPassword}}new password{{else}}at least 10 characters{{end}}">
+          <div class="row"><button class="btn sm" type="submit">{{if .HasPassword}}Change{{else}}Set password{{end}}</button>
+          {{if .HasPassword}}<button class="btn sm ghost" name="clear" value="1" type="submit">Remove password</button>{{end}}</div>
+        </form>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Delete account</h3>
+        <p class="small dim">Removes your connected agents and every file in your drive. This can't be undone.</p>
+        {{if .DeleteMsg}}<div class="notice err small">{{.DeleteMsg}}</div>{{end}}
+        <form method="post" action="/account/delete" class="stack">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input name="confirm" type="text" placeholder="type {{.Person.Handle}} to confirm" autocapitalize="none" spellcheck="false">
+          <button class="btn sm danger" type="submit">Delete my account</button>
+        </form>
+      </div>
+    </div>
+    <p class="small faint" style="margin-top:16px">Plan: {{.Plan}} · Need help? <a href="/support">Support</a></p>
+  </section>
+</div></main>
+<script src="/static/site/account.js" defer></script>
+{{template "site-foot" .}}

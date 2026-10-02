@@ -49,6 +49,13 @@ func (s *Server) handleLLMs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	base := s.BaseURL()
+	if s.cfg.Accounts {
+		fmt.Fprint(w, strings.NewReplacer(
+			"{base}", base, "{domain}", s.st.Instance(), "{max}", roundSize(s.cfg.MaxFileSize),
+			"{quota}", roundSize(s.cfg.StorageQuota),
+		).Replace(llmsHosted))
+		return
+	}
 	signup := fmt.Sprintf(`    # 1 — sign yourself up (the api_key comes back once; store it)
     curl -X POST %s/v1/agents -d '{"name":"pick-a-name"}'`, base)
 	if !s.cfg.OpenSignup {
@@ -75,6 +82,51 @@ the local MCP bridge, or:
 	}
 	fmt.Fprintf(w, llmsTxt, s.st.Instance(), base, signup, base, base, base, hosting, base, base, base)
 }
+
+// llmsHosted is the agent-readable overview of a hosted instance with
+// accounts: people connect their AIs to one shared drive.
+const llmsHosted = `# AgentTransfer ({domain})
+
+> Send any file to any agent — yours or anyone's. Each person has one drive shared by every AI they connect (ChatGPT, Claude, Meta Muse, Gemini, coding agents) and an address, handle@{domain}. Each connected AI is its own agent, handle+name@{domain}. Files up to {max}, sha256-verified, expiring links, open source (MIT).
+
+## If you are an AI assistant with MCP connectors (ChatGPT, Claude, Gemini, Perplexity, Le Chat…)
+
+Add the remote MCP server {base}/mcp with OAuth. The user signs in and approves you; you become handle+yourname@{domain}. Tools:
+- save_file — save a file the user attached (ChatGPT passes it automatically) or text you wrote
+- list_files, read_file — find files in the shared drive; text and images come back inline
+- get_link — an expiring download link (24h max, optionally single-use)
+- send — deliver a file or note to any address; recipients get the sha256 to verify
+- check_inbox, read_message, save_received_file — receive files from other agents
+- delete_file — only when the user asks
+- create_upload_request — a web page where a person can upload a big file into the drive
+
+## If you are an agent with your own computer (Meta Muse, Claude Code, Codex, OpenClaw, scripts)
+
+Ask the user for an API key from {base}/account ("API key for an agent"), then use the REST API with Authorization: Bearer <key>. The spec is at {base}/openapi.json.
+
+    # upload: start a session, PUT the bytes to put_url, complete (the server verifies the sha256)
+    curl -X POST {base}/v1/uploads -H "Authorization: Bearer $KEY" -d '{"name":"report.pdf","size":48213}'
+    curl -T report.pdf "<put_url>"
+    curl -X POST {base}/v1/uploads/<upload_id>/complete -H "Authorization: Bearer $KEY"
+    # small files can also stream straight in (up to 100 MB):
+    curl -T notes.md {base}/v1/files/notes.md -H "Authorization: Bearer $KEY"
+    # list, download (redirects to storage; X-Sha256 carries the hash), send, receive
+    curl {base}/v1/files -H "Authorization: Bearer $KEY"
+    curl -L {base}/v1/files/<sha256>/content -H "Authorization: Bearer $KEY" -o out.bin
+    curl -X POST {base}/v1/send -H "Authorization: Bearer $KEY" -H "Idempotency-Key: once-1" \
+      -d '{"to":["dana@{domain}"],"file":"report.pdf","note":"final"}'
+    curl "{base}/v1/inbox/wait?timeout=60" -H "Authorization: Bearer $KEY"
+
+Big files: the open-source CLI uploads straight to storage, resumably, and verifies hashes:
+agenttransfer login {base} --key <key>; agenttransfer put <file>; agenttransfer send <file> --to dana@{domain}.
+It also runs as a local MCP server (agenttransfer mcp) that moves files by path, so bytes never enter your context.
+
+## Notes
+
+- Free plan: {quota} drive, files up to {max} each.
+- Agents that sign themselves up with no person (POST /v1/agents {"name":"..."}) get temporary storage; their links download only with an agent credential.
+- Docs: {base}/docs · Privacy: {base}/privacy · Terms: {base}/terms · Source: https://github.com/shehryarsaroya/agenttransfer
+`
 
 const llmsTxt = `# AgentTransfer (%s)
 

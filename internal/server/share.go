@@ -46,6 +46,13 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		s.goneLink(w, l)
 		return
 	}
+	if s.linkNeedsAgent(l) {
+		if _, ok := s.requestAgent(r); !ok {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="agenttransfer"`)
+			http.Error(w, "this file was shared by an agent without a verified owner, so it downloads only with an agent credential (Authorization: Bearer <api key>)", http.StatusUnauthorized)
+			return
+		}
+	}
 
 	q := r.URL.Query()
 	wantsDownload := q.Get("dl") == "1" || q.Get("dl") == "true" ||
@@ -77,6 +84,27 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.st.Remote() {
+		if l.Once {
+			s.burnMu.Lock()
+			busy := s.burning[l.Token]
+			s.burning[l.Token] = true
+			s.burnMu.Unlock()
+			if busy {
+				http.Error(w, "a download of this single-use link is already in progress", http.StatusConflict)
+				return
+			}
+			defer func() {
+				s.burnMu.Lock()
+				delete(s.burning, l.Token)
+				s.burnMu.Unlock()
+			}()
+			s.streamBurnRemote(w, r, l)
+			return
+		}
+		s.streamNormalRemote(w, r, l)
+		return
+	}
 	if l.Once {
 		s.streamBurn(w, r, l)
 		return
@@ -325,21 +353,22 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
-	lock := s.uploadLock(agent.ID)
+	folder := s.folderFor(agent)
+	lock := s.uploadLock(folder.ID)
 	lock.Lock()
-	used, err := s.st.StorageUsed(agent.ID)
+	used, err := s.st.StorageUsed(folder.ID)
 	if err != nil {
 		lock.Unlock()
 		http.Error(w, "storage accounting unavailable — the link is still valid, try later", http.StatusInternalServerError)
 		return
 	}
-	alreadyCharged, err := s.st.AgentUsesStorageBlob(agent.ID, sha)
+	alreadyCharged, err := s.st.AgentUsesStorageBlob(folder.ID, sha)
 	if err != nil {
 		lock.Unlock()
 		http.Error(w, "storage accounting unavailable — the link is still valid, try later", http.StatusInternalServerError)
 		return
 	}
-	if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(agent)) {
+	if !alreadyCharged && !storageAdditionFits(used, size, s.quotaFor(folder)) {
 		lock.Unlock()
 		http.Error(w, "the agent's storage quota is exhausted", http.StatusInsufficientStorage)
 		return
@@ -352,7 +381,7 @@ func (s *Server) handleUploadSubmit(w http.ResponseWriter, r *http.Request) {
 	// Consume the token and add the folder row atomically. Arrives unclaimed:
 	// the agent keeps it or it expires with DEFAULT_TTL.
 	expires := time.Now().Add(s.cfg.DefaultTTL).Unix()
-	f, won, err := s.st.UseUploadRequestWithFile(token, agent.ID, sha, name, ctype, size, expires)
+	f, won, err := s.st.UseUploadRequestIntoFolder(token, agent.ID, folder.ID, sha, name, ctype, size, expires)
 	lock.Unlock()
 	if err != nil {
 		http.Error(w, "upload failed", http.StatusInternalServerError)

@@ -27,6 +27,7 @@ import (
 	"github.com/shehryarsaroya/agenttransfer/internal/apphost"
 	"github.com/shehryarsaroya/agenttransfer/internal/mail"
 	"github.com/shehryarsaroya/agenttransfer/internal/receipt"
+	"github.com/shehryarsaroya/agenttransfer/internal/s3"
 	"github.com/shehryarsaroya/agenttransfer/internal/store"
 )
 
@@ -120,6 +121,16 @@ func New(cfg Config) (s *Server, firstBootAdmin string, err error) {
 		return nil, "", err
 	}
 	st.SetInstance(cfg.Instance())
+	if cfg.S3Bucket != "" {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.MaxIdleConnsPerHost = 32
+		tr.ResponseHeaderTimeout = 2 * time.Minute
+		st.SetRemote(&s3.Client{
+			Endpoint: cfg.S3Endpoint, Region: cfg.S3Region, Bucket: cfg.S3Bucket,
+			AccessKey: cfg.S3AccessKey, SecretKey: cfg.S3SecretKey,
+			HTTP: &http.Client{Transport: tr},
+		})
+	}
 	// The unprivileged public service owns build-context materialization. Make
 	// APP_BUILD_ROOT before the root runner starts so a DynamicUser deployment never
 	// inherits a root:root 0700 directory it cannot write. The runner is ordered
@@ -270,6 +281,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/files/{sha}/keep", s.auth(s.handleKeepFile))
 	mux.HandleFunc("GET /v1/files/{sha}/content", s.auth(s.handleFileContent))
 
+	// Direct-to-bucket uploads (object-storage mode).
+	mux.HandleFunc("POST /v1/uploads", s.auth(s.handleCreateUpload))
+	mux.HandleFunc("GET /v1/uploads/{id}", s.auth(s.handleGetUpload))
+	mux.HandleFunc("POST /v1/uploads/{id}/parts", s.auth(s.handleUploadParts))
+	mux.HandleFunc("POST /v1/uploads/{id}/complete", s.auth(s.handleCompleteUpload))
+	mux.HandleFunc("DELETE /v1/uploads/{id}", s.auth(s.handleCancelUpload))
+
 	// Links.
 	mux.HandleFunc("POST /v1/links", s.auth(s.handleCreateLink))
 	mux.HandleFunc("GET /v1/links", s.auth(s.handleListLinks))
@@ -337,6 +355,61 @@ func (s *Server) Handler() http.Handler {
 
 	// Meta.
 	mux.HandleFunc("GET /.well-known/agenttransfer", s.handleWellKnown)
+	mux.HandleFunc("GET /.well-known/openai-apps-challenge", s.handleOpenAIChallenge)
+
+	// Site pages: docs, legal, support, and shared static assets.
+	mux.HandleFunc("GET /docs", s.unauthLimited(s.handleDocs))
+	mux.HandleFunc("GET /docs/connect", s.unauthLimited(s.handleDocs))
+	mux.HandleFunc("GET /privacy", s.unauthLimited(s.handleLegal))
+	mux.HandleFunc("GET /terms", s.unauthLimited(s.handleLegal))
+	mux.HandleFunc("GET /support", s.unauthLimited(s.handleLegal))
+	mux.HandleFunc("GET /openapi.json", s.unauthLimited(s.handleOpenAPI))
+	mux.HandleFunc("GET /static/site/{name}", s.handleSiteAsset)
+
+	// Accounts: sign-in, the account page, and the OAuth 2.1 server that
+	// lets ChatGPT, Claude, Muse and other MCP clients connect.
+	if s.cfg.Accounts {
+		mux.HandleFunc("POST /v1/admin/accounts", s.handleAdminCreateAccount) // admin
+		mux.HandleFunc("GET /login", s.handleLoginPage)
+		mux.HandleFunc("POST /login", s.handleLoginSubmit)
+		mux.HandleFunc("GET /login/verify", s.handleLoginVerifyPage)
+		mux.HandleFunc("POST /login/verify", s.handleLoginVerify)
+		mux.HandleFunc("POST /logout", s.handleLogout)
+		mux.HandleFunc("GET /welcome", s.handleWelcome)
+		mux.HandleFunc("POST /welcome", s.handleWelcome)
+		mux.HandleFunc("GET /account", s.handleAccount)
+		mux.HandleFunc("POST /account/agents", s.accountPost(s.handleCreateAgentKey))
+		mux.HandleFunc("POST /account/agents/{id}/remove", s.accountPost(s.handleRemoveAgent))
+		mux.HandleFunc("POST /account/password", s.accountPost(s.handleSetPassword))
+		mux.HandleFunc("POST /account/delete", s.accountPost(s.handleDeleteAccount))
+		mux.HandleFunc("GET /account/api/whoami", s.webAPI(s.handleWhoami))
+		mux.HandleFunc("GET /account/api/files", s.webAPI(s.handleListFiles))
+		mux.HandleFunc("PUT /account/api/files/{name...}", s.webAPI(s.handleUpload))
+		mux.HandleFunc("DELETE /account/api/files/{sha}", s.webAPI(s.handleDeleteFile))
+		mux.HandleFunc("GET /account/api/files/{sha}/content", s.webAPI(s.handleFileContent))
+		mux.HandleFunc("POST /account/api/links", s.webAPI(s.handleCreateLink))
+		mux.HandleFunc("GET /account/api/inbox", s.webAPI(s.handleInbox))
+		mux.HandleFunc("POST /account/api/uploads", s.webAPI(s.handleCreateUpload))
+		mux.HandleFunc("GET /account/api/uploads/{id}", s.webAPI(s.handleGetUpload))
+		mux.HandleFunc("POST /account/api/uploads/{id}/parts", s.webAPI(s.handleUploadParts))
+		mux.HandleFunc("POST /account/api/uploads/{id}/complete", s.webAPI(s.handleCompleteUpload))
+		mux.HandleFunc("DELETE /account/api/uploads/{id}", s.webAPI(s.handleCancelUpload))
+
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-authorization-server/{rest...}", s.handleAuthServerMetadata)
+		mux.HandleFunc("GET /.well-known/openid-configuration", s.handleAuthServerMetadata)
+		mux.HandleFunc("POST /oauth/register", cors(s.handleRegister))
+		mux.HandleFunc("OPTIONS /oauth/register", cors(nil))
+		mux.HandleFunc("GET /oauth/authorize", s.handleAuthorize)
+		mux.HandleFunc("POST /oauth/authorize", s.handleAuthorize)
+		mux.HandleFunc("POST /oauth/token", cors(s.handleToken))
+		mux.HandleFunc("OPTIONS /oauth/token", cors(nil))
+		mux.HandleFunc("POST /oauth/revoke", cors(s.handleRevoke))
+		mux.HandleFunc("OPTIONS /oauth/revoke", cors(nil))
+		mux.HandleFunc("GET /oauth/userinfo", cors(s.handleUserinfo))
+	}
 	mux.HandleFunc("GET /v1/stats", s.unauthLimited(s.handleStats)) // public aggregate counters (landing page strip)
 	mux.HandleFunc("GET /llms.txt", s.unauthLimited(s.handleLLMs))  // llms.txt convention: agent-readable overview
 	mux.HandleFunc("GET /robots.txt", s.unauthLimited(s.handleRobots))
@@ -669,6 +742,10 @@ func (s *Server) JanitorOnce() error {
 		s.reconcileContainerApps()
 	}
 
+	s.reapStaleUploads()
+	if err := s.st.PruneAccounts(); err != nil {
+		log.Printf("janitor: prune accounts: %v", err)
+	}
 	return s.st.Prune()
 }
 

@@ -2,7 +2,7 @@
 # clean. `git describe` otherwise resurrects the nearest historical tag (for
 # example v0.1.x), while a dirty tagged checkout is not the tagged release.
 # Repository tags use a conventional leading "v"; runtime/API versions do not.
-VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); state=$$(git status --porcelain --untracked-files=normal 2>/dev/null); if [ -n "$$tag" ] && [ -z "$$state" ]; then printf '%s\n' "$$tag" | sed 's/^v//'; else echo 0.7.0-dev; fi)
+VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); state=$$(git status --porcelain --untracked-files=normal 2>/dev/null); if [ -n "$$tag" ] && [ -z "$$state" ]; then printf '%s\n' "$$tag" | sed 's/^v//'; else echo 0.8.0-dev; fi)
 LDFLAGS  = -s -w -X github.com/shehryarsaroya/agenttransfer/internal/server.Version=$(VERSION)
 
 .PHONY: version build test demo lint clean release

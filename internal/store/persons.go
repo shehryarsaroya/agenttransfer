@@ -168,6 +168,9 @@ func (s *Store) CreateAgentForPersonLimited(p Person, tag string, _ int64) (Agen
 	if !ValidAgentName(tag) || strings.Contains(tag, "+") {
 		return Agent{}, "", errors.New("invalid agent name: use 3-64 chars of a-z 0-9 . _ -")
 	}
+	if reservedPersonTag(tag) {
+		return Agent{}, "", fmt.Errorf("the name %q is reserved for the person's drive", tag)
+	}
 	s.instanceMu.RLock()
 	defer s.instanceMu.RUnlock()
 	tx, err := s.DB.Begin()
@@ -226,6 +229,9 @@ func (s *Store) CreatePersonWithAgent(handle, email, tag string, _ int64) (Perso
 	if !ValidAgentName(tag) || strings.Contains(tag, "+") {
 		return Person{}, Agent{}, "", errors.New("invalid agent name: use 3-64 chars of a-z 0-9 . _ -")
 	}
+	if reservedPersonTag(tag) {
+		return Person{}, Agent{}, "", fmt.Errorf("the name %q is reserved for the person's drive", tag)
+	}
 	s.instanceMu.RLock()
 	defer s.instanceMu.RUnlock()
 
@@ -266,7 +272,7 @@ func (s *Store) CreatePersonWithAgent(handle, email, tag string, _ int64) (Perso
 // whose join click happened — the only ones that receive at the person's
 // address or their own plus-address.
 func (s *Store) AgentsByPerson(personID string, approvedOnly bool) ([]Agent, error) {
-	q := `SELECT ` + agentCols + ` FROM agents WHERE person_id=?`
+	q := `SELECT ` + agentCols + ` FROM agents WHERE person_id=? AND kind<>'drive'`
 	if approvedOnly {
 		q += ` AND owner_verified=1`
 	}

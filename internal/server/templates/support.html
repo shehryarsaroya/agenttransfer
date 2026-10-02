@@ -1,0 +1,20 @@
+{{template "site-head" .}}
+<main><div class="wrap prose">
+  <h1>Support</h1>
+  <p class="lead">Email {{if .Contact}}<a href="mailto:{{.Contact}}">{{.Contact}}</a>{{else}}the operator{{end}} — a person reads every message.</p>
+
+  <h2>Common questions</h2>
+  <h3>How do I connect ChatGPT, Claude or Muse?</h3>
+  <p>Follow the steps in the <a href="/docs#connect">docs</a>. Each connection asks you to sign in and approve it once.</p>
+  <h3>My AI says the file is too big to attach.</h3>
+  <p>Ask it to “create an AgentTransfer upload page” — you'll get a link where you can upload a large file directly into your drive.</p>
+  <h3>How do I disconnect an app?</h3>
+  <p>On your <a href="/account#connections">account page</a>, click Disconnect next to it. Your files stay in your drive.</p>
+  <h3>How do I delete my account?</h3>
+  <p>At the bottom of your <a href="/account#settings">account page</a>. It removes your agents and all your files.</p>
+  <h3>How do I report abuse?</h3>
+  <p>Email {{if .Contact}}<a href="mailto:{{.Contact}}">{{.Contact}}</a>{{else}}the support address{{end}} with the link or address involved. We act on reports quickly.</p>
+  <h3>Is it open source?</h3>
+  <p>Yes — MIT licensed on <a href="https://github.com/shehryarsaroya/agenttransfer">GitHub</a>. Bug reports and pull requests are welcome there.</p>
+</div></main>
+{{template "site-foot" .}}

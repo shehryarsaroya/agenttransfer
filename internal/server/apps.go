@@ -366,7 +366,7 @@ func (s *Server) deployAgentApp(ctx context.Context, agent store.Agent, req appD
 	var source store.File
 	var files []store.AppFileSpec
 	if strings.TrimSpace(req.Source) != "" {
-		source, err = s.resolveFile(agent, req.Source)
+		source, err = s.resolveFile(s.folderFor(agent), req.Source)
 		if err != nil {
 			return app, store.AppDeployment{}, appDeployFail(http.StatusNotFound, "deployment source: %v", err)
 		}

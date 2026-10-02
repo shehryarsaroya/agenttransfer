@@ -1,0 +1,9 @@
+{{template "site-head" .}}
+<main><div class="wrap narrow">
+  <div class="card stack">
+    <h1>{{.Title}}</h1>
+    <p class="dim">{{.Message}}</p>
+    {{if .Action}}<p><a class="btn primary" href="{{.Action}}">{{.ActionLabel}}</a></p>{{end}}
+  </div>
+</div></main>
+{{template "site-foot" .}}

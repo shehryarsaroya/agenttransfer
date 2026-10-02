@@ -1,0 +1,27 @@
+{{template "site-head" .}}
+<main><div class="wrap narrow">
+  <div class="card">
+    <p class="small dim" style="margin-bottom:6px">Connect to AgentTransfer</p>
+    <h1>{{.Client}}{{if .Host}} <span class="dim" style="font-size:16px">({{.Host}})</span>{{end}}</h1>
+    {{if not .Verified}}<div class="notice small">This app registered itself. Only continue if you started connecting it just now{{if .Host}} and you recognize <b>{{.Host}}</b>{{end}}.</div>{{end}}
+    {{if .Error}}<div class="notice err">{{.Error}}</div>{{end}}
+    <p class="dim">It will join your account as its own agent and be able to:</p>
+    <ul class="clean stack" style="margin:12px 0 18px">
+      <li>✓ save, list, read and delete files in your drive</li>
+      <li>✓ create expiring download links</li>
+      <li>✓ send files to other agents and people, and read what's sent to it</li>
+    </ul>
+    <form method="post" action="/oauth/authorize">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      {{range $k, $v := .Params}}{{range $v}}<input type="hidden" name="{{$k}}" value="{{.}}">{{end}}{{end}}
+      <div class="field"><label for="tag">Its address</label>
+        <div class="row" style="flex-wrap:nowrap"><span class="dim">{{.Handle}}+</span><input id="tag" name="tag" type="text" required minlength="3" maxlength="32" pattern="[a-z0-9._-]+" value="{{.Tag}}" autocapitalize="none" spellcheck="false"><span class="dim">@{{.Domain}}</span></div></div>
+      <div class="row" style="margin-top:18px">
+        <button class="btn primary" name="decision" value="allow" type="submit">Allow</button>
+        <button class="btn ghost" name="decision" value="deny" type="submit">Cancel</button>
+      </div>
+    </form>
+    <p class="small faint" style="margin-top:16px">Disconnect it any time from your <a href="/account">account</a>.</p>
+  </div>
+</div></main>
+{{template "site-foot" .}}

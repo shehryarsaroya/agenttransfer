@@ -90,6 +90,16 @@ Unverified-owner uploads additionally carry a top-level `expires_at` (the file's
 - `POST /v1/files/{sha256}/keep` — claim an unclaimed file. Verified owners get persistence; for unverified agents the keep extends the file to the `UNVERIFIED_FILE_TTL` ceiling (the response carries the resulting `expires_at`). The CLI mirrors that distinction: it says `now persistent` only when no expiry remains, otherwise it prints the resulting retention deadline.
 - `DELETE /v1/files/{sha256}` — remove from folder **and revoke all your active links on that content** (in-flight downloads are severed).
 
+### Direct uploads (object-storage instances)
+
+When `/.well-known/agenttransfer` reports `"uploads": {"direct": true}`, large files go straight to storage:
+
+1. `POST /v1/uploads` `{"name": "data.tar", "size": 734003200, "sha256": "<optional>", "share": false}` → `201` with `upload_id` and either `put_url` (one PUT of the whole body) or `mode: "multipart"`, `part_size`, `parts`, and the first `part_urls`.
+2. PUT the bytes to the presigned URL(s). Ask for more part URLs with `POST /v1/uploads/{id}/parts {"part_numbers": [101, 102]}`.
+3. `POST /v1/uploads/{id}/complete` (optionally `{"parts": [{"part_number": 1, "etag": "…"}]}`) → `201 {"file": {...}}`, or `202` while a large object's sha256 is verified — poll `GET /v1/uploads/{id}`.
+
+`GET /v1/uploads/{id}` also lists stored parts (to resume) or returns a fresh `put_url`. `DELETE /v1/uploads/{id}` cancels. A declared `sha256` that doesn't match the bytes fails the upload. Re-declaring content already in your folder is filed instantly (`"deduplicated": true`) without new bytes. In-flight sessions count against quota.
+
 ## Share links
 
 Ephemeral (≤ `MAX_TTL`, default cap 24h), unguessable (128-bit), content-addressed.
@@ -454,6 +464,25 @@ On a connect host (`CONNECT_DOMAIN` set):
 - `POST /connect/admin/suspend` — **admin**: `{"name": "...", "suspended": true}` kill switch.
 
 Full mechanics, quotas, and the wire protocol: [connect.md](connect.md).
+
+## Accounts and OAuth (instances with `ACCOUNTS=true`)
+
+People sign in at `/login` (email link or password); `/account` shows their shared drive and connected agents. Every approved agent of a person reads and writes one drive.
+
+MCP clients connect with OAuth 2.1 (public clients, PKCE S256):
+
+| Endpoint | |
+|---|---|
+| `GET /.well-known/oauth-protected-resource[/mcp]` | RFC 9728 metadata; `resource` is `https://<domain>/mcp` |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (also served as `openid-configuration`) |
+| `POST /oauth/register` | RFC 7591 dynamic registration (`token_endpoint_auth_method: none`) |
+| `GET /oauth/authorize` | sign-in + consent; the client becomes `handle+tag@<domain>`; responses carry `iss` (RFC 9207) |
+| `POST /oauth/token` | `authorization_code` (PKCE) and rotating `refresh_token` grants |
+| `POST /oauth/revoke`, `GET /oauth/userinfo` | revocation; `{sub, email, email_verified}` |
+
+Clients may also identify with a Client ID Metadata Document (an https `client_id` URL). Access tokens (`at_oat_…`) work on `/mcp` and the REST API; an unauthenticated `/mcp` request gets `401` with `WWW-Authenticate: Bearer resource_metadata="…"`.
+
+`POST /v1/admin/accounts` (admin token) creates a verified account with an optional password and plan — for reviewer and service accounts.
 
 ## Meta
 

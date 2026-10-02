@@ -152,6 +152,59 @@ Port 25 must still reach the binary directly (SMTP doesn't proxy through nginx).
 When apps are enabled, route `*.agents.example.com` to the same HTTP listener;
 the proxy, not AgentTransfer, must provision those certificates.
 
+## Object storage (S3 / Cloudflare R2)
+
+By default blobs live in `DATA_DIR/blobs`. Point AgentTransfer at any S3-compatible bucket and the bytes move there while the SQLite database stays local:
+
+```sh
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com   # or your MinIO/AWS endpoint
+S3_BUCKET=agenttransfer-blobs
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+# S3_REGION defaults to "auto"
+```
+
+With object storage on:
+
+- **Direct uploads.** `POST /v1/uploads` hands clients presigned URLs (one PUT, or resumable multipart for large files); the server re-reads each object and verifies its sha256 before filing it. Bytes never transit the server or a proxy's request-size cap (Cloudflare's proxy stops at 100 MB on Free/Pro plans).
+- **Downloads redirect** to short-lived presigned GETs (`X-Sha256` rides on the redirect). A burn-after-read link burns when its download starts.
+- **Bucket setup.** Allow CORS `PUT, GET, HEAD` from your site's origin and expose `ETag` (browser uploads read part ETags), and add a lifecycle rule that aborts incomplete multipart uploads after a day or two. Give the server a token scoped to this bucket only.
+- App hosting needs the local blob store; leave `APP_DOMAIN` unset with `S3_BUCKET`.
+
+Back the database up continuously with [Litestream](https://litestream.io) to a second bucket:
+
+```yaml
+# /etc/litestream.yml
+access-key-id: ...
+secret-access-key: ...
+dbs:
+  - path: /var/lib/agenttransfer/agenttransfer.db
+    replica:
+      url: s3://agenttransfer-backups/agenttransfer.db?endpoint=<account>.r2.cloudflarestorage.com&region=auto
+```
+
+## Accounts and connectors (ChatGPT, Claude, Muse)
+
+`ACCOUNTS=true` turns on the human side: email sign-in (links sent through `OUTBOUND`; optional passwords), an account page with the person's shared drive, and an OAuth 2.1 authorization server so ChatGPT, Claude, Gemini and other MCP clients can connect to `https://<domain>/mcp` as an agent of the signed-in person.
+
+| Variable | Purpose |
+|---|---|
+| `ACCOUNTS=true` | email sign-in, `/account`, OAuth (`/.well-known/oauth-authorization-server`, `/oauth/*`) |
+| `PUBLIC_LINKS=verified` | links owned by agents without a verified owner download only with an agent credential |
+| `STORAGE_QUOTA` / `STORAGE_QUOTA_PLUS` | drive quota for the free plan / the `plus` plan |
+| `SUPPORT_EMAIL`, `OPERATOR_NAME` | shown on `/support`, `/privacy`, `/terms` |
+| `OPENAI_APPS_CHALLENGE` | token served at `/.well-known/openai-apps-challenge` for ChatGPT plugin domain verification |
+| `SMTP_ADDR=off` | run without inbound mail even with `DOMAIN` set |
+
+Create accounts for directory reviewers (they can't receive sign-in links) with the admin token:
+
+```sh
+curl -X POST https://<domain>/v1/admin/accounts -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"email":"reviewer@<domain>","handle":"reviewer","password":"<long random>"}'
+```
+
+Behind Cloudflare, turn off Browser Integrity Check for the zone (it blocks non-browser API clients) and keep the bot settings permissive enough for server-to-server MCP traffic.
+
 ## App hosting
 
 Static hosting needs only two changes: set `APP_DOMAIN` on the public service

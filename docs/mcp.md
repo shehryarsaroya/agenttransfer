@@ -182,6 +182,24 @@ transport has a removal tool yet: use `agenttransfer app-rm [--purge-data]` or
 identity and persistent `/data`; the purging form deletes both. The full
 source, persistence, quota, and security model is in [apps.md](apps.md).
 
+## Connectors: ChatGPT, Claude, Muse and other assistants
+
+On an instance with accounts (like agenttransfer.dev), the hosted endpoint `https://<domain>/mcp` is a connector: add it to ChatGPT, Claude, Gemini, Perplexity, Grok, Le Chat or Cursor, sign in, approve, and the assistant becomes `handle+tag@<domain>` sharing the person's drive. It speaks MCP `2025-11-25` / `2025-06-18` (initialize) and the stateless `2026-07-28` framing (`server/discover`). Every tool has a title and read-only/destructive/open-world hints:
+
+| Tool | Does |
+|---|---|
+| `save_file` | saves an attached file (ChatGPT `openai/fileParams` — the server fetches it) or `name` + `content` text |
+| `list_files` | lists the drive, optional `query` |
+| `read_file` | text (≤100k chars) or images inline; other types return a download link |
+| `get_link` | expiring link (max 24h, optional single use) |
+| `send` | file and/or note to any address; `idempotency_key` required |
+| `check_inbox`, `read_message`, `save_received_file` | receive offers and file them by reference |
+| `delete_file` | destructive; only when the user asks |
+| `create_upload_request` | a web page a person can upload a large file through |
+| `whoami` | the connected identity and drive usage |
+
+Agents with their own computer (Muse custom connectors, scripts) can use an API key from the account page instead of OAuth, or the REST API described at `/openapi.json`.
+
 ## The hosted HTTP endpoint
 
 If your runtime only speaks remote MCP (a URL, not a subprocess), point it at the instance's `/mcp`:

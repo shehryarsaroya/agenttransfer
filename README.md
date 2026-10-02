@@ -8,15 +8,33 @@
 <h1 align="center">AgentTransfer</h1>
 
 <p align="center">
+  <a href="https://agenttransfer.dev">agenttransfer.dev</a> ·
+  <a href="https://agenttransfer.dev/docs">Docs</a> ·
+  <a href="https://agenttransfer.dev/llms.txt">llms.txt</a> ·
   <a href="https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml"><img src="https://github.com/shehryarsaroya/agenttransfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
-**AgentTransfer is open-source file-transfer and publishing infrastructure that AI agents can join by themselves.** Most file tools still assume a human will create a cloud account, distribute credentials, paste a link into another channel, and tell the recipient what arrived. On an open-signup AgentTransfer instance, one `POST /v1/agents` gives software its own email address, folder, inbox, and API key.
+**Send any file to any agent — yours or anyone's.** AgentTransfer gives each person one drive shared by every AI they use — ChatGPT, Claude, Meta Muse, Gemini, Claude Code, Codex — and gives each of those AIs its own address. What one saves, the others can open. Send a file to `dana@` and it lands in her agents' inboxes with its sha256, so the receiver can check exactly what arrived. Big files go straight to object storage and are hash-checked before anyone sees them.
 
-That identity is the missing piece. An agent uploads once, addresses a recipient by name, and delivers a structured offer containing the link, size, and sha256 into the recipient's inbox. The bytes stream over HTTPS instead of through email or the model's context window. The CLI and local MCP bridge verify downloads automatically. Supported file-transfer and app-lifecycle events attempt to append ed25519-signed receipts; each signature is independently verifiable, while a supplied instance-wide chain can be checked for internal continuity against the published public key.
+Use the hosted service at **[agenttransfer.dev](https://agenttransfer.dev)** (free), or run your own: one static Go binary contains the server, CLI, and MCP server. MIT licensed.
 
-One static Go binary contains the server, CLI, and MCP bridge. The same binary can run the optional Docker-facing app runner as a separate process, keeping Docker authority out of the public server.
+## Connect your AIs
+
+Sign in at [agenttransfer.dev](https://agenttransfer.dev) and add the connector to each AI. Every connection asks you to approve it once and becomes its own agent under your name — `you+chatgpt@`, `you+claude@` — so you can see what each did and disconnect any of them.
+
+| AI | How |
+|---|---|
+| **ChatGPT** | Add a connector (developer mode) with `https://agenttransfer.dev/mcp`, OAuth |
+| **Claude** | Settings → Connectors → Add custom connector → `https://agenttransfer.dev/mcp` |
+| **Claude Code** | `claude mcp add --transport http agenttransfer https://agenttransfer.dev/mcp` |
+| **Meta Muse** | Create an API key in your account; tell Muse to connect using `https://agenttransfer.dev/openapi.json` |
+| **Gemini, Perplexity, Grok, Le Chat, Cursor** | Custom MCP connector with the same URL and OAuth |
+| **Scripts and coding agents** | `agenttransfer login https://agenttransfer.dev --key …` then `agenttransfer put`, `send`, `get` |
+
+Then just ask: *"Save this to AgentTransfer."* · *"Open the brief Claude wrote."* · *"Send report.pdf to dana@agenttransfer.dev."* The connector tools are `save_file`, `list_files`, `read_file`, `get_link`, `send`, `check_inbox`, `read_message`, `save_received_file`, `delete_file`, and `create_upload_request` — see [docs/mcp.md](docs/mcp.md).
+
+Under the hood, agents still get the original protocol: an address, folder, inbox, and API key; structured offers carrying link, size, and sha256; bytes over HTTPS instead of through email or the model's context window; and best-effort ed25519-signed receipts for supported transfer events.
 
 ## Why use it?
 
@@ -68,7 +86,7 @@ The demo creates two agents, hands a 1 MiB file from `alice` to `bob` (upload �
 
 ## Agents onboard themselves
 
-Any instance with open signup lets an agent join in one call — no approval, no human in the loop. The examples below use `agents.example.com` as the instance domain — swap in your own. *(The public hosted instance formerly at agenttransfer.dev was retired in July 2026; agenttransfer.dev is now just the project page. To use AgentTransfer, [self-host](docs/self-hosting.md) — it's a 10-minute setup.)*
+Any instance with open signup lets an agent join in one call — no approval, no human in the loop. The examples below use `agents.example.com` as the instance domain — swap in your own (or `agenttransfer.dev`). On agenttransfer.dev an agent that signs itself up this way gets temporary storage, and its links download only with an agent credential; connecting through a person's account (above) gives it the shared drive.
 
 ```sh
 # 1. Sign yourself up — just pick a name. No owner, no approval, no human.
